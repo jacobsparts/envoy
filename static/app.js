@@ -480,6 +480,20 @@ class TerminalTab {
       }
     });
     this.term.onRender(() => this.updateScrollbackClass());
+    this.lastMeasuredSize = { width: 0, height: 0 };
+    this.resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
+      if (this.manager.activeTab !== this) return;
+      const rect = this.host.getBoundingClientRect();
+      const width = Math.round(rect.width);
+      const height = Math.round(rect.height);
+      if (!width || !height) return;
+      if (width === this.lastMeasuredSize.width && height === this.lastMeasuredSize.height) return;
+      this.lastMeasuredSize = { width, height };
+      requestAnimationFrame(() => {
+        if (this.manager.activeTab === this) this.fitTerminal();
+      });
+    }) : null;
+    this.resizeObserver?.observe(this.host);
   }
 
   get id() {
@@ -518,7 +532,20 @@ class TerminalTab {
   }
 
   fitTerminal() {
+    try {
+      this.term._core?._charSizeService?.measure();
+    } catch {}
     this.fit.fit();
+    try {
+      this.term.resize(this.term.cols, this.term.rows);
+    } catch {}
+    try {
+      this.term._core?._viewport?._refresh?.();
+    } catch {}
+    if (typeof this.term.refresh === "function") {
+      this.term.refresh(0, Math.max(0, this.term.rows - 1));
+      requestAnimationFrame(() => this.term.refresh(0, Math.max(0, this.term.rows - 1)));
+    }
     this.updateScrollbackClass();
     if (!this.disconnected) {
       this.transport.resize(this.term.cols, this.term.rows).catch(() => this.markDisconnected());
@@ -618,6 +645,7 @@ class TerminalTab {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    this.resizeObserver?.disconnect();
     this.pane.remove();
     this.button.remove();
     const transport = this.transport;
@@ -792,6 +820,7 @@ document.fonts.load("13pt 'Source Code Pro'").then(async () => {
 function init(baseTransport, config) {
   document.title = config.title || "envoy";
 
+  const isMobileClient = !window.matchMedia("(pointer: fine)").matches;
   const workspace = document.getElementById("workspace");
   const tabBar = document.getElementById("tabs");
   const tabAdd = document.getElementById("tab-add");
@@ -803,9 +832,34 @@ function init(baseTransport, config) {
   const overlay = document.getElementById("drop-overlay");
   const agentLogModal = document.getElementById("voice-log-modal");
   const agentLogEntries = document.getElementById("voice-log-entries");
+  const mobileInputBar = document.getElementById("mobile-input-bar");
+  const textInputModal = document.getElementById("text-input-modal");
+  const pasteEditorModal = document.getElementById("paste-editor-modal");
+  const settingsModal = document.getElementById("settings-modal");
 
   let toastTimer = null;
   let toastLocked = false;
+  let terminalInputActive = false;
+  let keyboardVisible = false;
+  let mobileBarInset = 0;
+  let resizeObserver = null;
+  let mobileRepeatTimer = null;
+  let mobileRepeatDelayTimer = null;
+  let suppressNextTerminalFocus = false;
+  let suppressTerminalFocusUntil = 0;
+  let lastMobileTouchTime = 0;
+  let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  const mobileModifiers = { Control: false, Alt: false };
+  const mobileInputSequences = {
+    escape: "\x1b",
+    tab: "\t",
+    left: "\x1b[D",
+    up: "\x1b[A",
+    down: "\x1b[B",
+    right: "\x1b[C",
+    home: "\x1b[H",
+    end: "\x1b[F",
+  };
 
   function dismissToast() {
     if (toastLocked) return;
@@ -834,6 +888,14 @@ function init(baseTransport, config) {
       toast.classList.add("active");
       toastTimer = setTimeout(() => toast.classList.remove("active"), 1500);
     }
+  }
+
+  function hasActiveModal() {
+    return helpModal.classList.contains("active")
+      || agentLogModal.classList.contains("active")
+      || textInputModal.classList.contains("active")
+      || pasteEditorModal.classList.contains("active")
+      || settingsModal.classList.contains("active");
   }
 
   document.addEventListener("keydown", () => dismissToast(), { capture: true });
@@ -884,6 +946,93 @@ function init(baseTransport, config) {
     syncSelectOverlaySize();
   }
 
+  function applyMobileInputBarInset() {
+    if (!mobileInputBar || !isMobileClient) return;
+    mobileInputBar.style.bottom = `${mobileBarInset}px`;
+  }
+
+  function updateMobileInputBar() {
+    if (!mobileInputBar || !isMobileClient) return;
+    const visible = keyboardVisible && terminalInputActive && !selectOverlay.classList.contains("active") && !hasActiveModal();
+    mobileInputBar.classList.toggle("active", visible);
+    workspace.classList.toggle("with-mobile-input-bar", visible);
+    sidePanel.classList.toggle("with-mobile-input-bar", visible);
+    applyMobileInputBarInset();
+  }
+
+  function setTerminalInputActive(active) {
+    if (terminalInputActive === active) return;
+    terminalInputActive = active;
+    updateMobileInputBar();
+  }
+
+  function resetMobileModifiers() {
+    mobileModifiers.Control = false;
+    mobileModifiers.Alt = false;
+    for (const button of mobileInputBar?.querySelectorAll(".mobile-modifier-key") || []) {
+      const key = button.dataset.key;
+      button.classList.toggle("active", !!mobileModifiers[key]);
+    }
+  }
+
+  function pulseMobileInputButton(button) {
+    if (!button) return;
+    button.classList.remove("pressed");
+    void button.offsetWidth;
+    button.classList.add("pressed");
+    setTimeout(() => button.classList.remove("pressed"), 120);
+  }
+
+  function encodeMobileInputSequence(sequence) {
+    let result = "";
+    for (const char of sequence) {
+      let next = char;
+      if (mobileModifiers.Control && next === "\t") {
+        next = "\x00";
+      } else if (mobileModifiers.Control && next.length === 1) {
+        const upper = next.toUpperCase();
+        const code = upper.charCodeAt(0);
+        if (code >= 64 && code <= 95) next = String.fromCharCode(code - 64);
+        else if (upper === " ") next = "\x00";
+      }
+      if (mobileModifiers.Alt) next = "\x1b" + next;
+      result += next;
+    }
+    resetMobileModifiers();
+    return result;
+  }
+
+  function writeSequenceToCurrentTab(sequence) {
+    const tab = currentTab();
+    if (!tab || tab.disconnected) return Promise.resolve();
+    return tab.transport.write(sequence).catch(() => tab.markDisconnected());
+  }
+
+  function sendMobileInput(sequence) {
+    writeSequenceToCurrentTab(encodeMobileInputSequence(sequence));
+    focusCurrent();
+  }
+
+  function stopMobileInputRepeat() {
+    if (mobileRepeatDelayTimer) {
+      clearTimeout(mobileRepeatDelayTimer);
+      mobileRepeatDelayTimer = null;
+    }
+    if (mobileRepeatTimer) {
+      clearInterval(mobileRepeatTimer);
+      mobileRepeatTimer = null;
+    }
+  }
+
+  function startMobileInputRepeat(sequence) {
+    stopMobileInputRepeat();
+    mobileRepeatDelayTimer = setTimeout(() => {
+      mobileRepeatTimer = setInterval(() => {
+        writeSequenceToCurrentTab(sequence);
+      }, 60);
+    }, 350);
+  }
+
   function adjustFontSize(delta) {
     const term = currentTerm();
     if (!term) return;
@@ -905,27 +1054,44 @@ function init(baseTransport, config) {
     showToast("Font size 17");
   }
 
-  function updateViewportHeight() {
-    const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
-    workspace.style.height = `${h}px`;
+  function updateViewportState() {
+    const vv = window.visualViewport;
+    const viewportHeight = vv ? vv.height : window.innerHeight;
+    const offsetTop = vv ? vv.offsetTop : 0;
+
+    if (!terminalInputActive && !hasActiveModal()) {
+      baselineViewportHeight = Math.max(baselineViewportHeight, viewportHeight);
+    }
+
+    const keyboardDelta = Math.max(0, baselineViewportHeight - viewportHeight);
+    keyboardVisible = isMobileClient && terminalInputActive && (window.visualViewport ? keyboardDelta > 100 : true);
+    mobileBarInset = keyboardVisible ? Math.max(0, offsetTop) : 0;
   }
 
-  updateViewportHeight();
+  function performLayoutRefresh() {
+    updateViewportState();
+    updateMobileInputBar();
+    requestAnimationFrame(() => {
+      sendResize();
+      requestAnimationFrame(() => sendResize());
+    });
+  }
+
+  updateViewportState();
 
   if (window.visualViewport) {
     window.visualViewport.addEventListener("resize", () => {
-      updateViewportHeight();
-      sendResize();
+      performLayoutRefresh();
     });
     window.visualViewport.addEventListener("scroll", () => {
-      updateViewportHeight();
+      performLayoutRefresh();
       window.scrollTo(0, 0);
     });
   }
 
   window.onresize = () => {
-    updateViewportHeight();
-    sendResize();
+    baselineViewportHeight = Math.max(baselineViewportHeight, window.visualViewport ? window.visualViewport.height : window.innerHeight);
+    performLayoutRefresh();
   };
 
   const sidePanel = document.getElementById("side-panel");
@@ -940,6 +1106,36 @@ function init(baseTransport, config) {
   const spSel = document.getElementById("sp-sel");
   const spFs = document.getElementById("sp-fs");
 
+  let pendingSidebarTouchButton = null;
+
+  function preserveTerminalFocusFromSidebarPress(e) {
+    if (!isMobileClient) return;
+    const button = e.target.closest("#side-panel .sp-btn");
+    if (!button) return;
+    if (!keyboardVisible) {
+      pendingSidebarTouchButton = null;
+      return;
+    }
+    e.preventDefault();
+    pendingSidebarTouchButton = button;
+  }
+
+  function triggerSidebarButtonWithoutBlur(e) {
+    if (!isMobileClient) return;
+    const button = e.target.closest("#side-panel .sp-btn");
+    if (!button || button !== pendingSidebarTouchButton) {
+      pendingSidebarTouchButton = null;
+      return;
+    }
+    e.preventDefault();
+    pendingSidebarTouchButton = null;
+    button.click();
+  }
+
+  function clearSidebarTouchButton() {
+    pendingSidebarTouchButton = null;
+  }
+
   function syncPanelWidth() {
     workspace.classList.toggle("with-panel", sidePanel.classList.contains("active"));
     sendResize();
@@ -951,8 +1147,26 @@ function init(baseTransport, config) {
     syncPanelWidth();
   }
 
+  function installResizeObserver() {
+    if (resizeObserver || typeof ResizeObserver !== "function") return;
+    resizeObserver = new ResizeObserver(() => {
+      requestAnimationFrame(() => {
+        sendResize();
+        requestAnimationFrame(() => sendResize());
+      });
+    });
+    resizeObserver.observe(workspace);
+    resizeObserver.observe(terminalStack);
+    resizeObserver.observe(tabBar);
+    if (mobileInputBar) resizeObserver.observe(mobileInputBar);
+  }
+
   sidePanel.addEventListener("transitionend", syncPanelWidth);
+  sidePanel.addEventListener("touchstart", preserveTerminalFocusFromSidebarPress, { passive: false, capture: true });
+  sidePanel.addEventListener("touchend", triggerSidebarButtonWithoutBlur, { passive: false, capture: true });
+  sidePanel.addEventListener("touchcancel", clearSidebarTouchButton, { capture: true });
   if (window.matchMedia("(pointer: fine)").matches) toggleSidePanel();
+  installResizeObserver();
 
   let swipeStart = null;
   let twoFingerStart = null;
@@ -1105,6 +1319,7 @@ function init(baseTransport, config) {
     if (xtermEl) xtermEl.classList.add("select-mode");
     selectOverlay.scrollTop = selectOverlay.scrollHeight;
     spSel.classList.add("sp-active");
+    setTerminalInputActive(false);
   }
 
   function exitSelectMode() {
@@ -1116,6 +1331,7 @@ function init(baseTransport, config) {
     spSel.classList.remove("sp-active");
     currentTerm()?.scrollToBottom();
     focusCurrent();
+    updateMobileInputBar();
   }
 
   let dragCount = 0;
@@ -1164,6 +1380,7 @@ function init(baseTransport, config) {
   let voiceCancelled = false;
   let voiceAbort = null;
   let voiceMode = null;
+  let voiceShouldRestoreTerminalFocus = false;
 
   function cancelVoiceAgent() {
     currentTab()?.transport.cancelAgent().catch(() => {});
@@ -1174,19 +1391,22 @@ function init(baseTransport, config) {
       voiceStream.getTracks().forEach(track => track.stop());
       voiceStream = null;
     }
+    const restoreTerminalFocus = voiceShouldRestoreTerminalFocus;
     voiceRecorder = null;
     voiceCancelled = false;
     voiceAbort = null;
     voiceMode = null;
+    voiceShouldRestoreTerminalFocus = false;
     spMic.classList.remove("recording", "processing");
     spDict.classList.remove("recording", "processing");
     spCancel.disabled = true;
-    focusCurrent();
+    if (restoreTerminalFocus) focusCurrent();
   }
 
   function startVoiceRecording(mode) {
     const tab = currentTab();
     if (!tab || voiceRecorder) return;
+    voiceShouldRestoreTerminalFocus = keyboardVisible && terminalInputActive;
     if (!navigator.mediaDevices || !window.MediaRecorder) {
       showToast("Voice not supported");
       return;
@@ -1227,7 +1447,15 @@ function init(baseTransport, config) {
             return;
           }
           if (mode === "dict") {
-            if (data.text) tab.transport.write(data.text).catch(() => tab.markDisconnected());
+            if (data.text) {
+              tab.transport.write(data.text).then(() => {
+                if (manager.activeTab === tab) {
+                  tab.term.scrollToBottom();
+                  requestAnimationFrame(() => tab.term.scrollToBottom());
+                  setTimeout(() => tab.term.scrollToBottom(), 50);
+                }
+              }).catch(() => tab.markDisconnected());
+            }
             return;
           }
           tab.addAgentLog(data.response, data.commands);
@@ -1295,7 +1523,6 @@ function init(baseTransport, config) {
 
   spHelp.addEventListener("click", () => helpModal.classList.add("active"));
 
-  const textInputModal = document.getElementById("text-input-modal");
   const textInputArea = document.getElementById("text-input-area");
   const textInputSend = document.getElementById("text-input-send");
   const textInputClose = document.getElementById("text-input-close");
@@ -1307,12 +1534,14 @@ function init(baseTransport, config) {
   function openTextInput() {
     textInputModal.classList.add("active");
     textInputArea.value = "";
+    setTerminalInputActive(false);
     setTimeout(() => textInputArea.focus(), 50);
   }
 
   function closeTextInput() {
     textInputModal.classList.remove("active");
     focusCurrent();
+    updateMobileInputBar();
   }
 
   function sendTextMessage() {
@@ -1435,7 +1664,6 @@ function init(baseTransport, config) {
     });
   });
 
-  const pasteEditorModal = document.getElementById("paste-editor-modal");
   const pasteEditorArea = document.getElementById("paste-editor-area");
   const pasteEditorCancel = document.getElementById("paste-editor-cancel");
   let pasteEditorOpen = false;
@@ -1444,6 +1672,7 @@ function init(baseTransport, config) {
     pasteEditorOpen = true;
     pasteEditorModal.classList.add("active");
     spPaste.classList.add("sp-active");
+    setTerminalInputActive(false);
     setTimeout(() => pasteEditorArea.focus(), 50);
   }
 
@@ -1456,6 +1685,7 @@ function init(baseTransport, config) {
     if (text && tab) tab.transport.write("\x1b[200~" + text + "\x1b[201~").catch(() => tab.markDisconnected());
     pasteEditorArea.value = "";
     focusCurrent();
+    updateMobileInputBar();
   }
 
   function closePasteEditorCancel() {
@@ -1463,6 +1693,7 @@ function init(baseTransport, config) {
     pasteEditorModal.classList.remove("active");
     spPaste.classList.remove("sp-active");
     focusCurrent();
+    updateMobileInputBar();
   }
 
   spPaste.addEventListener("click", () => { if (!pasteEditorOpen) openPasteEditor(); });
@@ -1547,7 +1778,6 @@ function init(baseTransport, config) {
     });
   });
 
-  const settingsModal = document.getElementById("settings-modal");
   const settingsGoogle = document.getElementById("settings-google");
   const settingsGroq = document.getElementById("settings-groq");
   const settingsInworld = document.getElementById("settings-inworld");
@@ -1580,10 +1810,12 @@ function init(baseTransport, config) {
   function closeSettings() {
     settingsModal.classList.remove("active");
     focusCurrent();
+    updateMobileInputBar();
   }
 
   async function openSettings() {
     settingsModal.classList.add("active");
+    setTerminalInputActive(false);
     settingsStatus.textContent = "Loading...";
     settingsStatus.className = "";
     try {
@@ -1654,7 +1886,25 @@ function init(baseTransport, config) {
     manager.createTab({ activate: true }).catch(err => showToast(String(err)));
   });
 
+  const focusTerminalFromTouch = e => {
+    if (!isMobileClient) return;
+    if (suppressNextTerminalFocus) {
+      suppressNextTerminalFocus = false;
+      return;
+    }
+    if (Date.now() < suppressTerminalFocusUntil) return;
+    if (hasActiveModal()) return;
+    if (e.target.closest("#side-panel, #mobile-input-bar, #help-modal, #voice-log-modal, #text-input-modal, #paste-editor-modal, #settings-modal")) return;
+    requestAnimationFrame(() => focusCurrent());
+  };
+
+  terminalStack.addEventListener("touchend", focusTerminalFromTouch, { passive: true });
+  terminalStack.addEventListener("mousedown", focusTerminalFromTouch);
+  tabBar.addEventListener("touchend", focusTerminalFromTouch, { passive: true });
+  tabBar.addEventListener("mousedown", focusTerminalFromTouch);
+
   document.addEventListener("keydown", e => {
+    if (isMobileClient) setTerminalInputActive(true);
     if (e.key.toLowerCase() === "a" && e.ctrlKey && selectOverlay.classList.contains("active")) {
       e.preventDefault();
       manager.selectAllVisibleTerminal();
@@ -1713,6 +1963,104 @@ function init(baseTransport, config) {
     }
   }, { capture: true });
 
+  if (mobileInputBar && isMobileClient) {
+    const repeatableActions = new Set(["left", "right", "up", "down"]);
+    const handleMobileInputPress = e => {
+      const button = e.target.closest(".mobile-input-key");
+      if (!button) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.type === "mousedown" && Date.now() - lastMobileTouchTime < 700) return;
+      if (e.type === "touchstart") lastMobileTouchTime = Date.now();
+      const modifier = button.dataset.key;
+      if (modifier) {
+        stopMobileInputRepeat();
+        mobileModifiers[modifier] = !mobileModifiers[modifier];
+        button.classList.toggle("active", mobileModifiers[modifier]);
+        pulseMobileInputButton(button);
+        focusCurrent();
+        return;
+      }
+      pulseMobileInputButton(button);
+      const sequence = mobileInputSequences[button.dataset.action] || "";
+      if (!sequence) return;
+      sendMobileInput(sequence);
+      if (repeatableActions.has(button.dataset.action)) {
+        startMobileInputRepeat(sequence);
+      } else {
+        stopMobileInputRepeat();
+      }
+    };
+    const handleMobileInputRelease = () => {
+      stopMobileInputRepeat();
+    };
+    mobileInputBar.addEventListener("touchstart", handleMobileInputPress, { passive: false });
+    mobileInputBar.addEventListener("touchend", handleMobileInputRelease, { passive: true });
+    mobileInputBar.addEventListener("touchcancel", handleMobileInputRelease, { passive: true });
+    mobileInputBar.addEventListener("mousedown", handleMobileInputPress);
+    mobileInputBar.addEventListener("mouseup", handleMobileInputRelease);
+    mobileInputBar.addEventListener("mouseleave", handleMobileInputRelease);
+  }
+
+  document.addEventListener("focusin", e => {
+    if (!isMobileClient) return;
+    if (e.target.closest("#text-input-modal, #paste-editor-modal, #settings-modal")) {
+      setTerminalInputActive(false);
+      performLayoutRefresh();
+      return;
+    }
+    if (e.target.classList?.contains("xterm-helper-textarea")) {
+      keyboardVisible = true;
+      setTerminalInputActive(true);
+      performLayoutRefresh();
+    }
+  });
+
+  document.addEventListener("focusout", e => {
+    if (!isMobileClient) return;
+    if (e.target.classList?.contains("xterm-helper-textarea")) {
+      setTimeout(() => {
+        const active = document.activeElement;
+        if (!active || !active.classList?.contains("xterm-helper-textarea")) {
+          keyboardVisible = false;
+          setTerminalInputActive(false);
+          baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+          performLayoutRefresh();
+        }
+      }, 0);
+    }
+  });
+
+  document.addEventListener("beforeinput", e => {
+    if (!isMobileClient) return;
+    if (!mobileModifiers.Control && !mobileModifiers.Alt) return;
+    if (!e.target.classList?.contains("xterm-helper-textarea")) return;
+    if (e.isComposing) return;
+    if (typeof e.data !== "string" || !e.data) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    writeSequenceToCurrentTab(encodeMobileInputSequence(e.data));
+    const textarea = e.target;
+    textarea.value = "";
+    focusCurrent();
+  }, true);
+
+  document.addEventListener("keydown", e => {
+    if (!isMobileClient) return;
+    if (!mobileModifiers.Control && !mobileModifiers.Alt) return;
+    if (!e.target.classList?.contains("xterm-helper-textarea")) return;
+
+    if (e.key === "Backspace" || e.key === "Enter") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const sequence = e.key === "Backspace" ? "\x7f" : "\r";
+      writeSequenceToCurrentTab(encodeMobileInputSequence(sequence));
+      const textarea = e.target;
+      textarea.value = "";
+      focusCurrent();
+    }
+  }, true);
+
   document.body.addEventListener("keydown", e => {
     if (e.ctrlKey && e.shiftKey && e.key === "C") {
       document.execCommand("copy");
@@ -1755,6 +2103,7 @@ function init(baseTransport, config) {
   const recoverConnections = () => {
     manager.resumeActiveReads();
     manager.reconnectDisconnectedTabs();
+    updateMobileInputBar();
   };
 
   document.addEventListener("visibilitychange", () => {
@@ -1765,7 +2114,9 @@ function init(baseTransport, config) {
   window.addEventListener("pageshow", recoverConnections);
 
   const hashSid = window.location.hash.slice(1);
-  manager.createTab({ activate: true, sessionId: hashSid }).then(() => sendResize()).catch(err => {
+  manager.createTab({ activate: true, sessionId: hashSid }).then(() => {
+    performLayoutRefresh();
+  }).catch(err => {
     showToast(String(err), true);
     disconnectOverlay.classList.add("active");
   });

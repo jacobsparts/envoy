@@ -22,10 +22,11 @@ input, textarea, #select-overlay, #select-overlay * {
   -webkit-user-select: text;
 }
 #workspace {
-  height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   padding-right: 0;
+  padding-bottom: 0;
   box-sizing: border-box;
 }
 #workspace.with-panel { padding-right: 50px; }
@@ -88,21 +89,29 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 #tab-bar.single { display: none; }
 #terminal-stack {
-  position: relative;
   flex: 1;
   min-height: 0;
-}
-.terminal-pane {
-  position: absolute;
-  inset: 0;
-  display: none;
+  min-width: 0;
+  display: flex;
   overflow: hidden;
 }
-.terminal-pane.active { display: block; }
+.terminal-pane {
+  display: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.terminal-pane.active {
+  display: flex;
+}
 .terminal-host {
+  flex: 1 1 auto;
   width: 100%;
   height: 100%;
   overflow: hidden;
+  min-width: 0;
+  min-height: 0;
 }
 .terminal-host .xterm {
   height: 100%;
@@ -221,6 +230,9 @@ input, textarea, #select-overlay, #select-overlay * {
   transition: transform 0.2s ease;
 }
 #side-panel.active { transform: translateX(0); }
+#side-panel.with-mobile-input-bar {
+  height: calc(100% - 44px);
+}
 
 .sp-btn {
   width: 36px; height: 36px; border-radius: 50%;
@@ -434,7 +446,66 @@ input, textarea, #select-overlay, #select-overlay * {
 #settings-save { background: #1a3a5c; border-color: #4af; color: #4af; }
 #settings-save:hover { background: #254a6e; }
 
+#mobile-input-bar {
+  display: none;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 35;
+  height: 44px;
+  padding: 4px;
+  box-sizing: border-box;
+  grid-template-columns: repeat(10, minmax(0, 1fr));
+  gap: 4px;
+  background: rgba(10, 10, 10, 0.96);
+  border-top: 1px solid #222;
+  transform: translateY(100%);
+  transition: transform 0.15s ease;
+  pointer-events: none;
+}
+#mobile-input-bar.active {
+  display: grid;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.mobile-input-key {
+  min-width: 0;
+  border: 1px solid #333;
+  border-radius: 6px;
+  background: #181818;
+  color: #ccc;
+  font: 13px 'Source Code Pro', monospace;
+  padding: 0;
+}
+.mobile-input-key:active { background: #2a2a2a; }
+.mobile-input-key.pressed {
+  background: #2a2a2a;
+  border-color: #666;
+  color: #fff;
+}
+.mobile-input-key.active {
+  border-color: #4af;
+  color: #4af;
+  background: #112033;
+}
+
 @media (pointer: coarse) {
   .sp-btn.sp-icon-lg { font-size: 24px; }
   .tab-item { max-width: 180px; }
+  #workspace.with-mobile-input-bar { padding-bottom: 44px; }
+
+  .terminal-host .xterm .xterm-helper-textarea {
+    position: fixed;
+    left: 0;
+    top: auto;
+    bottom: 0;
+    width: 1px;
+    height: 1px;
+    opacity: 0.01;
+    z-index: 5;
+    -webkit-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
+  }
 }
