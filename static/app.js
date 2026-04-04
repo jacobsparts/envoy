@@ -1088,7 +1088,7 @@ function init(baseTransport, config) {
             return;
           }
           voiceReset();
-          showToast(mode === "dict" ? "Dictation failed" : "Voice failed");
+          showToast(String(err.message || err));
           console.error(err);
         });
       };
@@ -1180,7 +1180,7 @@ function init(baseTransport, config) {
       spText.classList.remove("processing");
       textAbort = null;
       if (controller.signal.aborted) return;
-      showToast("Text agent failed");
+      showToast(String(err.message || err));
       console.error(err);
     });
   }
