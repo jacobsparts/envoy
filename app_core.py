@@ -83,7 +83,10 @@ def resolve_cli(url_path: str) -> tuple[list[str], str]:
 
 
 def build_title(path: str) -> str:
-    return socket.gethostname()
+    clean = "/" + path.strip("/")
+    if clean == "/":
+        return socket.gethostname()
+    return clean.lstrip("/")
 
 
 class Session:
