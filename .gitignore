@@ -17,3 +17,6 @@ __pycache__/
 
 # Codex
 .codex
+
+# Claude Code
+CLAUDE.md
