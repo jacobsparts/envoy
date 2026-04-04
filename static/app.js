@@ -863,12 +863,25 @@ function init(baseTransport, config) {
     return currentTab()?.host.querySelector(".xterm") || null;
   }
 
+  function syncSelectOverlaySize() {
+    if (!selectOverlay.classList.contains("active")) return;
+    const tab = currentTab();
+    if (!tab) return;
+    const dims = tab.term?._core?._renderService?.dimensions?.css?.cell;
+    if (dims) {
+      selectOverlay.style.setProperty("--cell-height", dims.height + "px");
+      selectOverlay.style.setProperty("--cell-font-size", tab.term.options.fontSize + "px");
+    }
+    selectOverlay.style.height = `${terminalStack.clientHeight}px`;
+  }
+
   function focusCurrent() {
     currentTab()?.focus();
   }
 
   function sendResize() {
     if (manager.activeTab) manager.activeTab.fitTerminal();
+    syncSelectOverlaySize();
   }
 
   function adjustFontSize(delta) {
@@ -1086,8 +1099,7 @@ function init(baseTransport, config) {
     const dims = tab.term._core._renderService.dimensions.css.cell;
     selectOverlay.style.setProperty("--cell-height", dims.height + "px");
     selectOverlay.style.setProperty("--cell-font-size", tab.term.options.fontSize + "px");
-    const screen = tab.host.querySelector(".xterm-screen");
-    if (screen) selectOverlay.style.height = screen.style.height;
+    selectOverlay.style.height = `${terminalStack.clientHeight}px`;
     selectOverlay.classList.add("active");
     const xtermEl = currentXtermEl();
     if (xtermEl) xtermEl.classList.add("select-mode");
@@ -1098,6 +1110,7 @@ function init(baseTransport, config) {
   function exitSelectMode() {
     selectOverlay.classList.remove("active");
     selectOverlay.innerHTML = "";
+    selectOverlay.style.height = "";
     const xtermEl = currentXtermEl();
     if (xtermEl) xtermEl.classList.remove("select-mode");
     spSel.classList.remove("sp-active");
