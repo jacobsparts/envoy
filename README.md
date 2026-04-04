@@ -1,76 +1,103 @@
-# envoy
+<p align="center">
+  <img src="static/icon.svg" width="128" alt="envoy icon"/>
+</p>
 
-This repo can run in two first-class modes:
+<h1 align="center">envoy</h1>
 
-- web server mode under `/envoy/`
-- local desktop mode backed by `pywebview`
+<p align="center">
+  A terminal emulator with a built-in voice &amp; text AI agent.<br>
+  Runs as a <strong>web app</strong> or a native <strong>desktop app</strong> &mdash; same codebase, same features.
+</p>
 
-The terminal/session runtime is shared between both modes. `pywebview` is no longer required for the server install.
+<p align="center">
+  <img src="static/screenshot.png" width="720" alt="envoy desktop app"/>
+</p>
 
-## Run
+---
 
-Create a local environment and install dependencies:
+## Features
+
+- **Full terminal emulation** &mdash; xterm.js with 256-color support, scrollback, and bracketed paste
+- **Multi-tab sessions** &mdash; open, close, and switch between independent terminal tabs
+- **Voice agent** &mdash; hold a button and talk; the agent sees your terminal, runs commands, and speaks back
+- **Text agent** &mdash; type a message instead; same capabilities, no microphone needed
+- **Dictation** &mdash; voice-to-text transcription pasted directly into the terminal
+- **Drag-and-drop file upload** &mdash; drop a file onto the terminal and its path is inserted at the cursor
+- **Aliases** &mdash; map URL paths to shell commands via `aliases.conf`
+- **PWA support** &mdash; installable from the browser with offline caching
+- **Dark theme** &mdash; designed for extended terminal use
+
+## Architecture
+
+```
+Browser / pywebview
+  ├── xterm.js          terminal emulation
+  ├── app.js            tabs, voice, drag-drop, settings
+  └── transport layer
+        ├── PywebviewTransport   (desktop: JS ↔ Python bridge)
+        └── BrowserTransport     (web: HTTP JSON to server.py)
+
+Python backend
+  ├── app_core.py       PTY session management, file uploads
+  ├── voice_chat.py     Gemini agent with terminal tools
+  ├── speech.py         Inworld TTS synthesis
+  ├── agent.py          Gemini tool-calling runtime
+  └── env_config.py     API key management
+```
+
+Both modes share the same runtime (`app_core.py`) and frontend (`app.js`). The only difference is the transport layer.
+
+## Quickstart
+
+### Web mode
 
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements-web.txt
-```
-
-For desktop mode, install the desktop runtime instead:
-
-```bash
-uv pip install --python .venv/bin/python -r requirements-desktop.txt
-```
-
-Set the local API keys:
-
-```bash
-export GOOGLE_API_KEY=your_key_here
-export GROQ_API_KEY=your_key_here
-export INWORLD_API_KEY=your_key_here
-```
-
-Or put it in a local `.env` file:
-
-```bash
-GOOGLE_API_KEY=your_key_here
-GROQ_API_KEY=your_key_here
-INWORLD_API_KEY=your_key_here
-```
-
-Start the web app:
-
-```bash
 python server.py
 ```
 
-Then open:
+Open `http://localhost:8080/envoy/`
 
-```text
-http://localhost:8080/envoy/
-```
-
-Start the desktop app:
+### Desktop mode
 
 ```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements-desktop.txt
 ./envoy-desktop
 ```
 
-Optional launch target:
+An optional launch target can open a specific alias or path:
 
 ```bash
-./envoy-desktop /path-or-alias
+./envoy-desktop /python        # resolved via aliases.conf
+./envoy-desktop /projects/foo  # resolved relative to $HOME
 ```
 
-`/` opens an interactive shell. Any non-root path is resolved through `aliases.conf` first, then as a file under `$HOME`.
+## API Keys
 
-## Notes
+Voice and agent features require API keys. Set them as environment variables, in a `.env` file, or through the in-app settings dialog.
 
-- The browser app is served from `/envoy/`, and all web routes are prefixed with `/envoy/`.
-- The desktop host keeps the xterm.js frontend and uses a `pywebview` bridge.
-- The web host serves the same frontend and talks to the shared runtime over HTTP.
-- Drag-and-drop uploads still write into `.envoy_uploads` and paste the resulting path into the terminal.
-- Voice/text agent calls require `GOOGLE_API_KEY`.
-- Dictation requires `GROQ_API_KEY`.
-- Spoken agent audio requires `INWORLD_API_KEY`.
-- The desktop app exposes an API settings dialog and stores those values in a local `.env`.
+| Key | Required for |
+|-----|-------------|
+| `GOOGLE_API_KEY` | Voice & text agent (Gemini) |
+| `GROQ_API_KEY` | Dictation (Whisper) |
+| `INWORLD_API_KEY` | Spoken agent responses (TTS) |
+
+The terminal itself works without any keys configured.
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+T` | New tab |
+| `Ctrl+W` | Close tab |
+| `Ctrl+Tab` | Next tab |
+| `Ctrl+\` | Toggle toolbar |
+| `Ctrl+Shift+Space` | Voice agent |
+| `Ctrl+Shift+E` | Text agent / paste editor |
+| `Ctrl+Shift+0` / `+` / `-` | Reset / increase / decrease font size |
+
+## License
+
+MIT
