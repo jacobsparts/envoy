@@ -18,7 +18,7 @@ import requests
 from agent import Agent
 from env_config import load_app_env
 
-#logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 log = logging.getLogger("voice_chat")
 
 load_app_env()

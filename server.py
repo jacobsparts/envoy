@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import signal
 import threading
@@ -215,11 +216,17 @@ def make_handler():
                     json_response(self, 200, {"ok": True})
                     return
 
+            except BrokenPipeError:
+                return
             except ValueError as exc:
                 json_response(self, 400, {"error": str(exc)})
                 return
             except Exception as exc:
-                json_response(self, 500, {"error": str(exc)})
+                logging.exception("Error handling %s", parsed.path)
+                try:
+                    json_response(self, 500, {"error": str(exc)})
+                except BrokenPipeError:
+                    pass
                 return
 
             self.send_error(404)

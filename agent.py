@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import inspect
+import logging
 import os
 from typing import Any
 
 import requests
+
+log = logging.getLogger("agent")
 
 
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -102,7 +105,10 @@ class Agent:
             },
             timeout=120,
         )
-        response.raise_for_status()
+        if not response.ok:
+            body = response.text
+            log.error("Gemini API %s: %s", response.status_code, body)
+            raise RuntimeError(f"Gemini API {response.status_code}: {body}")
         return response.json()
 
     def _dispatch_tool(self, call: dict[str, Any]) -> Any:
