@@ -146,7 +146,7 @@ class Session:
             rc = self.proc.wait()
             self.exit_code = rc
             hide_cursor = "\x1b[?25l"
-            if rc == 0:
+            if rc in (0, 130):
                 message = f"{hide_cursor}\r\n\x1b[90m[process exited]\x1b[0m\r\n"
             elif rc > 0:
                 message = f"{hide_cursor}\r\n\x1b[31m[process exited with code {rc}]\x1b[0m\r\n"
@@ -294,7 +294,7 @@ class EnvoyService:
         if session_id:
             with self._lock:
                 session = self._sessions.get(session_id)
-            if session:
+            if session and session.alive:
                 session.cancel_timeout()
                 client_id = secrets.token_hex(8)
                 with session._lock:
