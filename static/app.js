@@ -1430,6 +1430,20 @@ function init(baseTransport, config) {
     }
   }, { capture: true });
 
+  document.body.addEventListener("keydown", e => {
+    if (e.ctrlKey && e.shiftKey && e.key === "C") {
+      document.execCommand("copy");
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }, false);
+  document.body.addEventListener("keyup", e => {
+    if (e.ctrlKey && e.shiftKey && e.key === "C") {
+      e.stopPropagation();
+      e.preventDefault();
+    }
+  }, false);
+
   window.addEventListener("beforeunload", () => {
     if (!(window.pywebview && window.pywebview.api)) {
       for (const tab of manager.tabs) {
