@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content">
 <meta name="theme-color" content="#000000">
+<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="dark">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
@@ -30,12 +32,19 @@
   <button id="sp-mic" class="sp-btn" title="Voice agent">&#x1F916;</button>
   <button id="sp-text" class="sp-btn sp-icon-lg" title="Text agent">&#x2328;</button>
   <button id="sp-log" class="sp-btn" title="Agent log">&#x1F4DC;</button>
+  <button id="sp-link" class="sp-btn" title="Copy link">&#x1F517;</button>
   <button id="sp-settings" class="sp-btn" title="API settings">&#9881;</button>
   <div style="flex:1"></div>
   <button id="sp-help" class="sp-btn" title="Help">?</button>
 </div>
 <div id="toast"></div>
-<div id="disconnect-overlay">Disconnected</div>
+<div id="disconnect-overlay">
+  <div id="disconnect-message">Disconnected</div>
+  <div id="disconnect-actions">
+    <button id="disconnect-reconnect" type="button">Reconnect</button>
+    <button id="disconnect-close" type="button">Close</button>
+  </div>
+</div>
 <div id="drop-overlay">Drop file here</div>
 <div id="help-modal">
   <div id="help-content">

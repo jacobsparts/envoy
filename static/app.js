@@ -40,6 +40,13 @@ function base64ToBytes(text) {
 }
 
 function copyToClipboard(text) {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    return navigator.clipboard.writeText(text).catch(() => copyToClipboardFallback(text));
+  }
+  return copyToClipboardFallback(text);
+}
+
+function copyToClipboardFallback(text) {
   const active = document.activeElement;
   const ta = document.createElement("textarea");
   ta.value = text;
@@ -584,7 +591,11 @@ class TerminalTab {
   canReconnect() {
     if (this.closed || !this.disconnected || this.reconnecting) return false;
     if (!this.transport.sessionId) return false;
-    return this.disconnectInfo?.kind !== "evicted" && this.disconnectInfo?.kind !== "exit";
+    return this.disconnectInfo?.kind !== "exit";
+  }
+
+  canAutoReconnect() {
+    return this.canReconnect() && this.disconnectInfo?.kind !== "evicted";
   }
 
   async reconnect() {
@@ -704,7 +715,20 @@ class TabManager {
   }
 
   updateDisconnectOverlay() {
-    this.elements.disconnect.classList.toggle("active", !!(this.activeTab && this.activeTab.disconnected));
+    const tab = this.activeTab;
+    const disconnected = !!(tab && tab.disconnected);
+    this.elements.disconnect.classList.toggle("active", disconnected);
+    if (!this.elements.disconnectMessage || !this.elements.disconnectReconnect || !this.elements.disconnectClose) return;
+    if (!disconnected) {
+      this.elements.disconnectMessage.textContent = "Disconnected";
+      this.elements.disconnectReconnect.disabled = false;
+      this.elements.disconnectClose.disabled = false;
+      return;
+    }
+    const kind = tab.disconnectInfo?.kind;
+    this.elements.disconnectMessage.textContent = kind === "evicted" ? "Session evicted" : "Disconnected";
+    this.elements.disconnectReconnect.disabled = !tab.canReconnect();
+    this.elements.disconnectClose.disabled = false;
   }
 
   renderAgentLog() {
@@ -795,7 +819,7 @@ class TabManager {
 
   reconnectDisconnectedTabs() {
     for (const tab of this.tabs) {
-      if (tab.canReconnect()) {
+      if (tab.canAutoReconnect()) {
         tab.reconnect().catch(err => console.error(err));
       }
     }
@@ -826,6 +850,9 @@ function init(baseTransport, config) {
   const tabAdd = document.getElementById("tab-add");
   const terminalStack = document.getElementById("terminal-stack");
   const disconnectOverlay = document.getElementById("disconnect-overlay");
+  const disconnectMessage = document.getElementById("disconnect-message");
+  const disconnectReconnect = document.getElementById("disconnect-reconnect");
+  const disconnectClose = document.getElementById("disconnect-close");
   const helpModal = document.getElementById("help-modal");
   const toast = document.getElementById("toast");
   const selectOverlay = document.getElementById("select-overlay");
@@ -905,6 +932,9 @@ function init(baseTransport, config) {
     stack: terminalStack,
     tabs: tabBar,
     disconnect: disconnectOverlay,
+    disconnectMessage,
+    disconnectReconnect,
+    disconnectClose,
     agentLog: agentLogEntries,
     selectOverlay,
   });
@@ -1101,6 +1131,7 @@ function init(baseTransport, config) {
   const spHelp = document.getElementById("sp-help");
   const spSettings = document.getElementById("sp-settings");
   const spLog = document.getElementById("sp-log");
+  const spLink = document.getElementById("sp-link");
   const spText = document.getElementById("sp-text");
   const spPaste = document.getElementById("sp-paste");
   const spSel = document.getElementById("sp-sel");
@@ -1370,6 +1401,30 @@ function init(baseTransport, config) {
   spLog.addEventListener("click", () => {
     manager.renderAgentLog();
     agentLogModal.classList.add("active");
+  });
+  disconnectReconnect.addEventListener("click", () => {
+    const tab = currentTab();
+    if (!tab || !tab.canReconnect()) return;
+    disconnectReconnect.disabled = true;
+    disconnectClose.disabled = true;
+    disconnectMessage.textContent = "Reconnecting...";
+    tab.reconnect().catch(err => {
+      showToast(String(err));
+      manager.updateDisconnectOverlay();
+    });
+  });
+  disconnectClose.addEventListener("click", () => {
+    const tab = currentTab();
+    if (!tab) return;
+    manager.closeTab(tab.id).catch(err => showToast(String(err)));
+  });
+  spLink.addEventListener("click", () => {
+    const url = new URL(window.location.href);
+    const sid = manager.activeTab?.transport.sessionId || "";
+    url.hash = sid ? sid : "";
+    Promise.resolve(copyToClipboard(url.toString()))
+      .then(() => showToast("Link copied"))
+      .catch(err => showToast(String(err.message || err)));
   });
   agentLogModal.addEventListener("click", e => {
     if (e.target === agentLogModal) agentLogModal.classList.remove("active");

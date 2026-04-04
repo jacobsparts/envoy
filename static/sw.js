@@ -1,4 +1,4 @@
-const CACHE_NAME = 'envoy-v3';
+const CACHE_NAME = 'envoy-v4';
 const urlsToCache = [
   '/envoy/static/index.html',
   '/envoy/static/app.css',

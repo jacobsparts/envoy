@@ -143,8 +143,39 @@ input, textarea, #select-overlay, #select-overlay * {
   padding: 8px 20px;
   z-index: 25; pointer-events: none;
   font: bold 14px 'Source Code Pro', monospace; color: #f55;
+  min-width: 220px;
+  text-align: center;
 }
 #disconnect-overlay.active { display: block; }
+#disconnect-message {
+  pointer-events: none;
+}
+#disconnect-actions {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+  pointer-events: auto;
+}
+#disconnect-actions button {
+  background: #2a2a2a;
+  color: #f2f2f2;
+  border: 1px solid #666;
+  border-radius: 4px;
+  padding: 6px 12px;
+  font: 14px 'Source Code Pro', monospace;
+  cursor: pointer;
+}
+#disconnect-actions button:active { background: #3a3a3a; }
+#disconnect-reconnect {
+  border-color: #4af;
+  color: #4af;
+  background: #15283a;
+}
+#disconnect-actions button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 
 #drop-overlay {
   display: none; position: fixed; inset: 0;
@@ -226,6 +257,7 @@ input, textarea, #select-overlay, #select-overlay * {
   z-index: 20; box-sizing: border-box;
   display: flex; flex-direction: column;
   align-items: center; padding: 12px 0; gap: 12px;
+  overflow: hidden;
   transform: translateX(100%);
   transition: transform 0.2s ease;
 }
@@ -494,6 +526,15 @@ input, textarea, #select-overlay, #select-overlay * {
   .sp-btn.sp-icon-lg { font-size: 24px; }
   .tab-item { max-width: 180px; }
   #workspace.with-mobile-input-bar { padding-bottom: 44px; }
+  #side-panel {
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-y;
+  }
+  #side-panel::-webkit-scrollbar { width: 0; height: 0; }
 
   .terminal-host .xterm .xterm-helper-textarea {
     position: fixed;
