@@ -610,6 +610,10 @@ class TabManager {
         await this.baseTransport.closeApp();
         return;
       }
+      if (window.matchMedia('(display-mode: standalone)').matches && window.matchMedia('(pointer: fine)').matches) {
+        window.close();
+        return;
+      }
       await this.createTab({ activate: true });
       return;
     }

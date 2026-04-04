@@ -1,0 +1,11 @@
+# envoy aliases
+# Maps URL paths to commands. One alias per line:
+#   /name = command [args...]
+#
+# The command is run directly (not through a shell).
+# Use ~ for home directory in paths.
+#
+# Examples:
+#   /lister = ~/ebay/lister/cli.py
+#   /htop = /usr/bin/htop
+#   /python = /usr/bin/python3
