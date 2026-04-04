@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="static/icon.svg" width="128" alt="envoy icon"/>
+  <picture>
+    <img src="static/icon.svg" width="128" alt="envoy icon"/>
+  </picture>
 </p>
 
 <h1 align="center">envoy</h1>
@@ -9,9 +11,7 @@
   Runs as a <strong>web app</strong> or a native <strong>desktop app</strong> &mdash; same codebase, same features.
 </p>
 
-<p align="center">
-  <img src="static/screenshot.png" width="720" alt="envoy desktop app"/>
-</p>
+![envoy desktop app](static/screenshot.png)
 
 ---
 
