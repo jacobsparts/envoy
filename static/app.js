@@ -1065,6 +1065,7 @@ function init(baseTransport, config) {
         }
         button.classList.remove("recording");
         button.classList.add("processing");
+        if (mode === "agent") showToast("Thinking...", true);
         const mime = recorder.mimeType.split(";")[0];
         const controller = new AbortController();
         voiceAbort = controller;
@@ -1085,10 +1086,13 @@ function init(baseTransport, config) {
           tab.addAgentLog(data.response, data.commands);
           manager.renderAgentLog();
           if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
-          if (data.speech) showToast(data.speech.length > 80 ? data.speech.substring(0, 77) + "..." : data.speech, false, true);
+          const msg = data.speech || data.response;
+          if (msg) showToast(msg.length > 80 ? msg.substring(0, 77) + "..." : msg, false, true);
+          else dismissToast();
         }).catch(err => {
           if (controller.signal.aborted) {
             voiceReset();
+            dismissToast();
             return;
           }
           voiceReset();
@@ -1148,7 +1152,10 @@ function init(baseTransport, config) {
   const textInputArea = document.getElementById("text-input-area");
   const textInputSend = document.getElementById("text-input-send");
   const textInputClose = document.getElementById("text-input-close");
+  const textInputDict = document.getElementById("text-input-dict");
   let textAbort = null;
+  let textDictRecorder = null;
+  let textDictStream = null;
 
   function openTextInput() {
     textInputModal.classList.add("active");
@@ -1167,6 +1174,7 @@ function init(baseTransport, config) {
     if (!tab || !text) return;
     closeTextInput();
     spText.classList.add("processing");
+    showToast("Thinking...", true);
     const controller = new AbortController();
     textAbort = controller;
     tab.transport.sendTextMessage(text).then(data => {
@@ -1179,11 +1187,13 @@ function init(baseTransport, config) {
       tab.addAgentLog(data.response, data.commands, text);
       manager.renderAgentLog();
       if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
-      if (data.speech) showToast(data.speech.length > 80 ? data.speech.substring(0, 77) + "..." : data.speech, false, true);
+      const msg = data.speech || data.response;
+      if (msg) showToast(msg.length > 80 ? msg.substring(0, 77) + "..." : msg, false, true);
+      else dismissToast();
     }).catch(err => {
       spText.classList.remove("processing");
       textAbort = null;
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) { dismissToast(); return; }
       showToast(String(err.message || err));
       console.error(err);
     });
@@ -1216,6 +1226,67 @@ function init(baseTransport, config) {
   }, { capture: true });
   textInputArea.addEventListener("keypress", e => e.stopPropagation(), { capture: true });
   textInputModal.addEventListener("click", e => { if (e.target === textInputModal) closeTextInput(); });
+
+  function stopTextDict() {
+    if (textDictStream) {
+      textDictStream.getTracks().forEach(t => t.stop());
+      textDictStream = null;
+    }
+    textDictRecorder = null;
+    textInputDict.classList.remove("recording", "processing");
+    textInputDict.textContent = "Dictate";
+  }
+
+  textInputDict.addEventListener("click", () => {
+    const tab = currentTab();
+    if (!tab) return;
+    if (textDictRecorder && textDictRecorder.state === "recording") {
+      textDictRecorder.stop();
+      return;
+    }
+    if (textDictRecorder) return;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      textDictStream = stream;
+      const chunks = [];
+      const mimeOpts = ["audio/ogg;codecs=opus", "audio/ogg", "audio/webm;codecs=opus", "audio/webm", "audio/wav"];
+      const mimeOpt = mimeOpts.find(m => MediaRecorder.isTypeSupported(m));
+      const recorder = mimeOpt ? new MediaRecorder(stream, { mimeType: mimeOpt }) : new MediaRecorder(stream);
+      textDictRecorder = recorder;
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        textInputDict.classList.remove("recording");
+        textInputDict.classList.add("processing");
+        textInputDict.textContent = "Transcribing...";
+        const mime = recorder.mimeType.split(";")[0];
+        const blob = new Blob(chunks, { type: mime });
+        tab.transport.transcribeAudio(blob, mime).then(data => {
+          stopTextDict();
+          if (data.text) {
+            const start = textInputArea.selectionStart;
+            const end = textInputArea.selectionEnd;
+            const before = textInputArea.value.substring(0, start);
+            const after = textInputArea.value.substring(end);
+            const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+            textInputArea.value = before + prefix + data.text + after;
+            const cursor = start + prefix.length + data.text.length;
+            textInputArea.selectionStart = textInputArea.selectionEnd = cursor;
+          }
+          textInputArea.focus();
+        }).catch(err => {
+          stopTextDict();
+          showToast("Dictation: " + (err.message || err));
+          textInputArea.focus();
+        });
+      };
+      recorder.start();
+      textInputDict.classList.add("recording");
+      textInputDict.textContent = "Stop";
+    }).catch(err => {
+      stopTextDict();
+      showToast("Mic: " + err.message);
+    });
+  });
 
   const pasteEditorModal = document.getElementById("paste-editor-modal");
   const pasteEditorArea = document.getElementById("paste-editor-area");
@@ -1263,6 +1334,71 @@ function init(baseTransport, config) {
     e.stopPropagation();
   }, { capture: true });
   pasteEditorArea.addEventListener("keypress", e => e.stopPropagation(), { capture: true });
+
+  const pasteEditorDict = document.getElementById("paste-editor-dict");
+  let pasteDictRecorder = null;
+  let pasteDictStream = null;
+
+  function stopPasteDict() {
+    if (pasteDictStream) {
+      pasteDictStream.getTracks().forEach(t => t.stop());
+      pasteDictStream = null;
+    }
+    pasteDictRecorder = null;
+    pasteEditorDict.classList.remove("recording", "processing");
+    pasteEditorDict.textContent = "Dictate";
+  }
+
+  pasteEditorDict.addEventListener("click", () => {
+    const tab = currentTab();
+    if (!tab) return;
+    if (pasteDictRecorder && pasteDictRecorder.state === "recording") {
+      pasteDictRecorder.stop();
+      return;
+    }
+    if (pasteDictRecorder) return;
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      pasteDictStream = stream;
+      const chunks = [];
+      const mimeOpts = ["audio/ogg;codecs=opus", "audio/ogg", "audio/webm;codecs=opus", "audio/webm", "audio/wav"];
+      const mimeOpt = mimeOpts.find(m => MediaRecorder.isTypeSupported(m));
+      const recorder = mimeOpt ? new MediaRecorder(stream, { mimeType: mimeOpt }) : new MediaRecorder(stream);
+      pasteDictRecorder = recorder;
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        pasteEditorDict.classList.remove("recording");
+        pasteEditorDict.classList.add("processing");
+        pasteEditorDict.textContent = "Transcribing...";
+        const mime = recorder.mimeType.split(";")[0];
+        const blob = new Blob(chunks, { type: mime });
+        tab.transport.transcribeAudio(blob, mime).then(data => {
+          stopPasteDict();
+          if (data.text) {
+            const start = pasteEditorArea.selectionStart;
+            const end = pasteEditorArea.selectionEnd;
+            const before = pasteEditorArea.value.substring(0, start);
+            const after = pasteEditorArea.value.substring(end);
+            const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+            pasteEditorArea.value = before + prefix + data.text + after;
+            const cursor = start + prefix.length + data.text.length;
+            pasteEditorArea.selectionStart = pasteEditorArea.selectionEnd = cursor;
+          }
+          pasteEditorArea.focus();
+        }).catch(err => {
+          stopPasteDict();
+          showToast("Dictation: " + (err.message || err));
+          pasteEditorArea.focus();
+        });
+      };
+      recorder.start();
+      pasteEditorDict.classList.add("recording");
+      pasteEditorDict.textContent = "Stop";
+    }).catch(err => {
+      stopPasteDict();
+      showToast("Mic: " + err.message);
+    });
+  });
 
   const settingsModal = document.getElementById("settings-modal");
   const settingsGoogle = document.getElementById("settings-google");

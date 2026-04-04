@@ -366,7 +366,7 @@ class EnvoyService:
         try:
             iface = SessionTerminal(session)
             reply = process_text_message(text, iface, cancel)
-            speech = "\n".join(iface.messages)
+            speech = "\n".join(iface.messages) or reply
             return {
                 "response": reply,
                 "speech": speech,
@@ -387,7 +387,7 @@ class EnvoyService:
         try:
             iface = SessionTerminal(session)
             reply = process_voice_message(self._decode(audio_b64), mime_type, iface, cancel)
-            speech = "\n".join(iface.messages)
+            speech = "\n".join(iface.messages) or reply
             return {
                 "response": reply,
                 "speech": speech,

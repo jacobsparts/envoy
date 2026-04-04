@@ -292,14 +292,18 @@ input, textarea, #select-overlay, #select-overlay * {
   border: 1px solid #444;
   border-radius: 8px;
   padding: 16px;
-  width: min(500px, 90vw);
+  width: min(600px, 90vw);
+  height: min(500px, 90vh);
+  display: flex; flex-direction: column;
+  box-sizing: border-box;
 }
 #text-input-area {
   width: 100%; box-sizing: border-box;
   background: #111; color: #ccc; border: 1px solid #444;
   border-radius: 4px; padding: 10px;
   font: 14px 'Source Code Pro', monospace;
-  resize: vertical; outline: none;
+  resize: none; outline: none;
+  flex: 1;
 }
 #text-input-area:focus { border-color: #4af; }
 #text-input-actions {
@@ -312,6 +316,9 @@ input, textarea, #select-overlay, #select-overlay * {
   font: 14px 'Source Code Pro', monospace;
 }
 #text-input-actions button:hover { background: #444; }
+#text-input-dict { margin-right: auto; }
+#text-input-dict.recording { background: #a33; border-color: #f66; color: #fff; }
+#text-input-dict.processing { opacity: 0.5; pointer-events: none; }
 #text-input-send { background: #1a3a5c; border-color: #4af; color: #4af; }
 #text-input-send:hover { background: #254a6e; }
 
@@ -355,6 +362,9 @@ input, textarea, #select-overlay, #select-overlay * {
   font: 14px 'Source Code Pro', monospace;
 }
 #paste-editor-actions button:hover { background: #444; }
+#paste-editor-dict { margin-right: auto; }
+#paste-editor-dict.recording { background: #a33; border-color: #f66; color: #fff; }
+#paste-editor-dict.processing { opacity: 0.5; pointer-events: none; }
 
 #settings-modal {
   display: none; position: fixed; inset: 0;

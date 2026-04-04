@@ -67,10 +67,8 @@ terminal output. If you cannot see the result, say so.
 Keep responses brief and conversational -- they will be spoken aloud. \
 Do not use markdown formatting.
 
-You can run terminal commands and speak to the user using the provided tools. \
-If the result of a command is self-evident from the terminal output, \
-call done instead of speak -- do not narrate what the user can already see. \
-Only speak when you have something useful to add beyond what the terminal shows."""
+You can run terminal commands using the provided tools. \
+Your final text response will be spoken aloud to the user."""
 
 
 class CancelledError(Exception):
@@ -131,18 +129,6 @@ class VoiceChatAgent(Agent):
         output = self._terminal.read_output()
         return output if output.strip() else "(no new output)"
 
-    @Agent.tool
-    def speak(self, message: str = "Message to speak to the user"):
-        """Send a spoken response to the user."""
-        self._check_cancelled()
-        self._terminal.send_message(message)
-        self.respond(message)
-
-    @Agent.tool
-    def done(self):
-        """Finish without speaking. Use when the terminal output speaks for itself."""
-        self._check_cancelled()
-        self.respond("")
 
 
 def transcribe_audio(audio_data, mime_type):
