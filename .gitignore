@@ -18,5 +18,8 @@ __pycache__/
 # Codex
 .codex
 
+# Aliases (user-specific)
+aliases.conf
+
 # Claude Code
 CLAUDE.md
