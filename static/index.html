@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content">
+<meta name="theme-color" content="#000000">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="webterm">
+<title>webterm</title>
+<link rel="icon" href="/webterm/static/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/webterm/static/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="/webterm/static/icon-192.png">
+<link rel="manifest" href="/webterm/static/manifest.json">
+<link rel="stylesheet" href="/webterm/static/xterm.css">
+<link rel="stylesheet" href="/webterm/static/app.css">
+<script defer src="/webterm/static/xterm.js"></script>
+<script defer src="/webterm/static/xterm-addon-fit.js"></script>
+<script defer src="/webterm/static/xterm-addon-serialize.js"></script>
+</head>
+<body>
+<div id="side-panel">
+  <button id="tab-add" class="sp-btn" title="New tab">+</button>
+  <button id="sp-cancel" class="sp-btn" title="Cancel" disabled>&times;</button>
+  <button id="sp-fs" class="sp-btn" title="Fullscreen">&#x26F6;</button>
+  <button id="sp-sel" class="sp-btn" title="Select mode">&#x2263;</button>
+  <button id="sp-paste" class="sp-btn sp-icon-lg" title="Multiline editor">&#x270F;</button>
+  <button id="sp-dict" class="sp-btn" title="Dictate to terminal">&#x1F3A4;</button>
+  <button id="sp-mic" class="sp-btn" title="Voice agent">&#x1F916;</button>
+  <button id="sp-text" class="sp-btn sp-icon-lg" title="Text agent">&#x2328;</button>
+  <button id="sp-log" class="sp-btn" title="Agent log">&#x1F4DC;</button>
+  <button id="sp-settings" class="sp-btn" title="API settings">&#9881;</button>
+  <div style="flex:1"></div>
+  <button id="sp-help" class="sp-btn" title="Help">?</button>
+</div>
+<div id="toast"></div>
+<div id="disconnect-overlay">Disconnected</div>
+<div id="drop-overlay">Drop file here</div>
+<div id="help-modal">
+  <div id="help-content">
+    <h2>Shortcuts</h2>
+    <table>
+      <tr><td>New tab</td><td></td><td>Ctrl+T</td></tr>
+      <tr><td>Close tab</td><td></td><td>Ctrl+W</td></tr>
+      <tr><td>Next tab</td><td></td><td>Ctrl+Tab</td></tr>
+      <tr><td>Toolbar</td><td>Swipe left</td><td>Ctrl+\</td></tr>
+      <tr><td>Voice agent</td><td>2-finger tap</td><td>Ctrl+Shift+Space</td></tr>
+      <tr><td>Multiline editor</td><td></td><td>Ctrl+Shift+E</td></tr>
+      <tr><td>Font larger</td><td>Pinch out</td><td>Ctrl+Shift++</td></tr>
+      <tr><td>Font smaller</td><td>Pinch in</td><td>Ctrl+Shift+-</td></tr>
+      <tr><td>Font reset</td><td></td><td>Ctrl+Shift+0</td></tr>
+    </table>
+  </div>
+</div>
+<div id="voice-log-modal">
+  <div id="voice-log-content">
+    <h2>Agent Log</h2>
+    <div id="voice-log-entries"><p class="voice-log-empty">No entries yet.</p></div>
+  </div>
+</div>
+<div id="text-input-modal">
+  <div id="text-input-content">
+    <textarea id="text-input-area" placeholder="Type a message for the agent..." rows="3"></textarea>
+    <div id="text-input-actions">
+      <button id="text-input-send">Send</button>
+      <button id="text-input-close">Cancel</button>
+    </div>
+  </div>
+</div>
+<div id="paste-editor-modal">
+  <div id="paste-editor-content">
+    <textarea id="paste-editor-area" placeholder="Edit multiline text to paste into terminal..." rows="10"></textarea>
+    <div id="paste-editor-actions">
+      <button id="paste-editor-submit">Paste</button>
+      <button id="paste-editor-cancel">Close</button>
+    </div>
+  </div>
+</div>
+<div id="settings-modal">
+  <div id="settings-content">
+    <h2>API Settings</h2>
+    <p id="settings-copy">Keys are stored in a local <code>.env</code> file next to the app.</p>
+    <label class="settings-field" for="settings-google">
+      <span>Google API Key</span>
+      <input id="settings-google" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="settings-field" for="settings-groq">
+      <span>Groq API Key</span>
+      <input id="settings-groq" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="settings-field" for="settings-inworld">
+      <span>Inworld API Key</span>
+      <input id="settings-inworld" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <div id="settings-status"></div>
+    <div id="settings-actions">
+      <button id="settings-save">Save</button>
+      <button id="settings-close">Close</button>
+    </div>
+  </div>
+</div>
+<div id="workspace">
+  <div id="tab-bar">
+    <div id="tabs"></div>
+  </div>
+  <div id="terminal-stack">
+    <div id="select-overlay"></div>
+  </div>
+</div>
+<script defer src="/webterm/static/app.js"></script>
+<script>
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/webterm/static/sw.js', { scope: '/webterm/' });
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+# Credentials
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# User uploads
+.webterm_uploads/
+
+# Claude Code local settings
+.claude/
+
+# Codex
+.codex

@@ -1,0 +1,13 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
+
+if [ ! -x "$VENV_PYTHON" ]; then
+  echo "Missing virtualenv interpreter at $VENV_PYTHON" >&2
+  echo "Create it with: uv venv .venv && uv pip install --python .venv/bin/python -r requirements-web.txt" >&2
+  exit 1
+fi
+
+exec "$VENV_PYTHON" "$SCRIPT_DIR/server.py" "$@"
