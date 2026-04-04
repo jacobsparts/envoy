@@ -1,38 +1,38 @@
 {
-  "name": "webterm",
-  "short_name": "webterm",
+  "name": "envoy",
+  "short_name": "envoy",
   "description": "Web-based terminal emulator",
-  "start_url": "/webterm/",
+  "start_url": "/envoy/",
   "display": "standalone",
   "background_color": "#000000",
   "theme_color": "#000000",
   "icons": [
     {
-      "src": "/webterm/static/icon.svg",
+      "src": "/envoy/static/icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "any"
     },
     {
-      "src": "/webterm/static/icon-192.png",
+      "src": "/envoy/static/icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/webterm/static/icon-512.png",
+      "src": "/envoy/static/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "/webterm/static/icon-192-maskable.png",
+      "src": "/envoy/static/icon-192-maskable.png",
       "sizes": "192x192",
       "type": "image/png",
       "purpose": "maskable"
     },
     {
-      "src": "/webterm/static/icon-512-maskable.png",
+      "src": "/envoy/static/icon-512-maskable.png",
       "sizes": "512x512",
       "type": "image/png",
       "purpose": "maskable"

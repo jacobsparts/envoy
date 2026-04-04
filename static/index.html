@@ -7,17 +7,17 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
-<meta name="apple-mobile-web-app-title" content="webterm">
-<title>webterm</title>
-<link rel="icon" href="/webterm/static/icon.svg" type="image/svg+xml">
-<link rel="icon" href="/webterm/static/icon-192.png" type="image/png" sizes="192x192">
-<link rel="apple-touch-icon" href="/webterm/static/icon-192.png">
-<link rel="manifest" href="/webterm/static/manifest.json">
-<link rel="stylesheet" href="/webterm/static/xterm.css">
-<link rel="stylesheet" href="/webterm/static/app.css">
-<script defer src="/webterm/static/xterm.js"></script>
-<script defer src="/webterm/static/xterm-addon-fit.js"></script>
-<script defer src="/webterm/static/xterm-addon-serialize.js"></script>
+<meta name="apple-mobile-web-app-title" content="envoy">
+<title>envoy</title>
+<link rel="icon" href="/envoy/static/icon.svg" type="image/svg+xml">
+<link rel="icon" href="/envoy/static/icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="/envoy/static/icon-192.png">
+<link rel="manifest" href="/envoy/static/manifest.json">
+<link rel="stylesheet" href="/envoy/static/xterm.css">
+<link rel="stylesheet" href="/envoy/static/app.css">
+<script defer src="/envoy/static/xterm.js"></script>
+<script defer src="/envoy/static/xterm-addon-fit.js"></script>
+<script defer src="/envoy/static/xterm-addon-serialize.js"></script>
 </head>
 <body>
 <div id="side-panel">
@@ -108,10 +108,10 @@
     <div id="select-overlay"></div>
   </div>
 </div>
-<script defer src="/webterm/static/app.js"></script>
+<script defer src="/envoy/static/app.js"></script>
 <script>
 if ('serviceWorker' in navigator && window.isSecureContext) {
-  navigator.serviceWorker.register('/webterm/static/sw.js', { scope: '/webterm/' });
+  navigator.serviceWorker.register('/envoy/static/sw.js', { scope: '/envoy/' });
 }
 </script>
 </body>

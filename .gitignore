@@ -10,7 +10,7 @@ __pycache__/
 .venv/
 
 # User uploads
-.webterm_uploads/
+.envoy_uploads/
 
 # Claude Code local settings
 .claude/

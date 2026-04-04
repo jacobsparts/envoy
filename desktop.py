@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Desktop entrypoint for webterm using pywebview."""
+"""Desktop entrypoint for envoy using pywebview."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ import signal
 
 import webview
 
-from app_core import DESKTOP_HTML, UPLOAD_DIR, WebtermService, build_title
+from app_core import DESKTOP_HTML, UPLOAD_DIR, EnvoyService, build_title
 
 
 class DesktopApi:
     def __init__(self, path: str):
         self.path = path
         self.title = build_title(path)
-        self._service = WebtermService()
+        self._service = EnvoyService()
         self.window = None
 
     def get_config(self) -> dict[str, str]:
@@ -73,7 +73,7 @@ class DesktopApi:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run webterm as a local desktop app.")
+    parser = argparse.ArgumentParser(description="Run envoy as a local desktop app.")
     parser.add_argument(
         "path",
         nargs="?",

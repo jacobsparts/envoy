@@ -61,8 +61,8 @@ function waitForPywebview() {
   });
 }
 
-function getWebtermPath() {
-  const prefix = "/webterm";
+function getEnvoyPath() {
+  const prefix = "/envoy";
   const pathname = window.location.pathname || "/";
   if (!pathname.startsWith(prefix)) {
     return "/";
@@ -179,7 +179,7 @@ class PywebviewTransport {
 }
 
 class BrowserTransport {
-  constructor(basePath = "/webterm", targetPath = getWebtermPath()) {
+  constructor(basePath = "/envoy", targetPath = getEnvoyPath()) {
     this.basePath = basePath;
     this.targetPath = targetPath;
     this.pollInFlight = false;
@@ -390,7 +390,7 @@ class TerminalTab {
 
     this.term = new Terminal({
       cursorBlink: true,
-      fontSize: parseInt(localStorage.getItem("webterm-font-size")) || 17,
+      fontSize: parseInt(localStorage.getItem("envoy-font-size")) || 17,
       fontFamily: "'Source Code Pro', monospace",
       scrollback: 10000,
     });
@@ -652,7 +652,7 @@ document.fonts.load("13pt 'Source Code Pro'").then(async () => {
 });
 
 function init(baseTransport, config) {
-  document.title = config.title || "webterm";
+  document.title = config.title || "envoy";
 
   const workspace = document.getElementById("workspace");
   const tabBar = document.getElementById("tabs");
@@ -739,7 +739,7 @@ function init(baseTransport, config) {
     const next = Math.max(8, Math.min(40, term.options.fontSize + delta));
     if (next === term.options.fontSize) return;
     term.options.fontSize = next;
-    localStorage.setItem("webterm-font-size", next);
+    localStorage.setItem("envoy-font-size", next);
     sendResize();
     showToast(`Font size ${next}`);
   }
@@ -749,7 +749,7 @@ function init(baseTransport, config) {
     if (!term) return;
     if (term.options.fontSize === 17) return;
     term.options.fontSize = 17;
-    localStorage.setItem("webterm-font-size", "17");
+    localStorage.setItem("envoy-font-size", "17");
     sendResize();
     showToast("Font size 17");
   }
@@ -842,7 +842,7 @@ function init(baseTransport, config) {
         const newSize = Math.max(8, Math.min(40, term.options.fontSize + (delta > 0 ? 1 : -1)));
         if (newSize !== term.options.fontSize) {
           term.options.fontSize = newSize;
-          localStorage.setItem("webterm-font-size", newSize);
+          localStorage.setItem("envoy-font-size", newSize);
           sendResize();
         }
         twoFingerStart.dist = dist;
@@ -1431,7 +1431,7 @@ function init(baseTransport, config) {
       for (const tab of manager.tabs) {
         if (tab.transport?.sessionId) {
           navigator.sendBeacon(
-            "/webterm/api/detach",
+            "/envoy/api/detach",
             new Blob([JSON.stringify({ session_id: tab.transport.sessionId })], { type: "application/json" }),
           );
         }

@@ -1,18 +1,18 @@
-const CACHE_NAME = 'webterm-v3';
+const CACHE_NAME = 'envoy-v3';
 const urlsToCache = [
-  '/webterm/static/index.html',
-  '/webterm/static/app.css',
-  '/webterm/static/app.js',
-  '/webterm/static/xterm.js',
-  '/webterm/static/xterm.css',
-  '/webterm/static/xterm-addon-fit.js',
-  '/webterm/static/xterm-addon-serialize.js',
-  '/webterm/static/SourceCodePro-Regular.woff2',
-  '/webterm/static/SourceCodePro-Bold.woff2',
-  '/webterm/static/manifest.json',
-  '/webterm/static/icon-192.png',
-  '/webterm/static/icon-512.png',
-  '/webterm/static/icon.svg'
+  '/envoy/static/index.html',
+  '/envoy/static/app.css',
+  '/envoy/static/app.js',
+  '/envoy/static/xterm.js',
+  '/envoy/static/xterm.css',
+  '/envoy/static/xterm-addon-fit.js',
+  '/envoy/static/xterm-addon-serialize.js',
+  '/envoy/static/SourceCodePro-Regular.woff2',
+  '/envoy/static/SourceCodePro-Bold.woff2',
+  '/envoy/static/manifest.json',
+  '/envoy/static/icon-192.png',
+  '/envoy/static/icon-512.png',
+  '/envoy/static/icon.svg'
 ];
 
 // Install service worker and cache assets
@@ -44,15 +44,15 @@ self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
 
   // API requests: always network
-  if (event.request.url.includes('/webterm/api/')) {
+  if (event.request.url.includes('/envoy/api/')) {
     event.respondWith(fetch(event.request));
     return;
   }
 
-  // Navigation requests (e.g. /webterm/foo): serve cached index.html
+  // Navigation requests (e.g. /envoy/foo): serve cached index.html
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      caches.match('/webterm/static/index.html')
+      caches.match('/envoy/static/index.html')
         .then(cached => cached || fetch(event.request))
     );
     return;

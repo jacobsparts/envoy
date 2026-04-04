@@ -1,4 +1,4 @@
-"""Shared runtime core for desktop and webterm server modes."""
+"""Shared runtime core for desktop and envoy server modes."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ STATIC_DIR = APP_DIR / "static"
 DESKTOP_HTML = STATIC_DIR / "desktop.html"
 WEB_HTML = STATIC_DIR / "index.html"
 HOME_DIR = os.path.expanduser("~")
-UPLOAD_DIR = os.path.join(APP_DIR, ".webterm_uploads")
+UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
 SESSION_TIMEOUT = 15 * 60
@@ -247,7 +247,7 @@ class Session:
                 pass
 
 
-class WebtermService:
+class EnvoyService:
     def __init__(self):
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()

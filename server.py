@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Web entrypoint for webterm."""
+"""Web entrypoint for envoy."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from app_core import STATIC_DIR, UPLOAD_DIR, WEB_HTML, WebtermService
+from app_core import STATIC_DIR, UPLOAD_DIR, WEB_HTML, EnvoyService
 
 
-WEB_PREFIX = "/webterm"
-DEFAULT_HTTP_PORT = int(os.environ.get("WEBTERM_HTTP_PORT", "8080"))
-DEFAULT_READ_TIMEOUT = float(os.environ.get("WEBTERM_READ_TIMEOUT", "20"))
+WEB_PREFIX = "/envoy"
+DEFAULT_HTTP_PORT = int(os.environ.get("ENVOY_HTTP_PORT", "8080"))
+DEFAULT_READ_TIMEOUT = float(os.environ.get("ENVOY_READ_TIMEOUT", "20"))
 MIME_TYPES = {
     ".css": "text/css",
     ".js": "application/javascript",
@@ -28,7 +28,7 @@ MIME_TYPES = {
     ".png": "image/png",
 }
 
-service = WebtermService()
+service = EnvoyService()
 
 
 def normalize_app_path(raw_path: str) -> str:
@@ -235,7 +235,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run webterm as a web app.")
+    parser = argparse.ArgumentParser(description="Run envoy as a web app.")
     parser.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     return parser.parse_args()
 
@@ -251,7 +251,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    print(f"webterm: http://localhost:{args.port}{WEB_PREFIX}/")
+    print(f"envoy: http://localhost:{args.port}{WEB_PREFIX}/")
     try:
         server.serve_forever()
     finally:

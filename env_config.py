@@ -1,4 +1,4 @@
-"""Shared environment configuration helpers for local webterm."""
+"""Shared environment configuration helpers for local envoy."""
 
 from __future__ import annotations
 
