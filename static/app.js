@@ -102,7 +102,7 @@ class PywebviewTransport {
     return result;
   }
 
-  startReading(onData, onDisconnect) {
+  startReading(onData, onDisconnect, onEvents) {
     if (this.pollTimer) clearInterval(this.pollTimer);
     this.pollTimer = setInterval(async () => {
       if (this.pollInFlight || !this.sessionId) return;
@@ -111,6 +111,7 @@ class PywebviewTransport {
         const result = await this.api.read(this.sessionId);
         const chunk = base64ToBytes(result.output);
         if (chunk.length) onData(chunk);
+        if (result.events && result.events.length) onEvents(result.events);
         if (!result.alive) onDisconnect({ kind: "exit", exitCode: result.exit_code });
       } catch (err) {
         onDisconnect({ kind: "error", error: err });
@@ -187,6 +188,10 @@ class BrowserTransport {
     this.clientId = "";
     this.readLoopId = 0;
     this.closed = false;
+    this.readTimer = null;
+    this.readRetryDelay = 250;
+    this.onData = null;
+    this.onDisconnect = null;
   }
 
   async requestJson(path, options = {}) {
@@ -199,7 +204,9 @@ class BrowserTransport {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.error || `${response.status} ${response.statusText}`);
+      const error = new Error(data.error || `${response.status} ${response.statusText}`);
+      error.status = response.status;
+      throw error;
     }
     return data;
   }
@@ -235,46 +242,91 @@ class BrowserTransport {
     return result;
   }
 
-  startReading(onData, onDisconnect) {
+  startReading(onData, onDisconnect, onEvents) {
     this.stopReading();
     this.closed = false;
+    this.onData = onData;
+    this.onDisconnect = onDisconnect;
+    this.onEvents = onEvents;
+    this.readRetryDelay = 250;
     const loopId = ++this.readLoopId;
-    const run = async () => {
-      while (!this.closed && this.sessionId && this.readLoopId === loopId) {
-        if (this.pollInFlight) return;
-        this.pollInFlight = true;
-        try {
-          const result = await this.requestJson("/api/read", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: this.sessionId, client_id: this.clientId, wait_timeout: 20 }),
-          });
-          if (this.closed || this.readLoopId !== loopId) return;
-          if (result.evicted) {
-            onDisconnect({ kind: "evicted" });
-            return;
-          }
-          const chunk = base64ToBytes(result.output);
-          if (chunk.length) onData(chunk);
-          if (!result.alive) {
-            onDisconnect({ kind: "exit", exitCode: result.exit_code });
-            return;
-          }
-        } catch (err) {
-          if (this.closed || this.readLoopId !== loopId) return;
-          onDisconnect({ kind: "error", error: err });
-          return;
-        } finally {
-          this.pollInFlight = false;
-        }
+    this.scheduleRead(loopId, 0);
+  }
+
+  scheduleRead(loopId, delay = 0) {
+    if (this.readTimer) clearTimeout(this.readTimer);
+    this.readTimer = setTimeout(() => {
+      this.readTimer = null;
+      this.runRead(loopId);
+    }, delay);
+  }
+
+  nextReadRetryDelay() {
+    const delay = this.readRetryDelay;
+    this.readRetryDelay = Math.min(this.readRetryDelay * 2, 5000);
+    return delay;
+  }
+
+  shouldRetryRead(err) {
+    if (!err) return true;
+    if (err.name === "TypeError") return true;
+    if (typeof err.status === "number") {
+      return err.status === 408 || err.status === 429 || err.status >= 500;
+    }
+    return true;
+  }
+
+  async runRead(loopId) {
+    if (this.closed || !this.sessionId || this.readLoopId !== loopId || this.pollInFlight) return;
+    this.pollInFlight = true;
+    let retryDelay = null;
+    try {
+      const result = await this.requestJson("/api/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: this.sessionId, client_id: this.clientId, wait_timeout: 20 }),
+      });
+      if (this.closed || this.readLoopId !== loopId) return;
+      this.readRetryDelay = 250;
+      if (result.evicted) {
+        this.onDisconnect?.({ kind: "evicted" });
+        return;
       }
-    };
-    run();
+      const chunk = base64ToBytes(result.output);
+      if (chunk.length) this.onData?.(chunk);
+      if (result.events && result.events.length) this.onEvents?.(result.events);
+      if (!result.alive) {
+        this.onDisconnect?.({ kind: "exit", exitCode: result.exit_code });
+        return;
+      }
+    } catch (err) {
+      if (this.closed || this.readLoopId !== loopId) return;
+      if (this.shouldRetryRead(err)) {
+        retryDelay = this.nextReadRetryDelay();
+      } else {
+        this.onDisconnect?.({ kind: "error", error: err });
+        return;
+      }
+    } finally {
+      this.pollInFlight = false;
+    }
+    if (this.closed || !this.sessionId || this.readLoopId !== loopId) return;
+    this.scheduleRead(loopId, retryDelay ?? 0);
+  }
+
+  resumeReading() {
+    if (this.closed || !this.sessionId || this.pollInFlight) return;
+    this.readRetryDelay = 250;
+    this.scheduleRead(this.readLoopId, 0);
   }
 
   stopReading() {
     this.closed = true;
     this.readLoopId += 1;
+    if (this.readTimer) {
+      clearTimeout(this.readTimer);
+      this.readTimer = null;
+    }
   }
 
   async write(data) {
@@ -379,8 +431,11 @@ class TerminalTab {
     this.index = index;
     this.title = `Tab ${index}`;
     this.disconnected = false;
+    this.disconnectInfo = null;
     this.closed = false;
+    this.reconnecting = false;
     this.agentLog = [];
+    this.liveAgentEvents = [];
 
     this.pane = document.createElement("div");
     this.pane.className = "terminal-pane";
@@ -439,11 +494,14 @@ class TerminalTab {
     const chunk = base64ToBytes(result.output);
     if (chunk.length) this.term.write(chunk);
     this.disconnected = false;
+    this.disconnectInfo = null;
+    this.reconnecting = false;
     this.button.classList.remove("exited");
     this.updateScrollbackClass();
     this.transport.startReading(
       data => this.term.write(data),
       info => this.handleDisconnect(info),
+      events => this.handleAgentEvents(events),
     );
   }
 
@@ -472,9 +530,11 @@ class TerminalTab {
     if (textarea) textarea.focus();
   }
 
-  markDisconnected() {
+  markDisconnected(info = { kind: "error" }) {
     if (this.disconnected) return;
     this.disconnected = true;
+    this.disconnectInfo = info;
+    this.reconnecting = false;
     this.button.classList.add("exited");
     if (this.manager.activeTab === this) {
       this.manager.updateDisconnectOverlay();
@@ -484,14 +544,43 @@ class TerminalTab {
   handleDisconnect(info) {
     if (this.closed) return;
     if (info?.kind === "evicted") {
-      this.markDisconnected();
+      this.markDisconnected(info);
       return;
     }
     if (info?.kind === "exit" && info.exitCode === 0) {
       this.manager.closeTab(this.id).catch(err => console.error(err));
       return;
     }
-    this.markDisconnected();
+    this.markDisconnected(info);
+  }
+
+  canReconnect() {
+    if (this.closed || !this.disconnected || this.reconnecting) return false;
+    if (!this.transport.sessionId) return false;
+    return this.disconnectInfo?.kind !== "evicted" && this.disconnectInfo?.kind !== "exit";
+  }
+
+  async reconnect() {
+    if (!this.canReconnect()) return false;
+    this.reconnecting = true;
+    try {
+      await this.connect(this.transport.sessionId);
+      this.fitTerminal();
+      if (this.manager.activeTab === this) {
+        this.manager.updateDisconnectOverlay();
+      }
+      return true;
+    } catch (err) {
+      this.reconnecting = false;
+      this.markDisconnected({ kind: "error", error: err });
+      return false;
+    }
+  }
+
+  resumeReading() {
+    if (typeof this.transport.resumeReading === "function") {
+      this.transport.resumeReading();
+    }
   }
 
   updateTitle(title) {
@@ -502,6 +591,22 @@ class TerminalTab {
   addAgentLog(response, commands, userMessage) {
     const time = new Date().toLocaleTimeString();
     this.agentLog.push({ time, response, commands, userMessage });
+    this.liveAgentEvents = [];
+  }
+
+  addLiveAgentEvent(event) {
+    const time = new Date().toLocaleTimeString();
+    this.liveAgentEvents.push({ time, ...event });
+  }
+
+  handleAgentEvents(events) {
+    for (const event of events) {
+      this.addLiveAgentEvent(event);
+      this.manager.handleAgentEvent(this, event);
+    }
+    if (this.manager.activeTab === this) {
+      this.manager.renderAgentLog();
+    }
   }
 
   updateScrollbackClass() {
@@ -576,11 +681,19 @@ class TabManager {
 
   renderAgentLog() {
     const entries = this.activeTab ? this.activeTab.agentLog : [];
-    if (!entries.length) {
+    const liveEvents = this.activeTab ? this.activeTab.liveAgentEvents : [];
+    if (!entries.length && !liveEvents.length) {
       this.elements.agentLog.innerHTML = '<p class="voice-log-empty">No entries yet.</p>';
       return;
     }
-    this.elements.agentLog.innerHTML = entries.map(entry => {
+    const liveHtml = liveEvents.map(event => {
+      let html = '<div class="voice-log-entry live">';
+      html += `<div class="voice-log-time">${event.time}</div>`;
+      if (event.kind === "status") html += `<div class="voice-log-agent">${event.text}</div>`;
+      if (event.kind === "message") html += `<div class="voice-log-agent">${event.text}</div>`;
+      return html + "</div>";
+    }).join("");
+    const entryHtml = entries.map(entry => {
       let html = '<div class="voice-log-entry">';
       html += `<div class="voice-log-time">${entry.time}</div>`;
       if (entry.userMessage) html += `<div class="voice-log-you">${entry.userMessage}</div>`;
@@ -590,7 +703,14 @@ class TabManager {
       if (entry.response) html += `<div class="voice-log-agent">${entry.response}</div>`;
       return html + "</div>";
     }).join("");
+    this.elements.agentLog.innerHTML = liveHtml + entryHtml;
     this.elements.agentLog.scrollTop = this.elements.agentLog.scrollHeight;
+  }
+
+  handleAgentEvent(tab, event) {
+    if (tab !== this.activeTab) return;
+    if (!event || !event.text) return;
+    showToast(event.text.length > 80 ? event.text.substring(0, 77) + "..." : event.text, false, true);
   }
 
   async closeTab(id) {
@@ -637,6 +757,20 @@ class TabManager {
 
   current() {
     return this.activeTab;
+  }
+
+  resumeActiveReads() {
+    for (const tab of this.tabs) {
+      tab.resumeReading();
+    }
+  }
+
+  reconnectDisconnectedTabs() {
+    for (const tab of this.tabs) {
+      if (tab.canReconnect()) {
+        tab.reconnect().catch(err => console.error(err));
+      }
+    }
   }
 
   selectAllVisibleTerminal() {
@@ -1604,6 +1738,18 @@ function init(baseTransport, config) {
       tab.connect(sid).then(() => tab.fitTerminal()).catch(err => showToast(String(err), true));
     }
   });
+
+  const recoverConnections = () => {
+    manager.resumeActiveReads();
+    manager.reconnectDisconnectedTabs();
+  };
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) recoverConnections();
+  });
+  window.addEventListener("focus", recoverConnections);
+  window.addEventListener("online", recoverConnections);
+  window.addEventListener("pageshow", recoverConnections);
 
   const hashSid = window.location.hash.slice(1);
   manager.createTab({ activate: true, sessionId: hashSid }).then(() => sendResize()).catch(err => {

@@ -38,5 +38,9 @@ class SessionTerminal:
     def read_output(self) -> str:
         return get_terminal_context(self._session)
 
+    def send_status(self, text: str) -> None:
+        self._session.push_agent_event("status", text)
+
     def send_message(self, text: str) -> None:
         self.messages.append(text)
+        self._session.push_agent_event("message", text)

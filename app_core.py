@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import collections
+import copy
 import socket
 import fcntl
 import os
@@ -116,6 +117,7 @@ class Session:
         self.voice_scrollback_mark = 0
         self.voice_cancel: threading.Event | None = None
         self.client_id: str = ""
+        self.agent_events: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
@@ -173,10 +175,21 @@ class Session:
             self.pending.clear()
             return data
 
+    def push_agent_event(self, kind: str, text: str) -> None:
+        with self._lock:
+            self.agent_events.append({"kind": kind, "text": text})
+            self._pending_ready.notify_all()
+
+    def drain_agent_events(self) -> list[dict[str, str]]:
+        with self._lock:
+            events = copy.deepcopy(self.agent_events)
+            self.agent_events.clear()
+            return events
+
     def wait_for_pending(self, timeout: float, client_id: str = "") -> bytes:
         deadline = time.monotonic() + max(timeout, 0.0)
         with self._lock:
-            while self.alive and not self.pending:
+            while self.alive and not self.pending and not self.agent_events:
                 if client_id and self.client_id != client_id:
                     return b""
                 remaining = deadline - time.monotonic()
@@ -338,6 +351,7 @@ class EnvoyService:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
         return {
             "output": self._encode(output),
+            "events": session.drain_agent_events(),
             "alive": session.alive,
             "exit_code": session.exit_code,
         }
