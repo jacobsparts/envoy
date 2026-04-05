@@ -37,7 +37,8 @@
       <tr><td>Close tab</td><td></td><td>Ctrl+W</td></tr>
       <tr><td>Next tab</td><td></td><td>Ctrl+Tab</td></tr>
       <tr><td>Toolbar</td><td>Swipe left</td><td>Ctrl+\</td></tr>
-      <tr><td>Voice agent</td><td>2-finger tap</td><td>Ctrl+Shift+Space</td></tr>
+      <tr><td>Dictation</td><td>2-finger double tap</td><td></td></tr>
+      <tr><td>Voice agent</td><td></td><td>Ctrl+Shift+Space</td></tr>
       <tr><td>Multiline editor</td><td></td><td>Ctrl+Shift+E</td></tr>
       <tr><td>Font larger</td><td>Pinch out</td><td>Ctrl+Shift++</td></tr>
       <tr><td>Font smaller</td><td>Pinch in</td><td>Ctrl+Shift+-</td></tr>
@@ -91,6 +92,30 @@
     <div id="settings-actions">
       <button id="settings-save">Save</button>
       <button id="settings-close">Close</button>
+    </div>
+  </div>
+</div>
+<div id="agent-settings-modal">
+  <div id="agent-settings-content">
+    <h2>Agent Settings</h2>
+    <label class="settings-field">
+      <span>Persistence</span>
+      <select id="agent-persistence">
+        <option value="persistent">Persistent (keep conversation)</option>
+        <option value="per_invocation">New agent each message</option>
+      </select>
+    </label>
+    <label class="settings-field">
+      <span>Lookback <span id="agent-lookback-val">100</span> rows</span>
+      <input id="agent-lookback" type="range" min="0" max="10000" step="10" value="100">
+    </label>
+    <label class="settings-field">
+      <span>Turn limit</span>
+      <input id="agent-turn-limit" type="number" min="1" max="1000" value="20">
+    </label>
+    <div id="agent-settings-actions">
+      <button id="agent-settings-reset">Reset agent</button>
+      <button id="agent-settings-close">Close</button>
     </div>
   </div>
 </div>

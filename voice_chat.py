@@ -147,7 +147,21 @@ def transcribe_audio(audio_data, mime_type):
     return resp.json()["text"]
 
 
-def process_voice_message(audio_data, mime_type, terminal, cancel):
+def _prepare_agent(session, agent_settings):
+    """Return (agent, is_new) based on persistence setting."""
+    persistence = agent_settings.get("agent_persistence", "persistent")
+    lookback = int(agent_settings.get("agent_lookback", 100))
+    is_new = False
+    if persistence == "per_invocation" or not hasattr(session, "voice_agent"):
+        session.voice_agent = VoiceChatAgent()
+        is_new = True
+    if is_new:
+        session.reset_context_lookback(lookback)
+    return session.voice_agent, is_new
+
+
+def process_voice_message(audio_data, mime_type, terminal, cancel,
+                          agent_settings=None):
     """Process voice audio through the LLM (audio sent directly to model).
 
     Returns reply text.
@@ -155,23 +169,23 @@ def process_voice_message(audio_data, mime_type, terminal, cancel):
     cancel: threading.Event — set to abort the agent between tool calls.
     """
     require_voice_agent_env()
+    if agent_settings is None:
+        agent_settings = {}
     session = terminal._session
-    if not hasattr(session, 'voice_agent'):
-        session.voice_agent = VoiceChatAgent()
-
-    agent = session.voice_agent
+    agent, _ = _prepare_agent(session, agent_settings)
     agent._terminal = terminal
+    turn_limit = int(agent_settings.get("agent_turn_limit", 100))
 
     context = terminal.get_terminal_context().strip()
     audio_data, mime_type = convert_audio_to_ogg(audio_data, mime_type)
     log.info("audio_len=%d mime=%s context_len=%d", len(audio_data), mime_type, len(context))
     t0 = time.time()
-    reply = agent.run(audio_data, mime_type, context, cancel)
+    reply = agent.run(audio_data, mime_type, context, cancel, max_turns=turn_limit)
     log.info("reply=%r elapsed=%.1fs", reply, time.time() - t0)
     return reply
 
 
-def process_text_message(text, terminal, cancel):
+def process_text_message(text, terminal, cancel, agent_settings=None):
     """Process a text message through the LLM agent.
 
     Returns reply text.
@@ -179,16 +193,16 @@ def process_text_message(text, terminal, cancel):
     cancel: threading.Event — set to abort the agent between tool calls.
     """
     require_voice_agent_env()
+    if agent_settings is None:
+        agent_settings = {}
     session = terminal._session
-    if not hasattr(session, 'voice_agent'):
-        session.voice_agent = VoiceChatAgent()
-
-    agent = session.voice_agent
+    agent, _ = _prepare_agent(session, agent_settings)
     agent._terminal = terminal
+    turn_limit = int(agent_settings.get("agent_turn_limit", 100))
 
     context = terminal.get_terminal_context().strip()
     log.info("text=%r context_len=%d", text, len(context))
     t0 = time.time()
-    reply = agent.run_text(text, context, cancel)
+    reply = agent.run_text(text, context, cancel, max_turns=turn_limit)
     log.info("reply=%r elapsed=%.1fs", reply, time.time() - t0)
     return reply

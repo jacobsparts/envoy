@@ -137,7 +137,18 @@ class PywebviewTransport {
 
   async write(data) {
     if (!this.sessionId) return;
-    await this.api.write(this.sessionId, stringToBase64(data));
+    const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
+    if (transformed == null) return;
+    if (transformed instanceof Uint8Array) {
+      await this.api.write(this.sessionId, bytesToBase64(transformed));
+      return;
+    }
+    await this.api.write(this.sessionId, stringToBase64(transformed));
+  }
+
+  async writeBytes(bytes) {
+    if (!this.sessionId) return;
+    await this.api.write(this.sessionId, bytesToBase64(bytes));
   }
 
   async resize(cols, rows) {
@@ -150,13 +161,13 @@ class PywebviewTransport {
     await this.api.upload_file(this.sessionId, name, b64data);
   }
 
-  async sendTextMessage(text) {
-    return this.api.send_text_message(this.sessionId, text);
+  async sendTextMessage(text, agentSettings) {
+    return this.api.send_text_message(this.sessionId, text, agentSettings || {});
   }
 
-  async sendVoiceMessage(audioBlob, mime) {
+  async sendVoiceMessage(audioBlob, mime, agentSettings) {
     const bytes = new Uint8Array(await audioBlob.arrayBuffer());
-    return this.api.send_voice_message(this.sessionId, bytesToBase64(bytes), mime);
+    return this.api.send_voice_message(this.sessionId, bytesToBase64(bytes), mime, agentSettings || {});
   }
 
   async transcribeAudio(audioBlob, mime) {
@@ -175,6 +186,11 @@ class PywebviewTransport {
     const sid = this.sessionId;
     this.sessionId = "";
     await this.api.close_session(sid);
+  }
+
+  abandon() {
+    this.stopReading();
+    this.sessionId = "";
   }
 
   async toggleFullscreen() {
@@ -338,10 +354,22 @@ class BrowserTransport {
 
   async write(data) {
     if (!this.sessionId) return;
+    const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
+    if (transformed == null) return;
+    const payload = transformed instanceof Uint8Array ? bytesToBase64(transformed) : stringToBase64(transformed);
     await this.requestJson("/api/write", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: this.sessionId, data: stringToBase64(data) }),
+      body: JSON.stringify({ session_id: this.sessionId, data: payload }),
+    });
+  }
+
+  async writeBytes(bytes) {
+    if (!this.sessionId) return;
+    await this.requestJson("/api/write", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: this.sessionId, data: bytesToBase64(bytes) }),
     });
   }
 
@@ -363,21 +391,27 @@ class BrowserTransport {
     });
   }
 
-  async sendTextMessage(text) {
+  async sendTextMessage(text, agentSettings) {
     return this.requestJson("/api/text", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: this.sessionId, text }),
+      body: JSON.stringify({ session_id: this.sessionId, text, ...agentSettings }),
     });
   }
 
-  async sendVoiceMessage(audioBlob, mime) {
+  async sendVoiceMessage(audioBlob, mime, agentSettings) {
+    const headers = {
+      "Content-Type": mime,
+      "X-Session-Id": this.sessionId,
+    };
+    if (agentSettings) {
+      headers["X-Agent-Persistence"] = agentSettings.agent_persistence || "";
+      headers["X-Agent-Lookback"] = String(agentSettings.agent_lookback ?? "");
+      headers["X-Agent-Turn-Limit"] = String(agentSettings.agent_turn_limit ?? "");
+    }
     const response = await fetch(this.basePath + "/api/voice", {
       method: "POST",
-      headers: {
-        "Content-Type": mime,
-        "X-Session-Id": this.sessionId,
-      },
+      headers,
       body: audioBlob,
     });
     const data = await response.json().catch(() => ({}));
@@ -410,11 +444,18 @@ class BrowserTransport {
     if (!this.sessionId) return;
     const sid = this.sessionId;
     this.sessionId = "";
+    this.clientId = "";
     await this.requestJson("/api/close_session", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: sid }),
     });
+  }
+
+  abandon() {
+    this.stopReading();
+    this.sessionId = "";
+    this.clientId = "";
   }
 
   async closeApp() {}
@@ -655,6 +696,10 @@ class TerminalTab {
     this.button.remove();
     const transport = this.transport;
     setTimeout(() => {
+      if (this.disconnected && this.disconnectInfo?.kind === "evicted" && typeof transport.abandon === "function") {
+        transport.abandon();
+        return;
+      }
       transport.close().catch(err => console.error(err));
     }, 0);
   }
@@ -887,6 +932,8 @@ function init(baseTransport, config) {
   let toastLocked = false;
   let terminalInputActive = false;
   let keyboardVisible = false;
+  let mobileSuppressNextData = null;
+  let mobileSuppressUntil = 0;
 
   let resizeObserver = null;
   let mobileRepeatTimer = null;
@@ -896,6 +943,15 @@ function init(baseTransport, config) {
   let lastMobileTouchTime = 0;
   let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
   const mobileModifiers = { Control: false, Alt: false };
+  const mobileLockedModifiers = { Control: false, Alt: false };
+  let mobileModifierLongPressTimer = null;
+  let mobileModifierLongPressKey = "";
+  let mobileModifierLongPressTriggered = false;
+  let mobileNavLongPressTimer = null;
+  let mobileNavLongPressAction = "";
+  let mobileNavLongPressTriggered = false;
+  const MOBILE_MODIFIER_LONG_PRESS_MS = 450;
+  const MOBILE_NAV_LONG_PRESS_MS = 450;
   const mobileInputSequences = {
     escape: "\x1b",
     tab: "\t",
@@ -905,7 +961,12 @@ function init(baseTransport, config) {
     right: "\x1b[C",
     home: "\x1b[H",
     end: "\x1b[F",
+    pageup: "\x1b[5~",
+    pagedown: "\x1b[6~",
   };
+  const MOBILE_ALT_LEFT_TOKEN = "__ENVOY_ALT_LEFT__";
+  const MOBILE_ALT_RIGHT_TOKEN = "__ENVOY_ALT_RIGHT__";
+  const MOBILE_ALT_BACKSPACE_TOKEN = "__ENVOY_ALT_BACKSPACE__";
 
   function dismissToast() {
     if (toastLocked) return;
@@ -957,6 +1018,7 @@ function init(baseTransport, config) {
     agentLog: agentLogEntries,
     selectOverlay,
   });
+  window.__envoyTransformWriteData = data => transformMobileTerminalInput(data);
 
   function currentTab() {
     return manager.current();
@@ -1023,13 +1085,48 @@ function init(baseTransport, config) {
     updateMobileInputBar();
   }
 
-  function resetMobileModifiers() {
-    mobileModifiers.Control = false;
-    mobileModifiers.Alt = false;
+  function syncMobileModifierButtons() {
     for (const button of mobileInputBar?.querySelectorAll(".mobile-modifier-key") || []) {
       const key = button.dataset.key;
       button.classList.toggle("active", !!mobileModifiers[key]);
+      button.classList.toggle("locked", !!mobileLockedModifiers[key]);
     }
+  }
+
+  function resetMobileModifiers() {
+    mobileModifiers.Control = !!mobileLockedModifiers.Control;
+    mobileModifiers.Alt = !!mobileLockedModifiers.Alt;
+    syncMobileModifierButtons();
+  }
+
+  function clearMobileModifierLongPress() {
+    if (mobileModifierLongPressTimer) {
+      clearTimeout(mobileModifierLongPressTimer);
+      mobileModifierLongPressTimer = null;
+    }
+    mobileModifierLongPressKey = "";
+  }
+
+  function clearMobileNavLongPress() {
+    if (mobileNavLongPressTimer) {
+      clearTimeout(mobileNavLongPressTimer);
+      mobileNavLongPressTimer = null;
+    }
+    mobileNavLongPressAction = "";
+  }
+
+  function toggleMobileModifier(key) {
+    if (mobileLockedModifiers[key]) {
+      setMobileModifier(key, false, false);
+    } else {
+      setMobileModifier(key, !mobileModifiers[key], false);
+    }
+  }
+
+  function setMobileModifier(key, active, locked = false) {
+    mobileLockedModifiers[key] = !!locked;
+    mobileModifiers[key] = !!active || !!mobileLockedModifiers[key];
+    syncMobileModifierButtons();
   }
 
   function pulseMobileInputButton(button) {
@@ -1059,16 +1156,89 @@ function init(baseTransport, config) {
     return result;
   }
 
+  function getMobileActionSequence(action) {
+    if (mobileModifiers.Alt && !mobileModifiers.Control) {
+      if (action === "left") return MOBILE_ALT_LEFT_TOKEN;
+      if (action === "right") return MOBILE_ALT_RIGHT_TOKEN;
+    }
+    return mobileInputSequences[action] || "";
+  }
+
+  function getMobileModifiedKeySequence(key) {
+    if (mobileModifiers.Alt && !mobileModifiers.Control) {
+      if (key === "Backspace") return MOBILE_ALT_BACKSPACE_TOKEN;
+      if (key === "ArrowLeft") return MOBILE_ALT_LEFT_TOKEN;
+      if (key === "ArrowRight") return MOBILE_ALT_RIGHT_TOKEN;
+    }
+    let sequence = "";
+    if (key === "Backspace") {
+      sequence = encodeMobileInputSequence("\x7f");
+    } else if (key === "Enter") {
+      sequence = encodeMobileInputSequence("\r");
+    }
+    return sequence;
+  }
+
   function writeSequenceToCurrentTab(sequence) {
     const tab = currentTab();
     if (!tab || tab.disconnected) return Promise.resolve();
     return tab.transport.write(sequence).catch(() => tab.markDisconnected());
   }
 
+  function writeBytesToCurrentTab(bytes) {
+    const tab = currentTab();
+    if (!tab || tab.disconnected) return Promise.resolve();
+    return tab.transport.writeBytes(bytes).catch(() => tab.markDisconnected());
+  }
+
+  function suppressNextMobileTerminalData(values) {
+    mobileSuppressNextData = new Set(Array.isArray(values) ? values : [values]);
+    mobileSuppressUntil = performance.now() + 1000;
+  }
+
+  function transformMobileTerminalInput(data) {
+    if (!isMobileClient) return data;
+    if (mobileSuppressNextData && performance.now() <= mobileSuppressUntil && mobileSuppressNextData.has(data)) {
+      mobileSuppressNextData = null;
+      mobileSuppressUntil = 0;
+      return null;
+    }
+
+    if (data === MOBILE_ALT_BACKSPACE_TOKEN) {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x7f]);
+    }
+    if (data === MOBILE_ALT_LEFT_TOKEN) {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x62]);
+    }
+    if (data === MOBILE_ALT_RIGHT_TOKEN) {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x66]);
+    }
+
+    if (!mobileModifiers.Alt || mobileModifiers.Control) return data;
+    if (data === "\x7f" || data === "\x08") {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x7f]);
+    }
+    if (data === "\x1b[D" || data === "\x1bOD") {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x62]);
+    }
+    if (data === "\x1b[C" || data === "\x1bOC") {
+      resetMobileModifiers();
+      return new Uint8Array([0x1b, 0x66]);
+    }
+    return data;
+  }
+
   function sendMobileInput(sequence) {
     writeSequenceToCurrentTab(encodeMobileInputSequence(sequence));
     focusCurrent();
   }
+
+  resetMobileModifiers();
 
   function stopMobileInputRepeat() {
     if (mobileRepeatDelayTimer) {
@@ -1085,7 +1255,8 @@ function init(baseTransport, config) {
     stopMobileInputRepeat();
     mobileRepeatDelayTimer = setTimeout(() => {
       mobileRepeatTimer = setInterval(() => {
-        writeSequenceToCurrentTab(sequence);
+        if (sequence instanceof Uint8Array) writeBytesToCurrentTab(sequence);
+        else writeSequenceToCurrentTab(sequence);
       }, 60);
     }, 350);
   }
@@ -1248,8 +1419,14 @@ function init(baseTransport, config) {
 
   let swipeStart = null;
   let twoFingerStart = null;
+  let lastTwoFingerTapAt = 0;
   let scrollLastY = null;
+  let scrollLastTime = 0;
   let scrollAccum = 0;
+  let scrollVelocity = 0;
+  let scrollMomentumFrame = null;
+  let gestureAxis = null;
+  let scrollbarDrag = null;
   const SWIPE_MIN = 60;
 
   function getCellHeight() {
@@ -1257,9 +1434,107 @@ function init(baseTransport, config) {
     catch { return 20; }
   }
 
+  function stopScrollMomentum() {
+    if (scrollMomentumFrame) {
+      cancelAnimationFrame(scrollMomentumFrame);
+      scrollMomentumFrame = null;
+    }
+    scrollVelocity = 0;
+  }
+
+  function isScrollbarTarget(target) {
+    return !!target?.closest?.(".xterm-scrollable-element > .scrollbar, .xterm-scrollable-element .scrollbar, .xterm-scrollable-element > .scrollbar > .slider, .xterm-scrollable-element .scrollbar .slider");
+  }
+
+  function stopScrollbarDrag() {
+    scrollbarDrag = null;
+  }
+
+  function beginScrollbarDrag(target, clientY, pointerId = null) {
+    const term = currentTerm();
+    const scrollbar = target?.closest?.(".xterm-scrollable-element > .scrollbar, .xterm-scrollable-element .scrollbar");
+    if (!term || !scrollbar) return false;
+    const slider = scrollbar.querySelector(".slider");
+    const buffer = term.buffer?.active;
+    const maxTopLine = Math.max(0, (buffer?.length || 0) - term.rows);
+    if (!maxTopLine) return false;
+    const trackRect = scrollbar.getBoundingClientRect();
+    const sliderRect = (slider || scrollbar).getBoundingClientRect();
+    scrollbarDrag = {
+      pointerId,
+      maxTopLine,
+      trackTop: trackRect.top,
+      sliderHeight: Math.max(1, sliderRect.height),
+      availableHeight: Math.max(1, trackRect.height - sliderRect.height),
+    };
+    updateScrollbarDrag(clientY);
+    return true;
+  }
+
+  function updateScrollbarDrag(clientY) {
+    if (!scrollbarDrag) return;
+    const term = currentTerm();
+    if (!term) {
+      stopScrollbarDrag();
+      return;
+    }
+    const offset = clientY - scrollbarDrag.trackTop - scrollbarDrag.sliderHeight / 2;
+    const ratio = scrollbarDrag.availableHeight > 0 ? offset / scrollbarDrag.availableHeight : 0;
+    const nextTopLine = Math.max(0, Math.min(scrollbarDrag.maxTopLine, Math.round(ratio * scrollbarDrag.maxTopLine)));
+    term.scrollToLine(nextTopLine);
+  }
+
+  function startScrollMomentum() {
+    const term = currentTerm();
+    const xtermEl = currentXtermEl();
+    if (!term || !xtermEl || xtermEl.classList.contains("select-mode")) return;
+    if (Math.abs(scrollVelocity) < 0.02) {
+      scrollVelocity = 0;
+      return;
+    }
+    if (scrollMomentumFrame) cancelAnimationFrame(scrollMomentumFrame);
+    let lastFrameTime = performance.now();
+    const tick = now => {
+      const activeTerm = currentTerm();
+      const activeXtermEl = currentXtermEl();
+      if (!activeTerm || !activeXtermEl || activeXtermEl.classList.contains("select-mode")) {
+        stopScrollMomentum();
+        return;
+      }
+      const dt = Math.min(40, now - lastFrameTime || 16);
+      lastFrameTime = now;
+      scrollAccum += scrollVelocity * dt;
+      const cellHeight = getCellHeight();
+      const lines = Math.trunc(scrollAccum / cellHeight);
+      if (lines !== 0) {
+        activeTerm.scrollLines(lines);
+        scrollAccum -= lines * cellHeight;
+      }
+      scrollVelocity *= Math.pow(0.95, dt / 16.6667);
+      if (Math.abs(scrollVelocity) < 0.02) {
+        stopScrollMomentum();
+        return;
+      }
+      scrollMomentumFrame = requestAnimationFrame(tick);
+    };
+    scrollMomentumFrame = requestAnimationFrame(tick);
+  }
+
   document.addEventListener("touchstart", e => {
+    stopScrollMomentum();
+    gestureAxis = null;
+    if (e.touches.length === 1 && isScrollbarTarget(e.target)) {
+      const touch = e.touches[0];
+      beginScrollbarDrag(e.target, touch.clientY);
+      swipeStart = null;
+      twoFingerStart = null;
+      scrollLastY = null;
+      scrollLastTime = 0;
+      return;
+    }
     if (e.touches.length === 2) {
       scrollLastY = null;
+      scrollLastTime = 0;
       swipeStart = null;
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
@@ -1267,8 +1542,10 @@ function init(baseTransport, config) {
     } else if (e.touches.length === 1) {
       const touch = e.touches[0];
       swipeStart = { x: touch.clientX, y: touch.clientY };
-      scrollLastY = e.target.closest("#side-panel, #mobile-input-bar") ? null : touch.clientY;
+      scrollLastY = e.target.closest("#side-panel, #mobile-input-bar") || isScrollbarTarget(e.target) ? null : touch.clientY;
+      scrollLastTime = scrollLastY === null ? 0 : performance.now();
       scrollAccum = 0;
+      scrollVelocity = 0;
     }
   }, { passive: true, capture: true });
 
@@ -1276,6 +1553,10 @@ function init(baseTransport, config) {
     const term = currentTerm();
     const xtermEl = currentXtermEl();
     if (!term || !xtermEl) return;
+    if (scrollbarDrag && e.touches.length === 1) {
+      updateScrollbarDrag(e.touches[0].clientY);
+      return;
+    }
     if (e.touches.length === 2 && twoFingerStart && twoFingerStart.dist) {
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
@@ -1293,7 +1574,23 @@ function init(baseTransport, config) {
       }
     }
     if (e.touches.length === 1 && scrollLastY !== null && !xtermEl.classList.contains("select-mode")) {
+      if (swipeStart) {
+        const touch = e.touches[0];
+        const dx = swipeStart.x - touch.clientX;
+        const dy = swipeStart.y - touch.clientY;
+        if (!gestureAxis && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+          gestureAxis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+        }
+        if (gestureAxis === "x" && dx > 0 && Math.abs(dx) > Math.abs(dy)) {
+          scrollLastY = null;
+          scrollLastTime = 0;
+          scrollAccum = 0;
+          scrollVelocity = 0;
+          return;
+        }
+      }
       const y = e.touches[0].clientY;
+      const now = performance.now();
       const delta = scrollLastY - y;
       scrollAccum += delta;
       const cellHeight = getCellHeight();
@@ -1302,13 +1599,21 @@ function init(baseTransport, config) {
         term.scrollLines(lines);
         scrollAccum -= lines * cellHeight;
       }
+      const dt = Math.max(1, now - (scrollLastTime || now));
+      const instantVelocity = delta / dt;
+      scrollVelocity = scrollVelocity * 0.75 + instantVelocity * 0.25;
       scrollLastY = y;
+      scrollLastTime = now;
     }
   }, { passive: true, capture: true });
 
   document.addEventListener("touchend", e => {
+    stopScrollbarDrag();
     scrollLastY = null;
-    scrollAccum = 0;
+    scrollLastTime = 0;
+    if (e.touches.length === 0) {
+      startScrollMomentum();
+    }
     if (swipeStart && e.touches.length === 0 && e.changedTouches.length === 1) {
       const touch = e.changedTouches[0];
       const dx = swipeStart.x - touch.clientX;
@@ -1317,12 +1622,50 @@ function init(baseTransport, config) {
       swipeStart = null;
     }
     if (twoFingerStart && e.touches.length === 0) {
-      if (Date.now() - twoFingerStart.time < 500 && !voiceRecorder && !twoFingerStart.pinched) {
-        startVoiceRecording("agent");
+      if (Date.now() - twoFingerStart.time < 500 && !twoFingerStart.pinched) {
+        const now = Date.now();
+        if (lastTwoFingerTapAt && now - lastTwoFingerTapAt < 500) {
+          lastTwoFingerTapAt = 0;
+          toggleDictation();
+        } else {
+          lastTwoFingerTapAt = now;
+        }
       }
       twoFingerStart = null;
     }
   }, { passive: true, capture: true });
+
+  document.addEventListener("touchcancel", () => {
+    stopScrollbarDrag();
+    gestureAxis = null;
+    scrollLastY = null;
+    scrollLastTime = 0;
+  }, { passive: true, capture: true });
+
+  document.addEventListener("pointerdown", e => {
+    if (beginScrollbarDrag(e.target, e.clientY, e.pointerId)) {
+      e.preventDefault();
+    }
+  }, { capture: true });
+
+  document.addEventListener("pointermove", e => {
+    if (!scrollbarDrag) return;
+    if (scrollbarDrag.pointerId !== null && e.pointerId !== scrollbarDrag.pointerId) return;
+    e.preventDefault();
+    updateScrollbarDrag(e.clientY);
+  }, { capture: true });
+
+  document.addEventListener("pointerup", e => {
+    if (!scrollbarDrag) return;
+    if (scrollbarDrag.pointerId !== null && e.pointerId !== scrollbarDrag.pointerId) return;
+    stopScrollbarDrag();
+  }, { capture: true });
+
+  document.addEventListener("pointercancel", e => {
+    if (!scrollbarDrag) return;
+    if (scrollbarDrag.pointerId !== null && e.pointerId !== scrollbarDrag.pointerId) return;
+    stopScrollbarDrag();
+  }, { capture: true });
 
   helpModal.addEventListener("click", () => helpModal.classList.remove("active"));
 
@@ -1501,10 +1844,16 @@ function init(baseTransport, config) {
   let voiceCancelled = false;
   let voiceAbort = null;
   let voiceMode = null;
+  let voiceCancelPending = false;
   let voiceShouldRestoreTerminalFocus = false;
 
   function cancelVoiceAgent() {
     currentTab()?.transport.cancelAgent().catch(() => {});
+  }
+
+  function updateVoiceControls() {
+    spMic.classList.toggle("cancelling", voiceCancelPending && voiceMode === "agent");
+    spCancel.disabled = voiceCancelPending || (!voiceRecorder && !voiceAbort);
   }
 
   function voiceReset() {
@@ -1517,10 +1866,11 @@ function init(baseTransport, config) {
     voiceCancelled = false;
     voiceAbort = null;
     voiceMode = null;
+    voiceCancelPending = false;
     voiceShouldRestoreTerminalFocus = false;
-    spMic.classList.remove("recording", "processing");
+    spMic.classList.remove("recording", "processing", "cancelling");
     spDict.classList.remove("recording", "processing");
-    spCancel.disabled = true;
+    updateVoiceControls();
     if (restoreTerminalFocus) focusCurrent();
   }
 
@@ -1560,7 +1910,7 @@ function init(baseTransport, config) {
         const blob = new Blob(chunks, { type: mime });
         const request = mode === "dict"
           ? tab.transport.transcribeAudio(blob, mime)
-          : tab.transport.sendVoiceMessage(blob, mime);
+          : tab.transport.sendVoiceMessage(blob, mime, getAgentSettings());
         request.then(data => {
           voiceReset();
           if (data.error) {
@@ -1598,7 +1948,7 @@ function init(baseTransport, config) {
       };
       recorder.start();
       button.classList.add("recording");
-      spCancel.disabled = false;
+      updateVoiceControls();
     }).catch(err => {
       voiceReset();
       showToast("Mic: " + err.message);
@@ -1606,11 +1956,15 @@ function init(baseTransport, config) {
   }
 
   spMic.addEventListener("click", () => {
+    if (micLongPressFired) return;
+    if (voiceCancelPending) {
+      return;
+    }
     if (voiceAbort && voiceMode === "agent") {
+      voiceCancelPending = true;
       cancelVoiceAgent();
-      voiceAbort.abort();
-      voiceReset();
-      showToast("Cancelled");
+      updateVoiceControls();
+      showToast("Cancelling...", true);
     } else if (voiceRecorder && voiceRecorder.state === "recording" && voiceMode === "agent") {
       voiceRecorder.stop();
     } else if (!voiceRecorder && !voiceAbort) {
@@ -1618,7 +1972,7 @@ function init(baseTransport, config) {
     }
   });
 
-  spDict.addEventListener("click", () => {
+  function toggleDictation() {
     if (voiceAbort && voiceMode === "dict") {
       voiceAbort.abort();
       voiceReset();
@@ -1628,14 +1982,27 @@ function init(baseTransport, config) {
     } else if (!voiceRecorder && !voiceAbort) {
       startVoiceRecording("dict");
     }
+  }
+
+  spDict.addEventListener("click", () => {
+    toggleDictation();
   });
 
   spCancel.addEventListener("click", () => {
+    if (voiceCancelPending) {
+      return;
+    }
     if (voiceRecorder && voiceRecorder.state === "recording") {
       voiceCancelled = true;
       voiceRecorder.stop();
     } else if (voiceAbort) {
-      cancelVoiceAgent();
+      if (voiceMode === "agent") {
+        voiceCancelPending = true;
+        cancelVoiceAgent();
+        updateVoiceControls();
+        showToast("Cancelling...", true);
+        return;
+      }
       voiceAbort.abort();
       voiceReset();
       showToast("Cancelled");
@@ -1674,7 +2041,7 @@ function init(baseTransport, config) {
     showToast("Thinking...", true);
     const controller = new AbortController();
     textAbort = controller;
-    tab.transport.sendTextMessage(text).then(data => {
+    tab.transport.sendTextMessage(text, getAgentSettings()).then(data => {
       spText.classList.remove("processing");
       textAbort = null;
       if (data.error) {
@@ -1981,6 +2348,97 @@ function init(baseTransport, config) {
     e.stopPropagation();
   }, { capture: true });
 
+  // --- Agent settings modal (longpress on mic) ---
+  const agentSettingsModal = document.getElementById("agent-settings-modal");
+  const agentPersistence = document.getElementById("agent-persistence");
+  const agentLookback = document.getElementById("agent-lookback");
+  const agentLookbackVal = document.getElementById("agent-lookback-val");
+  const agentTurnLimit = document.getElementById("agent-turn-limit");
+  const agentSettingsReset = document.getElementById("agent-settings-reset");
+  const agentSettingsClose = document.getElementById("agent-settings-close");
+
+  const AGENT_DEFAULTS = { persistence: "persistent", lookback: 100, turnLimit: 20 };
+
+  function loadAgentSettings() {
+    try {
+      const raw = localStorage.getItem("envoy_agent_settings");
+      if (raw) return { ...AGENT_DEFAULTS, ...JSON.parse(raw) };
+    } catch {}
+    return { ...AGENT_DEFAULTS };
+  }
+
+  function saveAgentSettingsToStorage() {
+    const settings = {
+      persistence: agentPersistence.value,
+      lookback: parseInt(agentLookback.value, 10),
+      turnLimit: parseInt(agentTurnLimit.value, 10) || AGENT_DEFAULTS.turnLimit,
+    };
+    localStorage.setItem("envoy_agent_settings", JSON.stringify(settings));
+  }
+
+  function getAgentSettings() {
+    const s = loadAgentSettings();
+    return {
+      agent_persistence: s.persistence,
+      agent_lookback: s.lookback,
+      agent_turn_limit: s.turnLimit,
+    };
+  }
+
+  function openAgentSettings() {
+    const s = loadAgentSettings();
+    agentPersistence.value = s.persistence;
+    agentLookback.value = s.lookback;
+    agentLookbackVal.textContent = s.lookback;
+    agentTurnLimit.value = s.turnLimit;
+    agentSettingsModal.classList.add("active");
+    setTerminalInputActive(false);
+  }
+
+  function closeAgentSettings() {
+    saveAgentSettingsToStorage();
+    agentSettingsModal.classList.remove("active");
+    focusCurrent();
+    updateMobileInputBar();
+  }
+
+  agentLookback.addEventListener("input", () => {
+    agentLookbackVal.textContent = agentLookback.value;
+  });
+  agentSettingsClose.addEventListener("click", closeAgentSettings);
+  agentSettingsModal.addEventListener("click", e => { if (e.target === agentSettingsModal) closeAgentSettings(); });
+  agentSettingsModal.addEventListener("keydown", e => {
+    if (e.key === "Escape") { e.preventDefault(); closeAgentSettings(); }
+    e.stopPropagation();
+  }, { capture: true });
+
+  agentSettingsReset.addEventListener("click", () => {
+    const tab = currentTab();
+    if (tab) {
+      tab.transport.cancelAgent().catch(() => {});
+      showToast("Agent reset");
+    }
+    closeAgentSettings();
+  });
+
+  // Longpress on mic button to open agent settings
+  let micLongPressTimer = null;
+  let micLongPressFired = false;
+  spMic.addEventListener("pointerdown", e => {
+    micLongPressFired = false;
+    micLongPressTimer = setTimeout(() => {
+      micLongPressFired = true;
+      openAgentSettings();
+    }, 500);
+  });
+  spMic.addEventListener("pointerup", () => { clearTimeout(micLongPressTimer); });
+  spMic.addEventListener("pointercancel", () => { clearTimeout(micLongPressTimer); });
+  spMic.addEventListener("pointermove", e => {
+    if (micLongPressTimer && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
+      clearTimeout(micLongPressTimer);
+    }
+  });
+
   function scheduleFullscreenLayoutRefresh() {
     performLayoutRefresh();
     setTimeout(performLayoutRefresh, 100);
@@ -2106,31 +2564,131 @@ function init(baseTransport, config) {
       const modifier = button.dataset.key;
       if (modifier) {
         stopMobileInputRepeat();
-        mobileModifiers[modifier] = !mobileModifiers[modifier];
-        button.classList.toggle("active", mobileModifiers[modifier]);
+        if (modifier === "Alt" && (e.type === "touchstart" || e.type === "mousedown")) {
+          return;
+        }
+        clearMobileModifierLongPress();
+        toggleMobileModifier(modifier);
         pulseMobileInputButton(button);
         focusCurrent();
         return;
       }
+      const action = button.dataset.action || "";
+      if ((action === "home" || action === "end") && (e.type === "touchstart" || e.type === "mousedown")) {
+        clearMobileNavLongPress();
+        mobileNavLongPressTriggered = false;
+        mobileNavLongPressAction = action;
+        mobileNavLongPressTimer = setTimeout(() => {
+          if (mobileNavLongPressAction !== action) return;
+          mobileNavLongPressTriggered = true;
+          const longPressSequence = action === "home" ? mobileInputSequences.pageup : mobileInputSequences.pagedown;
+          pulseMobileInputButton(button);
+          writeSequenceToCurrentTab(longPressSequence).then(() => focusCurrent());
+          resetMobileModifiers();
+        }, MOBILE_NAV_LONG_PRESS_MS);
+        return;
+      }
       pulseMobileInputButton(button);
-      const sequence = mobileInputSequences[button.dataset.action] || "";
+      const sequence = getMobileActionSequence(action);
       if (!sequence) return;
-      sendMobileInput(sequence);
-      if (repeatableActions.has(button.dataset.action)) {
+      if (sequence === MOBILE_ALT_LEFT_TOKEN) suppressNextMobileTerminalData(["\x1b[D", "\x1bOD", "b"]);
+      if (sequence === MOBILE_ALT_RIGHT_TOKEN) suppressNextMobileTerminalData(["\x1b[C", "\x1bOC", "f"]);
+      writeSequenceToCurrentTab(sequence).then(() => focusCurrent());
+      if (sequence !== MOBILE_ALT_LEFT_TOKEN && sequence !== MOBILE_ALT_RIGHT_TOKEN) {
+        resetMobileModifiers();
+      }
+      if (repeatableActions.has(action)) {
         startMobileInputRepeat(sequence);
       } else {
         stopMobileInputRepeat();
       }
     };
-    const handleMobileInputRelease = () => {
+    const handleMobileInputRelease = e => {
       stopMobileInputRepeat();
+      const button = e?.target?.closest?.(".mobile-input-key");
+      const action = button?.dataset?.action || "";
+      const wasNavLongPress = mobileNavLongPressTriggered;
+      clearMobileNavLongPress();
+      if (button && (action === "home" || action === "end") && !wasNavLongPress) {
+        pulseMobileInputButton(button);
+        const sequence = getMobileActionSequence(action);
+        if (sequence) {
+          writeSequenceToCurrentTab(sequence).then(() => focusCurrent());
+          resetMobileModifiers();
+        }
+      }
+      mobileNavLongPressTriggered = false;
     };
+    mobileInputBar.addEventListener("touchstart", e => {
+      const button = e.target.closest(".mobile-modifier-key[data-key='Alt']");
+      clearMobileModifierLongPress();
+      mobileModifierLongPressTriggered = false;
+      if (!button) return;
+      mobileModifierLongPressKey = "Alt";
+      mobileModifierLongPressTimer = setTimeout(() => {
+        if (mobileModifierLongPressKey !== "Alt") return;
+        mobileModifierLongPressTriggered = true;
+        const nextLocked = !mobileLockedModifiers.Alt;
+        setMobileModifier("Alt", nextLocked, nextLocked);
+        pulseMobileInputButton(button);
+        focusCurrent();
+      }, MOBILE_MODIFIER_LONG_PRESS_MS);
+    }, { passive: true });
+    mobileInputBar.addEventListener("touchend", e => {
+      const button = e.target.closest(".mobile-modifier-key[data-key='Alt']");
+      const wasLongPress = mobileModifierLongPressTriggered;
+      clearMobileModifierLongPress();
+      if (button && !wasLongPress) {
+        toggleMobileModifier("Alt");
+        pulseMobileInputButton(button);
+        focusCurrent();
+      }
+      mobileModifierLongPressTriggered = false;
+      handleMobileInputRelease(e);
+    }, { passive: true });
+    mobileInputBar.addEventListener("touchcancel", e => {
+      clearMobileModifierLongPress();
+      mobileModifierLongPressTriggered = false;
+      clearMobileNavLongPress();
+      mobileNavLongPressTriggered = false;
+      handleMobileInputRelease(e);
+    }, { passive: true });
     mobileInputBar.addEventListener("touchstart", handleMobileInputPress, { passive: false });
-    mobileInputBar.addEventListener("touchend", handleMobileInputRelease, { passive: true });
-    mobileInputBar.addEventListener("touchcancel", handleMobileInputRelease, { passive: true });
+    mobileInputBar.addEventListener("mousedown", e => {
+      const button = e.target.closest(".mobile-modifier-key[data-key='Alt']");
+      clearMobileModifierLongPress();
+      mobileModifierLongPressTriggered = false;
+      if (!button) return;
+      mobileModifierLongPressKey = "Alt";
+      mobileModifierLongPressTimer = setTimeout(() => {
+        if (mobileModifierLongPressKey !== "Alt") return;
+        mobileModifierLongPressTriggered = true;
+        const nextLocked = !mobileLockedModifiers.Alt;
+        setMobileModifier("Alt", nextLocked, nextLocked);
+        pulseMobileInputButton(button);
+        focusCurrent();
+      }, MOBILE_MODIFIER_LONG_PRESS_MS);
+    });
     mobileInputBar.addEventListener("mousedown", handleMobileInputPress);
-    mobileInputBar.addEventListener("mouseup", handleMobileInputRelease);
-    mobileInputBar.addEventListener("mouseleave", handleMobileInputRelease);
+    mobileInputBar.addEventListener("mouseup", e => {
+      const button = e.target.closest(".mobile-modifier-key[data-key='Alt']");
+      const wasLongPress = mobileModifierLongPressTriggered;
+      clearMobileModifierLongPress();
+      if (button && !wasLongPress) {
+        toggleMobileModifier("Alt");
+        pulseMobileInputButton(button);
+        focusCurrent();
+      }
+      mobileModifierLongPressTriggered = false;
+      handleMobileInputRelease(e);
+    });
+    mobileInputBar.addEventListener("mouseleave", e => {
+      clearMobileModifierLongPress();
+      mobileModifierLongPressTriggered = false;
+      clearMobileNavLongPress();
+      mobileNavLongPressTriggered = false;
+      handleMobileInputRelease(e);
+    });
   }
 
   document.addEventListener("focusin", e => {
@@ -2167,6 +2725,19 @@ function init(baseTransport, config) {
     if (!mobileModifiers.Control && !mobileModifiers.Alt) return;
     if (!e.target.classList?.contains("xterm-helper-textarea")) return;
     if (e.isComposing) return;
+
+    if (e.inputType === "deleteContentBackward" || e.inputType === "deleteWordBackward") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const sequence = getMobileModifiedKeySequence("Backspace");
+      if (sequence === MOBILE_ALT_BACKSPACE_TOKEN) suppressNextMobileTerminalData(["\x7f", "\x08"]);
+      if (sequence) writeSequenceToCurrentTab(sequence);
+      const textarea = e.target;
+      textarea.value = "";
+      focusCurrent();
+      return;
+    }
+
     if (typeof e.data !== "string" || !e.data) return;
     e.preventDefault();
     e.stopImmediatePropagation();
@@ -2176,16 +2747,29 @@ function init(baseTransport, config) {
     focusCurrent();
   }, true);
 
+  document.addEventListener("input", e => {
+    if (!isMobileClient) return;
+    if (!mobileModifiers.Control && !mobileModifiers.Alt) return;
+    if (!e.target.classList?.contains("xterm-helper-textarea")) return;
+    if (e.inputType !== "deleteContentBackward" && e.inputType !== "deleteWordBackward") return;
+    e.stopImmediatePropagation();
+    const textarea = e.target;
+    textarea.value = "";
+  }, true);
+
   document.addEventListener("keydown", e => {
     if (!isMobileClient) return;
     if (!mobileModifiers.Control && !mobileModifiers.Alt) return;
     if (!e.target.classList?.contains("xterm-helper-textarea")) return;
 
-    if (e.key === "Backspace" || e.key === "Enter") {
+    if (e.key === "Backspace" || e.key === "Enter" || e.key === "ArrowLeft" || e.key === "ArrowRight") {
       e.preventDefault();
       e.stopImmediatePropagation();
-      const sequence = e.key === "Backspace" ? "\x7f" : "\r";
-      writeSequenceToCurrentTab(encodeMobileInputSequence(sequence));
+      const sequence = getMobileModifiedKeySequence(e.key);
+      if (sequence === MOBILE_ALT_BACKSPACE_TOKEN) suppressNextMobileTerminalData(["\x7f", "\x08"]);
+      if (sequence === MOBILE_ALT_LEFT_TOKEN) suppressNextMobileTerminalData(["\x1b[D", "\x1bOD", "b"]);
+      if (sequence === MOBILE_ALT_RIGHT_TOKEN) suppressNextMobileTerminalData(["\x1b[C", "\x1bOC", "f"]);
+      if (sequence) writeSequenceToCurrentTab(sequence);
       const textarea = e.target;
       textarea.value = "";
       focusCurrent();

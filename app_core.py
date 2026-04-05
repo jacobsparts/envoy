@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+import pyte
+
 from env_config import get_env_settings, save_env_settings
 from speech import synthesize_speech
 from terminal_session import SessionTerminal
@@ -114,7 +116,10 @@ class Session:
         self.alive = True
         self.exit_message = b""
         self.exit_code: int | None = None
-        self.voice_scrollback_mark = 0
+        # pyte virtual terminal for agent context
+        self._pyte_screen = pyte.HistoryScreen(80, 24, history=50000)
+        self._pyte_stream = pyte.Stream(self._pyte_screen)
+        self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
         self.client_id: str = ""
         self.agent_events: list[dict[str, str]] = []
@@ -131,6 +136,10 @@ class Session:
             removed = self.scrollback.popleft()
             self.scrollback_bytes -= len(removed)
         self.pending.extend(data)
+        try:
+            self._pyte_stream.feed(data.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
 
     def _read_loop(self) -> None:
         try:
@@ -168,6 +177,28 @@ class Session:
     def get_scrollback(self) -> bytes:
         with self._lock:
             return b"".join(self.scrollback)
+
+    def get_terminal_lines(self) -> list[str]:
+        """Return rendered lines from pyte: history + current screen."""
+        with self._lock:
+            screen = self._pyte_screen
+            lines = []
+            for hist_line in screen.history.top:
+                cols = screen.columns
+                rendered = "".join(
+                    hist_line[i].data if i in hist_line else " "
+                    for i in range(cols)
+                )
+                lines.append(rendered.rstrip())
+            for row in screen.display:
+                lines.append(row.rstrip())
+            return lines
+
+    def reset_context_lookback(self, rows: int) -> None:
+        """Reset the context watermark to include the last *rows* lines."""
+        lines = self.get_terminal_lines()
+        start = max(0, len(lines) - rows)
+        self._pyte_known_lines = lines[:start]
 
     def drain_pending(self) -> bytes:
         with self._lock:
@@ -210,6 +241,8 @@ class Session:
         if self.alive:
             winsize = struct.pack("HHHH", rows, cols, 0, 0)
             fcntl.ioctl(self.master, termios.TIOCSWINSZ, winsize)
+        with self._lock:
+            self._pyte_screen.resize(rows, cols)
 
     def save_upload(self, name: str, content: bytes) -> str:
         os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -371,7 +404,8 @@ class EnvoyService:
         path = session.save_upload(name, self._decode(data_b64))
         return {"path": path}
 
-    def send_text_message(self, session_id: str, text: str) -> dict[str, object]:
+    def send_text_message(self, session_id: str, text: str,
+                          agent_settings: dict | None = None) -> dict[str, object]:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
@@ -379,7 +413,8 @@ class EnvoyService:
         session.voice_cancel = cancel
         try:
             iface = SessionTerminal(session)
-            reply = process_text_message(text, iface, cancel)
+            reply = process_text_message(text, iface, cancel,
+                                         agent_settings=agent_settings or {})
             speech = "\n".join(iface.messages) or reply
             return {
                 "response": reply,
@@ -392,7 +427,8 @@ class EnvoyService:
         finally:
             session.voice_cancel = None
 
-    def send_voice_message(self, session_id: str, audio_b64: str, mime_type: str) -> dict[str, object]:
+    def send_voice_message(self, session_id: str, audio_b64: str, mime_type: str,
+                           agent_settings: dict | None = None) -> dict[str, object]:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
@@ -400,7 +436,8 @@ class EnvoyService:
         session.voice_cancel = cancel
         try:
             iface = SessionTerminal(session)
-            reply = process_voice_message(self._decode(audio_b64), mime_type, iface, cancel)
+            reply = process_voice_message(self._decode(audio_b64), mime_type, iface, cancel,
+                                          agent_settings=agent_settings or {})
             speech = "\n".join(iface.messages) or reply
             return {
                 "response": reply,

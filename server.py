@@ -170,7 +170,15 @@ def make_handler():
 
                 if parsed.path == f"{WEB_PREFIX}/api/text":
                     body = read_json_body(self)
-                    result = service.send_text_message(str(body.get("session_id") or ""), str(body.get("text") or ""))
+                    agent_settings = {
+                        k: body[k] for k in ("agent_persistence", "agent_lookback", "agent_turn_limit")
+                        if k in body
+                    }
+                    result = service.send_text_message(
+                        str(body.get("session_id") or ""),
+                        str(body.get("text") or ""),
+                        agent_settings=agent_settings or None,
+                    )
                     json_response(self, 200, result)
                     return
 
@@ -187,7 +195,17 @@ def make_handler():
                     audio = self.rfile.read(length)
                     mime = self.headers.get("Content-Type", "audio/webm").split(";", 1)[0]
                     session_id = self.headers.get("X-Session-Id", "")
-                    result = service.send_voice_message(session_id, service._encode(audio), mime)
+                    agent_settings = {}
+                    for hdr, key in [("X-Agent-Persistence", "agent_persistence"),
+                                     ("X-Agent-Lookback", "agent_lookback"),
+                                     ("X-Agent-Turn-Limit", "agent_turn_limit")]:
+                        val = self.headers.get(hdr, "")
+                        if val:
+                            agent_settings[key] = int(val) if val.isdigit() else val
+                    result = service.send_voice_message(
+                        session_id, service._encode(audio), mime,
+                        agent_settings=agent_settings or None,
+                    )
                     json_response(self, 200, result)
                     return
 
