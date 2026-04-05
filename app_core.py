@@ -122,6 +122,7 @@ class Session:
         self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
         self.client_id: str = ""
+        self.last_seen: float = time.monotonic()
         self.agent_events: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
@@ -296,10 +297,25 @@ class Session:
                 pass
 
 
+CLIENT_STALE_SECONDS = 30
+
+
 class EnvoyService:
     def __init__(self):
         self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
+        self._reaper = threading.Thread(target=self._reap_loop, daemon=True, name="session-reaper")
+        self._reaper.start()
+
+    def _reap_loop(self) -> None:
+        while True:
+            time.sleep(CLIENT_STALE_SECONDS)
+            now = time.monotonic()
+            with self._lock:
+                sessions = list(self._sessions.values())
+            for s in sessions:
+                if s.alive and s._timeout is None and now - s.last_seen >= CLIENT_STALE_SECONDS:
+                    s.start_timeout()
 
     def _encode(self, payload: bytes) -> str:
         return base64.b64encode(payload).decode("ascii")
@@ -376,6 +392,7 @@ class EnvoyService:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
         if session.alive:
             session.cancel_timeout()
+        session.last_seen = time.monotonic()
         if wait_timeout > 0:
             output = session.wait_for_pending(wait_timeout, client_id=client_id)
         else:
@@ -459,6 +476,22 @@ class EnvoyService:
         if cancel:
             cancel.set()
         return {"ok": True}
+
+    def list_sessions(self) -> list[dict[str, object]]:
+        with self._lock:
+            sessions = list(self._sessions.values())
+        result = []
+        for s in sessions:
+            if not s.alive:
+                continue
+            result.append({
+                "sid": s.sid,
+                "path": s.path,
+                "cmd": s.cmd,
+                "cwd": s.cwd,
+                "attached": s._timeout is None,
+            })
+        return result
 
     def close_session(self, session_id: str) -> dict[str, bool]:
         with self._lock:

@@ -997,12 +997,15 @@ function init(baseTransport, config) {
     }
   }
 
+  const sessionsModal = document.getElementById("sessions-modal");
+
   function hasActiveModal() {
     return helpModal.classList.contains("active")
       || agentLogModal.classList.contains("active")
       || textInputModal.classList.contains("active")
       || pasteEditorModal.classList.contains("active")
-      || settingsModal.classList.contains("active");
+      || settingsModal.classList.contains("active")
+      || sessionsModal.classList.contains("active");
   }
 
   document.addEventListener("keydown", () => dismissToast(), { capture: true });
@@ -1667,7 +1670,10 @@ function init(baseTransport, config) {
     stopScrollbarDrag();
   }, { capture: true });
 
-  helpModal.addEventListener("click", () => helpModal.classList.remove("active"));
+  helpModal.addEventListener("click", (e) => {
+    if (e.target.closest("#help-sessions-link")) return;
+    helpModal.classList.remove("active");
+  });
 
   function hexToRgb(hex) {
     const r = parseInt(hex.slice(1, 3), 16);
@@ -2010,6 +2016,59 @@ function init(baseTransport, config) {
   });
 
   spHelp.addEventListener("click", () => helpModal.classList.add("active"));
+
+  const sessionsList = document.getElementById("sessions-list");
+  const sessionsClose = document.getElementById("sessions-close");
+  const helpSessionsLink = document.getElementById("help-sessions-link");
+
+  async function openSessionPicker() {
+    helpModal.classList.remove("active");
+    sessionsModal.classList.add("active");
+    sessionsList.innerHTML = '<p class="sessions-empty">Loading...</p>';
+    try {
+      const basePath = baseTransport.basePath || "/envoy";
+      const resp = await fetch(basePath + "/api/sessions");
+      const sessions = await resp.json();
+      const openSids = new Set(manager.tabs.map(t => t.transport.sessionId).filter(Boolean));
+      if (!sessions.length) {
+        sessionsList.innerHTML = '<p class="sessions-empty">No active sessions</p>';
+        return;
+      }
+      sessionsList.innerHTML = "";
+      for (const s of sessions) {
+        const item = document.createElement("button");
+        item.type = "button";
+        item.className = "session-item";
+        if (openSids.has(s.sid)) item.style.opacity = "0.5";
+        const status = s.attached ? "attached" : "detached";
+        item.innerHTML =
+          `<div class="session-item-id">${s.sid}</div>` +
+          `<div class="session-item-cmd">${s.cmd.join(" ")}</div>` +
+          `<div class="session-item-status ${status}">${status} &mdash; ${s.path}</div>`;
+        item.addEventListener("click", () => {
+          sessionsModal.classList.remove("active");
+          const existing = manager.tabs.find(t => t.transport.sessionId === s.sid);
+          if (existing) {
+            manager.activateTab(existing.id);
+          } else {
+            manager.createTab({ activate: true, sessionId: s.sid }).catch(err => showToast(String(err), true));
+          }
+        });
+        sessionsList.appendChild(item);
+      }
+    } catch (err) {
+      sessionsList.innerHTML = `<p class="sessions-empty">${err.message || err}</p>`;
+    }
+  }
+
+  helpSessionsLink.addEventListener("click", (e) => {
+    e.preventDefault();
+    openSessionPicker();
+  });
+  sessionsClose.addEventListener("click", () => sessionsModal.classList.remove("active"));
+  sessionsModal.addEventListener("click", (e) => {
+    if (e.target === sessionsModal) sessionsModal.classList.remove("active");
+  });
 
   const textInputArea = document.getElementById("text-input-area");
   const textInputSend = document.getElementById("text-input-send");
@@ -2483,7 +2542,7 @@ function init(baseTransport, config) {
     }
     if (Date.now() < suppressTerminalFocusUntil) return;
     if (hasActiveModal()) return;
-    if (e.target.closest("#side-panel, #mobile-input-bar, #help-modal, #voice-log-modal, #text-input-modal, #paste-editor-modal, #settings-modal")) return;
+    if (e.target.closest("#side-panel, #mobile-input-bar, #help-modal, #voice-log-modal, #text-input-modal, #paste-editor-modal, #settings-modal, #sessions-modal")) return;
     requestAnimationFrame(() => focusCurrent());
   };
 
@@ -2545,6 +2604,13 @@ function init(baseTransport, config) {
     if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "e") {
       e.preventDefault();
       openPasteEditor();
+    }
+    if (e.ctrlKey && e.key.toLowerCase() === "d") {
+      e.preventDefault();
+    }
+    if (e.key === "Escape" && sessionsModal.classList.contains("active")) {
+      e.preventDefault();
+      sessionsModal.classList.remove("active");
     }
     if (e.key === "Escape" && selectOverlay.classList.contains("active")) {
       e.preventDefault();

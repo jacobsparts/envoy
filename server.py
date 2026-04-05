@@ -105,6 +105,10 @@ def make_handler():
                 json_response(self, 200, service.get_config(app_path))
                 return
 
+            if parsed.path == f"{WEB_PREFIX}/api/sessions":
+                json_response(self, 200, service.list_sessions())
+                return
+
             if parsed.path == f"{WEB_PREFIX}/api/settings":
                 json_response(self, 200, service.get_settings())
                 return
