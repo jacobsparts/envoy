@@ -10,6 +10,10 @@
   font-weight: 700;
   src: url('SourceCodePro-Bold.woff2') format('woff2');
 }
+html {
+  background-color: #000;
+  color-scheme: dark;
+}
 body {
   margin: 0;
   background: #000;
@@ -256,7 +260,7 @@ input, textarea, #select-overlay, #select-overlay * {
   background: #111; border-left: 1px solid #333;
   z-index: 20; box-sizing: border-box;
   display: flex; flex-direction: column;
-  align-items: center; padding: 12px 0; gap: 12px;
+  align-items: center; padding: 8px 0; gap: 0;
   overflow: hidden;
   transform: translateX(100%);
   transition: transform 0.2s ease;
@@ -267,12 +271,14 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 
 .sp-btn {
-  width: 36px; height: 36px; border-radius: 50%;
+  width: 36px; height: 36px; min-height: 36px;
+  margin-bottom: 8px;
+  border-radius: 50%;
   border: 1px solid #333; background: #1a1a1a;
   color: #888; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
   font: 16px 'Source Code Pro', monospace;
-  padding: 0;
+  padding: 0; flex-shrink: 0;
 }
 .sp-btn:active { background: #333; }
 .sp-btn:disabled { opacity: 0.3; cursor: default; }

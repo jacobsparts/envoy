@@ -546,13 +546,7 @@ class TerminalTab {
     try {
       this.term.resize(this.term.cols, this.term.rows);
     } catch {}
-    try {
-      this.term._core?._viewport?._refresh?.();
-    } catch {}
-    if (typeof this.term.refresh === "function") {
-      this.term.refresh(0, Math.max(0, this.term.rows - 1));
-      requestAnimationFrame(() => this.term.refresh(0, Math.max(0, this.term.rows - 1)));
-    }
+    this.term.scrollToBottom();
     this.updateScrollbackClass();
     if (!this.disconnected) {
       this.transport.resize(this.term.cols, this.term.rows).catch(() => this.markDisconnected());
@@ -675,6 +669,27 @@ class TabManager {
     this.elements = elements;
   }
 
+  saveTabState() {
+    if (!window.matchMedia('(display-mode: standalone)').matches) return;
+    const sids = this.tabs.map(t => t.transport.sessionId).filter(Boolean);
+    const active = this.activeTab?.transport.sessionId || "";
+    if (sids.length) {
+      localStorage.setItem("envoy-tab-state", JSON.stringify({ tabs: sids, active }));
+    } else {
+      localStorage.removeItem("envoy-tab-state");
+    }
+  }
+
+  static loadTabState() {
+    try {
+      const raw = localStorage.getItem("envoy-tab-state");
+      if (!raw) return null;
+      const state = JSON.parse(raw);
+      if (Array.isArray(state.tabs) && state.tabs.length) return state;
+    } catch {}
+    return null;
+  }
+
   updateTabBar() {
     this.elements.tabs.parentElement.classList.toggle("single", this.tabs.length <= 1);
   }
@@ -696,6 +711,7 @@ class TabManager {
     await tab.connect(sessionId);
     if (activate || !this.activeTab) this.activateTab(tab.id);
     this.syncHash();
+    this.saveTabState();
     return tab;
   }
 
@@ -712,6 +728,7 @@ class TabManager {
     this.updateDisconnectOverlay();
     this.renderAgentLog();
     this.syncHash();
+    this.saveTabState();
   }
 
   updateDisconnectOverlay() {
@@ -773,6 +790,7 @@ class TabManager {
     const remaining = this.tabs.filter(item => item !== tab);
     this.tabs = remaining;
     this.updateTabBar();
+    this.saveTabState();
     if (wasActive) {
       this.activeTab = null;
     }
@@ -783,6 +801,7 @@ class TabManager {
         return;
       }
       if (window.matchMedia('(display-mode: standalone)').matches && window.matchMedia('(pointer: fine)').matches) {
+        localStorage.removeItem("envoy-tab-state");
         window.close();
         return;
       }
@@ -868,7 +887,7 @@ function init(baseTransport, config) {
   let toastLocked = false;
   let terminalInputActive = false;
   let keyboardVisible = false;
-  let mobileBarInset = 0;
+
   let resizeObserver = null;
   let mobileRepeatTimer = null;
   let mobileRepeatDelayTimer = null;
@@ -971,14 +990,22 @@ function init(baseTransport, config) {
     currentTab()?.focus();
   }
 
+  let pendingResize = null;
   function sendResize() {
-    if (manager.activeTab) manager.activeTab.fitTerminal();
-    syncSelectOverlaySize();
+    if (pendingResize) cancelAnimationFrame(pendingResize);
+    pendingResize = requestAnimationFrame(() => {
+      pendingResize = null;
+      if (manager.activeTab) manager.activeTab.fitTerminal();
+      syncSelectOverlaySize();
+    });
   }
 
   function applyMobileInputBarInset() {
     if (!mobileInputBar || !isMobileClient) return;
-    mobileInputBar.style.bottom = `${mobileBarInset}px`;
+    const vv = window.visualViewport;
+    if (!vv) { mobileInputBar.style.bottom = '0px'; return; }
+    const bottom = Math.max(0, window.innerHeight - (vv.offsetTop + vv.height));
+    mobileInputBar.style.bottom = `${Math.round(bottom)}px`;
   }
 
   function updateMobileInputBar() {
@@ -1087,7 +1114,6 @@ function init(baseTransport, config) {
   function updateViewportState() {
     const vv = window.visualViewport;
     const viewportHeight = vv ? vv.height : window.innerHeight;
-    const offsetTop = vv ? vv.offsetTop : 0;
 
     if (!terminalInputActive && !hasActiveModal()) {
       baselineViewportHeight = Math.max(baselineViewportHeight, viewportHeight);
@@ -1095,16 +1121,12 @@ function init(baseTransport, config) {
 
     const keyboardDelta = Math.max(0, baselineViewportHeight - viewportHeight);
     keyboardVisible = isMobileClient && terminalInputActive && (window.visualViewport ? keyboardDelta > 100 : true);
-    mobileBarInset = keyboardVisible ? Math.max(0, offsetTop) : 0;
   }
 
   function performLayoutRefresh() {
     updateViewportState();
     updateMobileInputBar();
-    requestAnimationFrame(() => {
-      sendResize();
-      requestAnimationFrame(() => sendResize());
-    });
+    sendResize();
   }
 
   updateViewportState();
@@ -1136,8 +1158,12 @@ function init(baseTransport, config) {
   const spPaste = document.getElementById("sp-paste");
   const spSel = document.getElementById("sp-sel");
   const spFs = document.getElementById("sp-fs");
+  const spUpload = document.getElementById("sp-upload");
+
+  if (window.pywebview) spUpload.style.display = "none";
 
   let pendingSidebarTouchButton = null;
+  let sidebarTouchStart = null;
 
   function preserveTerminalFocusFromSidebarPress(e) {
     if (!isMobileClient) return;
@@ -1145,10 +1171,27 @@ function init(baseTransport, config) {
     if (!button) return;
     if (!keyboardVisible) {
       pendingSidebarTouchButton = null;
+      sidebarTouchStart = null;
       return;
     }
     e.preventDefault();
     pendingSidebarTouchButton = button;
+    const touch = e.touches[0];
+    sidebarTouchStart = touch ? { x: touch.clientX, y: touch.clientY, lastY: touch.clientY } : null;
+  }
+
+  function cancelSidebarTouchIfMoved(e) {
+    if (!sidebarTouchStart) return;
+    const touch = e.touches[0];
+    if (!touch) return;
+    const dx = touch.clientX - sidebarTouchStart.x;
+    const dy = touch.clientY - sidebarTouchStart.y;
+    if (pendingSidebarTouchButton && dx * dx + dy * dy > 100) {
+      pendingSidebarTouchButton = null;
+    }
+    // Manual sidebar scroll (preventDefault on touchstart blocks native scroll)
+    sidePanel.scrollTop += sidebarTouchStart.lastY - touch.clientY;
+    sidebarTouchStart.lastY = touch.clientY;
   }
 
   function triggerSidebarButtonWithoutBlur(e) {
@@ -1156,15 +1199,18 @@ function init(baseTransport, config) {
     const button = e.target.closest("#side-panel .sp-btn");
     if (!button || button !== pendingSidebarTouchButton) {
       pendingSidebarTouchButton = null;
+      sidebarTouchStart = null;
       return;
     }
     e.preventDefault();
     pendingSidebarTouchButton = null;
+    sidebarTouchStart = null;
     button.click();
   }
 
   function clearSidebarTouchButton() {
     pendingSidebarTouchButton = null;
+    sidebarTouchStart = null;
   }
 
   function syncPanelWidth() {
@@ -1194,6 +1240,7 @@ function init(baseTransport, config) {
 
   sidePanel.addEventListener("transitionend", syncPanelWidth);
   sidePanel.addEventListener("touchstart", preserveTerminalFocusFromSidebarPress, { passive: false, capture: true });
+  sidePanel.addEventListener("touchmove", cancelSidebarTouchIfMoved, { passive: true, capture: true });
   sidePanel.addEventListener("touchend", triggerSidebarButtonWithoutBlur, { passive: false, capture: true });
   sidePanel.addEventListener("touchcancel", clearSidebarTouchButton, { capture: true });
   if (window.matchMedia("(pointer: fine)").matches) toggleSidePanel();
@@ -1220,7 +1267,7 @@ function init(baseTransport, config) {
     } else if (e.touches.length === 1) {
       const touch = e.touches[0];
       swipeStart = { x: touch.clientX, y: touch.clientY };
-      scrollLastY = touch.clientY;
+      scrollLastY = e.target.closest("#side-panel, #mobile-input-bar") ? null : touch.clientY;
       scrollAccum = 0;
     }
   }, { passive: true, capture: true });
@@ -1395,6 +1442,25 @@ function init(baseTransport, config) {
         };
         reader.readAsDataURL(file);
       }
+    }
+  });
+
+  const fileInput = document.createElement("input");
+  fileInput.type = "file";
+  fileInput.multiple = true;
+  fileInput.style.display = "none";
+  document.body.appendChild(fileInput);
+  spUpload.addEventListener("click", () => { fileInput.value = ""; fileInput.click(); });
+  fileInput.addEventListener("change", () => {
+    const tab = currentTab();
+    if (!tab || !fileInput.files.length) return;
+    for (const file of fileInput.files) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const b64 = reader.result.split(",")[1];
+        tab.transport.uploadFile(file.name, b64).catch(err => showToast(String(err)));
+      };
+      reader.readAsDataURL(file);
     }
   });
 
@@ -1915,9 +1981,16 @@ function init(baseTransport, config) {
     e.stopPropagation();
   }, { capture: true });
 
+  function scheduleFullscreenLayoutRefresh() {
+    performLayoutRefresh();
+    setTimeout(performLayoutRefresh, 100);
+    setTimeout(performLayoutRefresh, 300);
+  }
+
   spFs.addEventListener("click", () => {
     if (baseTransport.toggleFullscreen) {
       baseTransport.toggleFullscreen();
+      scheduleFullscreenLayoutRefresh();
       return;
     }
     const el = document.documentElement;
@@ -1930,7 +2003,10 @@ function init(baseTransport, config) {
       el.webkitRequestFullscreen();
     }
   });
-  document.addEventListener("fullscreenchange", () => spFs.classList.toggle("sp-active", !!document.fullscreenElement));
+  document.addEventListener("fullscreenchange", () => {
+    spFs.classList.toggle("sp-active", !!document.fullscreenElement);
+    scheduleFullscreenLayoutRefresh();
+  });
 
   spSel.addEventListener("click", () => {
     if (selectOverlay.classList.contains("active")) exitSelectMode();
@@ -2151,7 +2227,7 @@ function init(baseTransport, config) {
     const tab = manager.activeTab;
     if (tab && tab.transport.sessionId === sid) return;
     if (tab) {
-      tab.connect(sid).then(() => tab.fitTerminal()).catch(err => showToast(String(err), true));
+      tab.connect(sid).then(() => { tab.fitTerminal(); manager.saveTabState(); }).catch(err => showToast(String(err), true));
     }
   });
 
@@ -2168,10 +2244,27 @@ function init(baseTransport, config) {
   window.addEventListener("online", recoverConnections);
   window.addEventListener("pageshow", recoverConnections);
 
+  const saved = window.matchMedia('(display-mode: standalone)').matches ? TabManager.loadTabState() : null;
   const hashSid = window.location.hash.slice(1);
-  manager.createTab({ activate: true, sessionId: hashSid }).then(() => {
+
+  (async () => {
+    if (saved) {
+      for (const sid of saved.tabs) {
+        try {
+          await manager.createTab({ activate: false, sessionId: sid });
+        } catch {}
+      }
+      if (manager.tabs.length) {
+        const active = manager.getTabById(saved.active) || manager.tabs[0];
+        if (active) manager.activateTab(active.id);
+      }
+      manager.saveTabState();
+    }
+    if (!manager.tabs.length) {
+      await manager.createTab({ activate: true, sessionId: hashSid });
+    }
     performLayoutRefresh();
-  }).catch(err => {
+  })().catch(err => {
     showToast(String(err), true);
     disconnectOverlay.classList.add("active");
   });
