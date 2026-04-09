@@ -92,6 +92,18 @@ def build_title(path: str) -> str:
     return clean.lstrip("/")
 
 
+class ClientState:
+    __slots__ = ("client_id", "role", "output", "events", "promoted", "joined")
+
+    def __init__(self, client_id: str, role: str):
+        self.client_id = client_id
+        self.role = role  # "lead" or "follow"
+        self.output: bytearray = bytearray()
+        self.events: list[dict[str, str]] = []
+        self.promoted = False
+        self.joined = time.monotonic()
+
+
 class Session:
     def __init__(self, sid: str, path: str, cmd: list[str], cwd: str):
         self.sid = sid
@@ -112,7 +124,6 @@ class Session:
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
-        self.pending = bytearray()
         self.session_files: list[str] = []
         self.alive = True
         self.exit_message = b""
@@ -122,9 +133,8 @@ class Session:
         self._pyte_stream = pyte.Stream(self._pyte_screen)
         self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
-        self.client_id: str = ""
+        self.clients: dict[str, ClientState] = {}
         self.last_seen: float = time.monotonic()
-        self.agent_events: list[dict[str, str]] = []
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
@@ -137,7 +147,8 @@ class Session:
         while self.scrollback_bytes > SCROLLBACK_BUFFER_SIZE and self.scrollback:
             removed = self.scrollback.popleft()
             self.scrollback_bytes -= len(removed)
-        self.pending.extend(data)
+        for cs in self.clients.values():
+            cs.output.extend(data)
         try:
             self._pyte_stream.feed(data.decode("utf-8", errors="replace"))
         except Exception:
@@ -202,38 +213,71 @@ class Session:
         start = max(0, len(lines) - rows)
         self._pyte_known_lines = lines[:start]
 
-    def drain_pending(self) -> bytes:
-        with self._lock:
-            data = bytes(self.pending)
-            self.pending.clear()
-            return data
-
     def push_agent_event(self, kind: str, text: str) -> None:
         with self._lock:
-            self.agent_events.append({"kind": kind, "text": text})
+            for cs in self.clients.values():
+                cs.events.append({"kind": kind, "text": text})
             self._pending_ready.notify_all()
 
-    def drain_agent_events(self) -> list[dict[str, str]]:
-        with self._lock:
-            events = copy.deepcopy(self.agent_events)
-            self.agent_events.clear()
-            return events
+    def add_client(self, client_id: str, role: str) -> ClientState:
+        """Add a client under the lock. Caller must hold self._lock."""
+        cs = ClientState(client_id, role)
+        self.clients[client_id] = cs
+        self._pending_ready.notify_all()
+        return cs
 
-    def wait_for_pending(self, timeout: float, client_id: str = "") -> bytes:
+    def remove_client(self, client_id: str) -> str | None:
+        """Remove a client. Returns promoted client_id if a follow was promoted, else None."""
+        with self._lock:
+            cs = self.clients.pop(client_id, None)
+            if not cs:
+                return None
+            if cs.role == "lead":
+                # Promote oldest follow to lead
+                oldest: ClientState | None = None
+                for c in self.clients.values():
+                    if c.role == "follow":
+                        if oldest is None or c.joined < oldest.joined:
+                            oldest = c
+                if oldest:
+                    oldest.role = "lead"
+                    oldest.promoted = True
+                    self._pending_ready.notify_all()
+                    return oldest.client_id
+            return None
+
+    def get_lead_client(self) -> ClientState | None:
+        """Return the lead client, if any. Caller must hold self._lock or accept races."""
+        for cs in self.clients.values():
+            if cs.role == "lead":
+                return cs
+        return None
+
+    def wait_for_client(self, client_id: str, timeout: float) -> tuple[bytes, list[dict[str, str]], bool]:
+        """Block until this client has output, events, promotion, or timeout.
+        Returns (output_bytes, agent_events, promoted)."""
         deadline = time.monotonic() + max(timeout, 0.0)
         with self._lock:
-            while self.alive and not self.pending and not self.agent_events:
-                if client_id and self.client_id != client_id:
-                    return b""
+            cs = self.clients.get(client_id)
+            if not cs:
+                return b"", [], False
+            while self.alive and not cs.output and not cs.events and not cs.promoted:
+                if client_id not in self.clients:
+                    return b"", [], False
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._pending_ready.wait(remaining)
-            if client_id and self.client_id != client_id:
-                return b""
-            data = bytes(self.pending)
-            self.pending.clear()
-            return data
+            cs = self.clients.get(client_id)
+            if not cs:
+                return b"", [], False
+            data = bytes(cs.output)
+            cs.output.clear()
+            events = copy.deepcopy(cs.events)
+            cs.events.clear()
+            promoted = cs.promoted
+            cs.promoted = False
+            return data, events, promoted
 
     def write(self, data: bytes) -> None:
         if self.alive:
@@ -315,7 +359,7 @@ class EnvoyService:
             with self._lock:
                 sessions = list(self._sessions.values())
             for s in sessions:
-                if s.alive and s._timeout is None and now - s.last_seen >= CLIENT_STALE_SECONDS:
+                if s.alive and not s.clients and s._timeout is None and now - s.last_seen >= CLIENT_STALE_SECONDS:
                     s.start_timeout()
 
     def _encode(self, payload: bytes) -> str:
@@ -353,7 +397,8 @@ class EnvoyService:
         save_env_settings(values)
         return {"ok": True, "settings": get_env_settings()}
 
-    def connect(self, path: str, session_id: str = "") -> dict[str, object]:
+    def connect(self, path: str, session_id: str = "",
+                mode: str = "takeover") -> dict[str, object]:
         if session_id:
             with self._lock:
                 session = self._sessions.get(session_id)
@@ -361,11 +406,26 @@ class EnvoyService:
                 session.cancel_timeout()
                 client_id = secrets.token_hex(8)
                 with session._lock:
-                    session.client_id = client_id
+                    if mode == "takeover":
+                        session.clients.clear()
+                        session.add_client(client_id, "lead")
+                    elif mode == "lead":
+                        # Demote existing lead to follow
+                        for cs in session.clients.values():
+                            if cs.role == "lead":
+                                cs.role = "follow"
+                        session.add_client(client_id, "lead")
+                    elif mode == "follow":
+                        session.add_client(client_id, "follow")
+                    else:
+                        session.clients.clear()
+                        session.add_client(client_id, "lead")
                     session._pending_ready.notify_all()
+                role = session.clients[client_id].role
                 resp = {
                     "sid": session.sid,
                     "client_id": client_id,
+                    "role": role,
                     "title": build_title(session.path),
                     "output": self._encode(session.get_scrollback()),
                     "alive": session.alive,
@@ -377,10 +437,12 @@ class EnvoyService:
 
         session = self._new_session(path)
         client_id = secrets.token_hex(8)
-        session.client_id = client_id
+        with session._lock:
+            session.add_client(client_id, "lead")
         resp = {
             "sid": session.sid,
             "client_id": client_id,
+            "role": "lead",
             "title": build_title(session.path),
             "output": self._encode(session.get_scrollback()),
             "alive": session.alive,
@@ -395,20 +457,30 @@ class EnvoyService:
             session = self._sessions.get(session_id)
         if not session:
             return {"output": "", "alive": False, "exit_code": -1}
-        if client_id and session.client_id != client_id:
+        if client_id and client_id not in session.clients:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
         if session.alive:
             session.cancel_timeout()
         session.last_seen = time.monotonic()
-        if wait_timeout > 0:
-            output = session.wait_for_pending(wait_timeout, client_id=client_id)
+        if client_id and wait_timeout > 0:
+            output, events, _ = session.wait_for_client(client_id, wait_timeout)
+        elif client_id:
+            with session._lock:
+                cs = session.clients.get(client_id)
+                if not cs:
+                    return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
+                output = bytes(cs.output)
+                cs.output.clear()
+                events = copy.deepcopy(cs.events)
+                cs.events.clear()
         else:
-            output = session.drain_pending()
-        if client_id and session.client_id != client_id:
+            output = b""
+            events = []
+        if client_id and client_id not in session.clients:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
         return {
             "output": self._encode(output),
-            "events": session.drain_agent_events(),
+            "events": events,
             "alive": session.alive,
             "exit_code": session.exit_code,
         }
@@ -418,8 +490,14 @@ class EnvoyService:
         session.write(self._decode(data_b64))
         return {"ok": True}
 
-    def resize(self, session_id: str, cols: int, rows: int) -> dict[str, bool]:
+    def resize(self, session_id: str, cols: int, rows: int,
+               client_id: str = "") -> dict[str, bool]:
         session = self._get_session(session_id)
+        if client_id:
+            with session._lock:
+                cs = session.clients.get(client_id)
+                if cs and cs.role != "lead":
+                    return {"ok": False}
         session.resize(cols, rows)
         return {"ok": True}
 
@@ -498,6 +576,7 @@ class EnvoyService:
                 "cmd": s.cmd,
                 "cwd": s.cwd,
                 "attached": s._timeout is None,
+                "clients": len(s.clients),
             })
         return result
 
@@ -515,9 +594,11 @@ class EnvoyService:
             session.cleanup()
         return {"ok": True}
 
-    def mark_detached(self, session_id: str) -> None:
+    def mark_detached(self, session_id: str, client_id: str = "") -> None:
         session = self._get_session(session_id)
-        if session.alive:
+        if client_id:
+            session.remove_client(client_id)
+        if session.alive and not session.clients:
             session.start_timeout()
 
     def shutdown(self) -> None:

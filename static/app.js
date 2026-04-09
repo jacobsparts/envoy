@@ -214,6 +214,7 @@ class BrowserTransport {
     this.targetPath = targetPath;
     this.sessionId = "";
     this.clientId = "";
+    this.role = "lead";
     this.closed = false;
     this.eventSource = null;
   }
@@ -255,18 +256,19 @@ class BrowserTransport {
     });
   }
 
-  async connect(existingSessionId) {
+  async connect(existingSessionId, mode = "takeover") {
     const result = await this.requestJson("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: this.targetPath, session_id: existingSessionId || "" }),
+      body: JSON.stringify({ path: this.targetPath, session_id: existingSessionId || "", mode }),
     });
     this.sessionId = result.sid;
     this.clientId = result.client_id || "";
+    this.role = result.role || "lead";
     return result;
   }
 
-  startReading(onData, onDisconnect, onEvents) {
+  startReading(onData, onDisconnect, onEvents, onPromoted) {
     this.stopReading();
     this.closed = false;
     const url = new URL(this.basePath + "/api/stream", location.origin);
@@ -288,6 +290,11 @@ class BrowserTransport {
     es.addEventListener("evicted", () => {
       es.close();
       if (!this.closed) onDisconnect({ kind: "evicted" });
+    });
+    es.addEventListener("promoted", () => {
+      if (this.closed) return;
+      this.role = "lead";
+      if (onPromoted) onPromoted();
     });
     es.onerror = () => {
       if (this.closed) return;
@@ -333,10 +340,11 @@ class BrowserTransport {
 
   async resize(cols, rows) {
     if (!this.sessionId) return;
+    if (this.role === "follow") return;
     await this.requestJson("/api/resize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: this.sessionId, cols, rows }),
+      body: JSON.stringify({ session_id: this.sessionId, client_id: this.clientId, cols, rows }),
     });
   }
 
@@ -401,12 +409,13 @@ class BrowserTransport {
     this.stopReading();
     if (!this.sessionId) return;
     const sid = this.sessionId;
+    const cid = this.clientId;
     this.sessionId = "";
     this.clientId = "";
     await this.requestJson("/api/detach", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sid }),
+      body: JSON.stringify({ session_id: sid, client_id: cid }),
     });
   }
 
@@ -449,6 +458,7 @@ class TerminalTab {
     this.transport = transport;
     this.index = index;
     this.title = `Tab ${index}`;
+    this.role = "lead";
     this.disconnected = false;
     this.disconnectInfo = null;
     this.closed = false;
@@ -521,10 +531,12 @@ class TerminalTab {
     return this.transport.sessionId || `pending-${this.index}`;
   }
 
-  async connect(existingSessionId = "") {
-    const result = await this.transport.connect(existingSessionId);
+  async connect(existingSessionId = "", mode = "takeover") {
+    const result = await this.transport.connect(existingSessionId, mode);
     this.isNew = !existingSessionId;
+    this.role = result.role || "lead";
     this.button.dataset.sid = result.sid;
+    this.updateRoleIndicator();
     if (result.custom_title) this.updateTitle(result.custom_title);
     this.term.reset();
     const chunk = base64ToBytes(result.output);
@@ -541,7 +553,18 @@ class TerminalTab {
       data => this.term.write(data),
       info => this.handleDisconnect(info),
       events => this.handleAgentEvents(events),
+      () => this.handlePromotion(),
     );
+  }
+
+  updateRoleIndicator() {
+    this.button.classList.toggle("follow-tab", this.role === "follow");
+  }
+
+  handlePromotion() {
+    this.role = "lead";
+    this.updateRoleIndicator();
+    this.fitTerminal();
   }
 
   show() {
@@ -757,13 +780,13 @@ class TabManager {
     }
   }
 
-  async createTab({ activate = true, sessionId = "" } = {}) {
+  async createTab({ activate = true, sessionId = "", mode = "takeover" } = {}) {
     const tab = new TerminalTab(this, this.baseTransport.clone(), this.nextIndex++);
     this.tabs.push(tab);
     this.elements.stack.appendChild(tab.pane);
     this.elements.tabs.appendChild(tab.button);
     this.updateTabBar();
-    await tab.connect(sessionId);
+    await tab.connect(sessionId, mode);
     if (activate || !this.activeTab) this.activateTab(tab.id);
     this.syncHash();
     this.saveTabState();
@@ -2067,34 +2090,59 @@ function init(baseTransport, config) {
       }
       sessionsList.innerHTML = "";
       for (const s of sessions) {
-        const item = document.createElement("button");
-        item.type = "button";
+        const item = document.createElement("div");
         item.className = "session-item";
         const isActive = tab && tab.transport.sessionId === s.sid;
         const isOpen = openSids.has(s.sid);
         if (isActive) {
           item.classList.add("session-item-active");
           item.style.opacity = "0.5";
-          item.disabled = true;
-        } else if (isOpen) {
-          item.style.opacity = "0.5";
-          item.disabled = true;
         }
-        const status = s.attached ? "attached" : "detached";
+        const status = s.attached
+          ? `attached (${s.clients || 1} client${(s.clients || 1) !== 1 ? "s" : ""})`
+          : "detached";
         item.innerHTML =
           `<div class="session-item-id">${s.title || s.sid}</div>` +
           `<div class="session-item-cmd">${s.cmd.join(" ")}</div>` +
-          `<div class="session-item-status ${status}">${status} &mdash; ${s.path}</div>`;
-        if (!isOpen) {
-          item.addEventListener("click", () => {
-            sessionsModal.classList.remove("active");
-            const unused = tab && tab.isNew && !tab.hasInput ? tab : null;
-            manager.createTab({ activate: true, sessionId: s.sid }).then(() => {
-              if (unused) manager.closeTab(unused.id).catch(() => {});
-            }).catch(err => showToast(String(err), true));
-          });
+          `<div class="session-item-status ${s.attached ? "attached" : "detached"}">${status} &mdash; ${s.path}</div>`;
+        if (!isActive && !isOpen) {
+          const actions = document.createElement("div");
+          actions.className = "session-item-actions";
+          if (s.attached) {
+            const takeover = document.createElement("button");
+            takeover.type = "button";
+            takeover.className = "session-action";
+            takeover.textContent = "Takeover";
+            takeover.addEventListener("click", () => attachSession(s.sid, "takeover"));
+            const joinLead = document.createElement("button");
+            joinLead.type = "button";
+            joinLead.className = "session-action";
+            joinLead.textContent = "Join as Lead";
+            joinLead.addEventListener("click", () => attachSession(s.sid, "lead"));
+            const joinFollow = document.createElement("button");
+            joinFollow.type = "button";
+            joinFollow.className = "session-action";
+            joinFollow.textContent = "Follow";
+            joinFollow.addEventListener("click", () => attachSession(s.sid, "follow"));
+            actions.append(takeover, joinLead, joinFollow);
+          } else {
+            const attach = document.createElement("button");
+            attach.type = "button";
+            attach.className = "session-action";
+            attach.textContent = "Attach";
+            attach.addEventListener("click", () => attachSession(s.sid, "takeover"));
+            actions.appendChild(attach);
+          }
+          item.appendChild(actions);
         }
         sessionsList.appendChild(item);
+      }
+      function attachSession(sid, mode) {
+        sessionsModal.classList.remove("active");
+        const unused = tab && tab.isNew && !tab.hasInput ? tab : null;
+        manager.createTab({ activate: true, sessionId: sid, mode }).then(() => {
+          if (unused) manager.closeTab(unused.id).catch(() => {});
+        }).catch(err => showToast(String(err), true));
       }
     } catch (err) {
       sessionsList.innerHTML = `<p class="sessions-empty">${err.message || err}</p>`;
@@ -2917,7 +2965,10 @@ function init(baseTransport, config) {
           const endpoint = (tab.isNew && !tab.hasInput) ? "/envoy/api/close_session" : "/envoy/api/detach";
           navigator.sendBeacon(
             endpoint,
-            new Blob([JSON.stringify({ session_id: tab.transport.sessionId })], { type: "application/json" }),
+            new Blob([JSON.stringify({
+              session_id: tab.transport.sessionId,
+              client_id: tab.transport.clientId,
+            })], { type: "application/json" }),
           );
         }
       }

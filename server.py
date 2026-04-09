@@ -127,19 +127,21 @@ def make_handler():
                 self.end_headers()
                 try:
                     while True:
-                        if client_id and session.client_id != client_id:
+                        if client_id not in session.clients:
                             self.wfile.write(b"event: evicted\ndata: {}\n\n")
                             self.wfile.flush()
                             break
                         if session.alive:
                             session.cancel_timeout()
                         session.last_seen = time.monotonic()
-                        output = session.wait_for_pending(30, client_id=client_id)
-                        events = session.drain_agent_events()
-                        if client_id and session.client_id != client_id:
+                        output, events, promoted = session.wait_for_client(client_id, 30)
+                        if client_id not in session.clients:
                             self.wfile.write(b"event: evicted\ndata: {}\n\n")
                             self.wfile.flush()
                             break
+                        if promoted:
+                            self.wfile.write(b"event: promoted\ndata: {}\n\n")
+                            self.wfile.flush()
                         msg = {"output": service._encode(output), "events": events, "alive": session.alive}
                         if not session.alive:
                             msg["exit_code"] = session.exit_code
@@ -174,7 +176,11 @@ def make_handler():
                 if parsed.path == f"{WEB_PREFIX}/api/connect":
                     body = read_json_body(self)
                     app_path = normalize_app_path(str(body.get("path") or request_app_path(self)))
-                    result = service.connect(app_path, str(body.get("session_id") or ""))
+                    result = service.connect(
+                        app_path,
+                        str(body.get("session_id") or ""),
+                        mode=str(body.get("mode") or "takeover"),
+                    )
                     json_response(self, 200, result)
                     return
 
@@ -201,6 +207,7 @@ def make_handler():
                         str(body.get("session_id") or ""),
                         int(body.get("cols") or 0),
                         int(body.get("rows") or 0),
+                        client_id=str(body.get("client_id") or ""),
                     )
                     json_response(self, 200, result)
                     return
@@ -286,7 +293,10 @@ def make_handler():
 
                 if parsed.path == f"{WEB_PREFIX}/api/detach":
                     body = read_json_body(self)
-                    service.mark_detached(str(body.get("session_id") or ""))
+                    service.mark_detached(
+                        str(body.get("session_id") or ""),
+                        client_id=str(body.get("client_id") or ""),
+                    )
                     json_response(self, 200, {"ok": True})
                     return
 
