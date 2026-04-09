@@ -4,6 +4,9 @@
   "description": "Web-based terminal emulator",
   "start_url": "/envoy/",
   "display": "standalone",
+  "launch_handler": {
+    "client_mode": "navigate-new"
+  },
   "background_color": "#000000",
   "theme_color": "#000000",
   "icons": [

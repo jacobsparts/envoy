@@ -24,19 +24,22 @@
 <body>
 <div id="side-panel">
   <button id="tab-add" class="sp-btn" title="New tab">+</button>
-  <button id="sp-cancel" class="sp-btn" title="Cancel" disabled>&times;</button>
+  <button id="sp-sessions" class="sp-btn" title="Sessions">&#x29C9;</button>
   <button id="sp-fs" class="sp-btn" title="Fullscreen">&#x26F6;</button>
   <button id="sp-sel" class="sp-btn" title="Select mode">&#x2263;</button>
   <button id="sp-paste" class="sp-btn sp-icon-lg" title="Multiline editor">&#x270F;</button>
-  <button id="sp-dict" class="sp-btn" title="Dictate to terminal">&#x1F3A4;</button>
-  <button id="sp-mic" class="sp-btn" title="Voice agent">&#x1F916;</button>
-  <button id="sp-text" class="sp-btn sp-icon-lg" title="Text agent">&#x2328;</button>
-  <button id="sp-log" class="sp-btn" title="Agent log">&#x1F4DC;</button>
   <button id="sp-upload" class="sp-btn" title="Upload file">&#x1F4C2;</button>
-  <button id="sp-link" class="sp-btn" title="Copy link">&#x1F517;</button>
-  <button id="sp-settings" class="sp-btn" title="API settings">&#9881;</button>
+  <div class="sp-group">
+    <button id="sp-cancel" class="sp-btn" title="Cancel" disabled>&times;</button>
+    <button id="sp-dict" class="sp-btn" title="Dictate to terminal">&#x1F3A4;</button>
+    <button id="sp-mic" class="sp-btn" title="Voice agent">&#x1F916;</button>
+    <button id="sp-text" class="sp-btn sp-icon-lg" title="Text agent">&#x2328;</button>
+    <button id="sp-log" class="sp-btn" title="Agent log">&#x1F4DC;</button>
+  </div>
+
   <div style="flex:1"></div>
   <button id="sp-help" class="sp-btn" title="Help">?</button>
+  <button id="sp-settings" class="sp-btn" title="API settings">&#9881;</button>
 </div>
 <div id="toast"></div>
 <div id="disconnect-overlay">
@@ -62,14 +65,17 @@
       <tr><td>Font smaller</td><td>Pinch in</td><td>Ctrl+Shift+-</td></tr>
       <tr><td>Font reset</td><td></td><td>Ctrl+Shift+0</td></tr>
     </table>
-    <p style="margin-top:1em"><a href="#" id="help-sessions-link" style="color:#6cf">Active sessions</a></p>
   </div>
 </div>
 <div id="sessions-modal">
   <div id="sessions-content">
     <h2>Sessions</h2>
+    <div id="sessions-rename">
+      <input id="sessions-rename-input" type="text" placeholder="Session title" autocomplete="off" spellcheck="false">
+    </div>
     <div id="sessions-list"></div>
     <div id="sessions-actions">
+      <button id="sessions-new-tab">New tab</button>
       <button id="sessions-close">Close</button>
     </div>
   </div>

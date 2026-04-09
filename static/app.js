@@ -180,6 +180,12 @@ class PywebviewTransport {
     await this.api.cancel_agent(this.sessionId);
   }
 
+  async detach() {
+    this.stopReading();
+    if (!this.sessionId) return;
+    this.sessionId = "";
+  }
+
   async close() {
     this.stopReading();
     if (!this.sessionId) return;
@@ -206,15 +212,10 @@ class BrowserTransport {
   constructor(basePath = "/envoy", targetPath = getEnvoyPath()) {
     this.basePath = basePath;
     this.targetPath = targetPath;
-    this.pollInFlight = false;
     this.sessionId = "";
     this.clientId = "";
-    this.readLoopId = 0;
     this.closed = false;
-    this.readTimer = null;
-    this.readRetryDelay = 250;
-    this.onData = null;
-    this.onDisconnect = null;
+    this.eventSource = null;
   }
 
   async requestJson(path, options = {}) {
@@ -268,87 +269,44 @@ class BrowserTransport {
   startReading(onData, onDisconnect, onEvents) {
     this.stopReading();
     this.closed = false;
-    this.onData = onData;
-    this.onDisconnect = onDisconnect;
-    this.onEvents = onEvents;
-    this.readRetryDelay = 250;
-    const loopId = ++this.readLoopId;
-    this.scheduleRead(loopId, 0);
-  }
-
-  scheduleRead(loopId, delay = 0) {
-    if (this.readTimer) clearTimeout(this.readTimer);
-    this.readTimer = setTimeout(() => {
-      this.readTimer = null;
-      this.runRead(loopId);
-    }, delay);
-  }
-
-  nextReadRetryDelay() {
-    const delay = this.readRetryDelay;
-    this.readRetryDelay = Math.min(this.readRetryDelay * 2, 5000);
-    return delay;
-  }
-
-  shouldRetryRead(err) {
-    if (!err) return true;
-    if (err.name === "TypeError") return true;
-    if (typeof err.status === "number") {
-      return err.status === 408 || err.status === 429 || err.status >= 500;
-    }
-    return true;
-  }
-
-  async runRead(loopId) {
-    if (this.closed || !this.sessionId || this.readLoopId !== loopId || this.pollInFlight) return;
-    this.pollInFlight = true;
-    let retryDelay = null;
-    try {
-      const result = await this.requestJson("/api/read", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: this.sessionId, client_id: this.clientId, wait_timeout: 20 }),
-      });
-      if (this.closed || this.readLoopId !== loopId) return;
-      this.readRetryDelay = 250;
-      if (result.evicted) {
-        this.onDisconnect?.({ kind: "evicted" });
-        return;
-      }
+    const url = new URL(this.basePath + "/api/stream", location.origin);
+    url.searchParams.set("session_id", this.sessionId);
+    url.searchParams.set("client_id", this.clientId);
+    const es = new EventSource(url);
+    this.eventSource = es;
+    es.onmessage = (e) => {
+      if (this.closed) return;
+      const result = JSON.parse(e.data);
       const chunk = base64ToBytes(result.output);
-      if (chunk.length) this.onData?.(chunk);
-      if (result.events && result.events.length) this.onEvents?.(result.events);
+      if (chunk.length) onData(chunk);
+      if (result.events && result.events.length) onEvents(result.events);
       if (!result.alive) {
-        this.onDisconnect?.({ kind: "exit", exitCode: result.exit_code });
-        return;
+        es.close();
+        onDisconnect({ kind: "exit", exitCode: result.exit_code });
       }
-    } catch (err) {
-      if (this.closed || this.readLoopId !== loopId) return;
-      if (this.shouldRetryRead(err)) {
-        retryDelay = this.nextReadRetryDelay();
-      } else {
-        this.onDisconnect?.({ kind: "error", error: err });
-        return;
+    };
+    es.addEventListener("evicted", () => {
+      es.close();
+      if (!this.closed) onDisconnect({ kind: "evicted" });
+    });
+    es.onerror = () => {
+      if (this.closed) return;
+      // EventSource auto-reconnects; if it gave up, fire disconnect
+      if (es.readyState === EventSource.CLOSED) {
+        onDisconnect({ kind: "error", error: new Error("stream closed") });
       }
-    } finally {
-      this.pollInFlight = false;
-    }
-    if (this.closed || !this.sessionId || this.readLoopId !== loopId) return;
-    this.scheduleRead(loopId, retryDelay ?? 0);
+    };
   }
 
   resumeReading() {
-    if (this.closed || !this.sessionId || this.pollInFlight) return;
-    this.readRetryDelay = 250;
-    this.scheduleRead(this.readLoopId, 0);
+    // SSE auto-reconnects, nothing to do
   }
 
   stopReading() {
     this.closed = true;
-    this.readLoopId += 1;
-    if (this.readTimer) {
-      clearTimeout(this.readTimer);
-      this.readTimer = null;
+    if (this.eventSource) {
+      this.eventSource.close();
+      this.eventSource = null;
     }
   }
 
@@ -439,6 +397,19 @@ class BrowserTransport {
     });
   }
 
+  async detach() {
+    this.stopReading();
+    if (!this.sessionId) return;
+    const sid = this.sessionId;
+    this.sessionId = "";
+    this.clientId = "";
+    await this.requestJson("/api/detach", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid }),
+    });
+  }
+
   async close() {
     this.stopReading();
     if (!this.sessionId) return;
@@ -482,6 +453,7 @@ class TerminalTab {
     this.disconnectInfo = null;
     this.closed = false;
     this.reconnecting = false;
+    this.hasInput = false;
     this.agentLog = [];
     this.liveAgentEvents = [];
 
@@ -523,7 +495,8 @@ class TerminalTab {
     });
 
     this.term.onData(data => {
-      if (!this.disconnected) {
+      if (!this.disconnected && !this._suppressInput) {
+        this.hasInput = true;
         this.transport.write(data).catch(() => this.markDisconnected());
       }
     });
@@ -550,11 +523,15 @@ class TerminalTab {
 
   async connect(existingSessionId = "") {
     const result = await this.transport.connect(existingSessionId);
+    this.isNew = !existingSessionId;
     this.button.dataset.sid = result.sid;
-    this.updateTitle(this.title);
+    if (result.custom_title) this.updateTitle(result.custom_title);
     this.term.reset();
     const chunk = base64ToBytes(result.output);
-    if (chunk.length) this.term.write(chunk);
+    if (chunk.length) {
+      this._suppressInput = true;
+      this.term.write(chunk, () => { this._suppressInput = false; });
+    }
     this.disconnected = false;
     this.disconnectInfo = null;
     this.reconnecting = false;
@@ -695,12 +672,19 @@ class TerminalTab {
     this.pane.remove();
     this.button.remove();
     const transport = this.transport;
+    const exited = this.disconnected && this.disconnectInfo?.kind === "exit";
     setTimeout(() => {
       if (this.disconnected && this.disconnectInfo?.kind === "evicted" && typeof transport.abandon === "function") {
         transport.abandon();
         return;
       }
-      transport.close().catch(err => console.error(err));
+      if (exited || (this.isNew && !this.hasInput)) {
+        transport.close().catch(err => console.error(err));
+      } else if (typeof transport.detach === "function") {
+        transport.detach().catch(err => console.error(err));
+      } else {
+        transport.close().catch(err => console.error(err));
+      }
     }, 0);
   }
 }
@@ -712,6 +696,32 @@ class TabManager {
     this.activeTab = null;
     this.nextIndex = 1;
     this.elements = elements;
+    this._bc = typeof BroadcastChannel === "function" ? new BroadcastChannel("envoy-tabs") : null;
+    if (this._bc) {
+      this._bc.onmessage = e => {
+        if (e.data?.type === "claim-query") {
+          this._bc.postMessage({ type: "claim-reply", sids: this.tabs.map(t => t.transport.sessionId).filter(Boolean) });
+        }
+      };
+    }
+  }
+
+  async getClaimedSids() {
+    if (!this._bc) return new Set();
+    return new Promise(resolve => {
+      const sids = new Set();
+      const handler = e => {
+        if (e.data?.type === "claim-reply") {
+          for (const sid of e.data.sids) sids.add(sid);
+        }
+      };
+      this._bc.addEventListener("message", handler);
+      this._bc.postMessage({ type: "claim-query" });
+      setTimeout(() => {
+        this._bc.removeEventListener("message", handler);
+        resolve(sids);
+      }, 150);
+    });
   }
 
   saveTabState() {
@@ -841,16 +851,14 @@ class TabManager {
     }
     if (!remaining.length) {
       await tab.close();
+      this.updateDisconnectOverlay();
       if (window.pywebview) {
         await this.baseTransport.closeApp();
         return;
       }
-      if (window.matchMedia('(display-mode: standalone)').matches && window.matchMedia('(pointer: fine)').matches) {
-        localStorage.removeItem("envoy-tab-state");
-        window.close();
-        return;
-      }
-      await this.createTab({ activate: true });
+      localStorage.removeItem("envoy-tab-state");
+      window.close();
+      if (this.onLastTabClosed) this.onLastTabClosed();
       return;
     }
     if (wasActive) {
@@ -1325,9 +1333,9 @@ function init(baseTransport, config) {
   const spDict = document.getElementById("sp-dict");
   const spCancel = document.getElementById("sp-cancel");
   const spHelp = document.getElementById("sp-help");
+  const spSessions = document.getElementById("sp-sessions");
   const spSettings = document.getElementById("sp-settings");
   const spLog = document.getElementById("sp-log");
-  const spLink = document.getElementById("sp-link");
   const spText = document.getElementById("sp-text");
   const spPaste = document.getElementById("sp-paste");
   const spSel = document.getElementById("sp-sel");
@@ -1584,7 +1592,7 @@ function init(baseTransport, config) {
         if (!gestureAxis && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
           gestureAxis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
         }
-        if (gestureAxis === "x" && dx > 0 && Math.abs(dx) > Math.abs(dy)) {
+        if (gestureAxis === "x" && Math.abs(dx) > Math.abs(dy)) {
           scrollLastY = null;
           scrollLastTime = 0;
           scrollAccum = 0;
@@ -1621,7 +1629,11 @@ function init(baseTransport, config) {
       const touch = e.changedTouches[0];
       const dx = swipeStart.x - touch.clientX;
       const dy = swipeStart.y - touch.clientY;
-      if (dx > SWIPE_MIN && Math.abs(dy) < dx) toggleSidePanel();
+      if (Math.abs(dy) < Math.abs(dx)) {
+        const isOpen = sidePanel.classList.contains("active");
+        if (!isOpen && dx > SWIPE_MIN) toggleSidePanel();
+        if (isOpen && -dx > SWIPE_MIN) toggleSidePanel();
+      }
       swipeStart = null;
     }
     if (twoFingerStart && e.touches.length === 0) {
@@ -1670,8 +1682,7 @@ function init(baseTransport, config) {
     stopScrollbarDrag();
   }, { capture: true });
 
-  helpModal.addEventListener("click", (e) => {
-    if (e.target.closest("#help-sessions-link")) return;
+  helpModal.addEventListener("click", () => {
     helpModal.classList.remove("active");
   });
 
@@ -1832,14 +1843,6 @@ function init(baseTransport, config) {
     const tab = currentTab();
     if (!tab) return;
     manager.closeTab(tab.id).catch(err => showToast(String(err)));
-  });
-  spLink.addEventListener("click", () => {
-    const url = new URL(window.location.href);
-    const sid = manager.activeTab?.transport.sessionId || "";
-    url.hash = sid ? sid : "";
-    Promise.resolve(copyToClipboard(url.toString()))
-      .then(() => showToast("Link copied"))
-      .catch(err => showToast(String(err.message || err)));
   });
   agentLogModal.addEventListener("click", e => {
     if (e.target === agentLogModal) agentLogModal.classList.remove("active");
@@ -2019,11 +2022,39 @@ function init(baseTransport, config) {
 
   const sessionsList = document.getElementById("sessions-list");
   const sessionsClose = document.getElementById("sessions-close");
-  const helpSessionsLink = document.getElementById("help-sessions-link");
+  const sessionsRenameInput = document.getElementById("sessions-rename-input");
+
+  function saveSessionTitle() {
+    const tab = manager.activeTab;
+    if (!tab || !tab.transport.sessionId) return;
+    const title = sessionsRenameInput.value.trim();
+    const basePath = baseTransport.basePath || "/envoy";
+    fetch(basePath + "/api/rename_session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: tab.transport.sessionId, title }),
+    }).catch(() => {});
+    tab.updateTitle(title || `Tab ${tab.index}`);
+    manager.saveTabState();
+  }
+
+  sessionsRenameInput.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      saveSessionTitle();
+      sessionsRenameInput.blur();
+    }
+    if (e.key === "Escape") {
+      sessionsModal.classList.remove("active");
+    }
+  });
+  sessionsRenameInput.addEventListener("blur", saveSessionTitle);
 
   async function openSessionPicker() {
-    helpModal.classList.remove("active");
     sessionsModal.classList.add("active");
+    const tab = manager.activeTab;
+    sessionsRenameInput.value = tab ? (tab.title === `Tab ${tab.index}` ? "" : tab.title) : "";
+    sessionsRenameInput.disabled = !tab;
     sessionsList.innerHTML = '<p class="sessions-empty">Loading...</p>';
     try {
       const basePath = baseTransport.basePath || "/envoy";
@@ -2039,21 +2070,30 @@ function init(baseTransport, config) {
         const item = document.createElement("button");
         item.type = "button";
         item.className = "session-item";
-        if (openSids.has(s.sid)) item.style.opacity = "0.5";
+        const isActive = tab && tab.transport.sessionId === s.sid;
+        const isOpen = openSids.has(s.sid);
+        if (isActive) {
+          item.classList.add("session-item-active");
+          item.style.opacity = "0.5";
+          item.disabled = true;
+        } else if (isOpen) {
+          item.style.opacity = "0.5";
+          item.disabled = true;
+        }
         const status = s.attached ? "attached" : "detached";
         item.innerHTML =
-          `<div class="session-item-id">${s.sid}</div>` +
+          `<div class="session-item-id">${s.title || s.sid}</div>` +
           `<div class="session-item-cmd">${s.cmd.join(" ")}</div>` +
           `<div class="session-item-status ${status}">${status} &mdash; ${s.path}</div>`;
-        item.addEventListener("click", () => {
-          sessionsModal.classList.remove("active");
-          const existing = manager.tabs.find(t => t.transport.sessionId === s.sid);
-          if (existing) {
-            manager.activateTab(existing.id);
-          } else {
-            manager.createTab({ activate: true, sessionId: s.sid }).catch(err => showToast(String(err), true));
-          }
-        });
+        if (!isOpen) {
+          item.addEventListener("click", () => {
+            sessionsModal.classList.remove("active");
+            const unused = tab && tab.isNew && !tab.hasInput ? tab : null;
+            manager.createTab({ activate: true, sessionId: s.sid }).then(() => {
+              if (unused) manager.closeTab(unused.id).catch(() => {});
+            }).catch(err => showToast(String(err), true));
+          });
+        }
         sessionsList.appendChild(item);
       }
     } catch (err) {
@@ -2061,11 +2101,21 @@ function init(baseTransport, config) {
     }
   }
 
-  helpSessionsLink.addEventListener("click", (e) => {
-    e.preventDefault();
-    openSessionPicker();
+  const sessionsNewTab = document.getElementById("sessions-new-tab");
+
+  if (spSessions) {
+    if (window.pywebview) {
+      spSessions.style.display = "none";
+    }
+    spSessions.addEventListener("click", () => openSessionPicker());
+  }
+  sessionsNewTab.addEventListener("click", () => {
+    sessionsModal.classList.remove("active");
+    manager.createTab({ activate: true }).catch(err => showToast(String(err), true));
   });
   sessionsClose.addEventListener("click", () => sessionsModal.classList.remove("active"));
+
+  manager.onLastTabClosed = () => openSessionPicker();
   sessionsModal.addEventListener("click", (e) => {
     if (e.target === sessionsModal) sessionsModal.classList.remove("active");
   });
@@ -2581,6 +2631,10 @@ function init(baseTransport, config) {
       resetFontSize();
       return;
     }
+    if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "n") {
+      e.preventDefault();
+      window.open(window.location.pathname, "_blank", `width=${window.outerWidth},height=${window.outerHeight}`);
+    }
     if (e.ctrlKey && e.key.toLowerCase() === "t") {
       e.preventDefault();
       manager.createTab({ activate: true }).catch(err => showToast(String(err)));
@@ -2860,8 +2914,9 @@ function init(baseTransport, config) {
     if (!(window.pywebview && window.pywebview.api)) {
       for (const tab of manager.tabs) {
         if (tab.transport?.sessionId) {
+          const endpoint = (tab.isNew && !tab.hasInput) ? "/envoy/api/close_session" : "/envoy/api/detach";
           navigator.sendBeacon(
-            "/envoy/api/detach",
+            endpoint,
             new Blob([JSON.stringify({ session_id: tab.transport.sessionId })], { type: "application/json" }),
           );
         }
@@ -2898,8 +2953,10 @@ function init(baseTransport, config) {
   const hashSid = window.location.hash.slice(1);
 
   (async () => {
+    const claimed = await manager.getClaimedSids();
     if (saved) {
       for (const sid of saved.tabs) {
+        if (claimed.has(sid)) continue;
         try {
           await manager.createTab({ activate: false, sessionId: sid });
         } catch {}
@@ -2911,7 +2968,11 @@ function init(baseTransport, config) {
       manager.saveTabState();
     }
     if (!manager.tabs.length) {
-      await manager.createTab({ activate: true, sessionId: hashSid });
+      if (hashSid && claimed.has(hashSid)) {
+        await manager.createTab({ activate: true });
+      } else {
+        await manager.createTab({ activate: true, sessionId: hashSid });
+      }
     }
     performLayoutRefresh();
   })().catch(err => {

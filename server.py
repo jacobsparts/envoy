@@ -9,6 +9,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
@@ -96,6 +97,7 @@ def make_handler():
                 self.send_header("Content-Length", str(len(body)))
                 if relpath == "sw.js":
                     self.send_header("Service-Worker-Allowed", f"{WEB_PREFIX}/")
+                    self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(body)
                 return
@@ -107,6 +109,47 @@ def make_handler():
 
             if parsed.path == f"{WEB_PREFIX}/api/sessions":
                 json_response(self, 200, service.list_sessions())
+                return
+
+            if parsed.path == f"{WEB_PREFIX}/api/stream":
+                qs = parse_qs(parsed.query)
+                session_id = qs.get("session_id", [""])[0]
+                client_id = qs.get("client_id", [""])[0]
+                with service._lock:
+                    session = service._sessions.get(session_id)
+                if not session:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                try:
+                    while True:
+                        if client_id and session.client_id != client_id:
+                            self.wfile.write(b"event: evicted\ndata: {}\n\n")
+                            self.wfile.flush()
+                            break
+                        if session.alive:
+                            session.cancel_timeout()
+                        session.last_seen = time.monotonic()
+                        output = session.wait_for_pending(30, client_id=client_id)
+                        events = session.drain_agent_events()
+                        if client_id and session.client_id != client_id:
+                            self.wfile.write(b"event: evicted\ndata: {}\n\n")
+                            self.wfile.flush()
+                            break
+                        msg = {"output": service._encode(output), "events": events, "alive": session.alive}
+                        if not session.alive:
+                            msg["exit_code"] = session.exit_code
+                        line = json.dumps(msg, separators=(",", ":"))
+                        self.wfile.write(f"data: {line}\n\n".encode())
+                        self.wfile.flush()
+                        if not session.alive:
+                            break
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
                 return
 
             if parsed.path == f"{WEB_PREFIX}/api/settings":
@@ -223,6 +266,15 @@ def make_handler():
                 if parsed.path == f"{WEB_PREFIX}/api/settings":
                     body = read_json_body(self)
                     result = service.save_settings({str(key): str(value or "") for key, value in body.items()})
+                    json_response(self, 200, result)
+                    return
+
+                if parsed.path == f"{WEB_PREFIX}/api/rename_session":
+                    body = read_json_body(self)
+                    result = service.rename_session(
+                        str(body.get("session_id") or ""),
+                        str(body.get("title") or ""),
+                    )
                     json_response(self, 200, result)
                     return
 

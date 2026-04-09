@@ -34,7 +34,7 @@ HOME_DIR = os.path.expanduser("~")
 UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
-SESSION_TIMEOUT = 15 * 60
+SESSION_TIMEOUT = 60 * 60 * 24
 
 
 def sanitize_filename(name: str) -> str:
@@ -98,6 +98,7 @@ class Session:
         self.path = path
         self.cmd = list(cmd)
         self.cwd = cwd
+        self.title = ""
         self.master, slave = pty.openpty()
         self.proc = subprocess.Popen(
             cmd,
@@ -362,7 +363,7 @@ class EnvoyService:
                 with session._lock:
                     session.client_id = client_id
                     session._pending_ready.notify_all()
-                return {
+                resp = {
                     "sid": session.sid,
                     "client_id": client_id,
                     "title": build_title(session.path),
@@ -370,11 +371,14 @@ class EnvoyService:
                     "alive": session.alive,
                     "exit_code": session.exit_code,
                 }
+                if session.title:
+                    resp["custom_title"] = session.title
+                return resp
 
         session = self._new_session(path)
         client_id = secrets.token_hex(8)
         session.client_id = client_id
-        return {
+        resp = {
             "sid": session.sid,
             "client_id": client_id,
             "title": build_title(session.path),
@@ -382,6 +386,9 @@ class EnvoyService:
             "alive": session.alive,
             "exit_code": session.exit_code,
         }
+        if session.title:
+            resp["custom_title"] = session.title
+        return resp
 
     def read(self, session_id: str, client_id: str = "", wait_timeout: float = 0.0) -> dict[str, object]:
         with self._lock:
@@ -486,12 +493,20 @@ class EnvoyService:
                 continue
             result.append({
                 "sid": s.sid,
+                "title": s.title,
                 "path": s.path,
                 "cmd": s.cmd,
                 "cwd": s.cwd,
                 "attached": s._timeout is None,
             })
         return result
+
+    def rename_session(self, session_id: str, title: str) -> dict[str, object]:
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if session:
+            session.title = title
+        return {"ok": True}
 
     def close_session(self, session_id: str) -> dict[str, bool]:
         with self._lock:
