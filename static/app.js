@@ -464,6 +464,7 @@ class TerminalTab {
     this.index = index;
     this.title = `Tab ${index}`;
     this.role = "lead";
+    this.ptySize = null;
     this.disconnected = false;
     this.disconnectInfo = null;
     this.closed = false;
@@ -501,9 +502,42 @@ class TerminalTab {
     this.updateScrollbackClass();
     this.button = document.createElement("div");
     this.button.className = "tab-item";
-    this.button.innerHTML = `<span class="tab-title"></span><button class="tab-close" type="button" title="Close tab">&times;</button>`;
+    this.button.innerHTML = `<span class="tab-title"></span><input class="tab-title-input" type="text"><button class="tab-close" type="button" title="Close tab">&times;</button>`;
     this.button.querySelector(".tab-title").textContent = this.title;
     this.button.addEventListener("click", () => this.manager.activateTab(this.id));
+    const titleSpan = this.button.querySelector(".tab-title");
+    const titleInput = this.button.querySelector(".tab-title-input");
+    titleSpan.addEventListener("click", e => {
+      if (this.manager.activeTab !== this) return;
+      e.stopPropagation();
+      titleInput.value = this.title;
+      this.button.classList.add("editing");
+      titleInput.focus();
+      titleInput.select();
+    });
+    const commitTitle = () => {
+      this.button.classList.remove("editing");
+      const val = titleInput.value.trim();
+      const newTitle = val || this.transport.sessionId || `Tab ${this.index}`;
+      this.updateTitle(newTitle);
+      if (this.transport.sessionId) {
+        const basePath = this.transport.basePath || "/envoy";
+        fetch(basePath + "/api/rename_session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: this.transport.sessionId, title: val }),
+        }).catch(() => {});
+      }
+      this.manager.saveTabState();
+      this.focus();
+    };
+    titleInput.addEventListener("blur", commitTitle);
+    titleInput.addEventListener("keydown", e => {
+      e.stopPropagation();
+      if (e.key === "Enter") { e.preventDefault(); titleInput.blur(); }
+      else if (e.key === "Escape") { e.preventDefault(); titleInput.value = this.title; titleInput.blur(); }
+    });
+    titleInput.addEventListener("click", e => e.stopPropagation());
     this.button.querySelector(".tab-close").addEventListener("click", e => {
       e.stopPropagation();
       this.manager.closeTab(this.id);
@@ -540,14 +574,22 @@ class TerminalTab {
     const result = await this.transport.connect(existingSessionId, mode);
     this.isNew = !existingSessionId;
     this.role = result.role || "lead";
+    this.ptySize = (result.cols && result.rows) ? { cols: result.cols, rows: result.rows } : null;
     this.button.dataset.sid = result.sid;
     this.updateRoleIndicator();
-    if (result.custom_title) this.updateTitle(result.custom_title);
-    // For follow clients, adopt the PTY's current size before writing scrollback
-    if (this.role === "follow" && result.cols && result.rows) {
-      this.term.resize(result.cols, result.rows);
-    }
+    this.updateTitle(result.custom_title || result.sid || this.title);
     this.term.reset();
+    // For follow clients, adopt the PTY's size before writing scrollback
+    if (this.role === "follow" && this.ptySize) {
+      const baseFontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
+      this.term.options.fontSize = baseFontSize;
+      const dims = this.fit.proposeDimensions();
+      if (dims && (dims.cols < this.ptySize.cols || dims.rows < this.ptySize.rows)) {
+        const scale = Math.min(dims.cols / this.ptySize.cols, dims.rows / this.ptySize.rows);
+        this.term.options.fontSize = Math.max(4, Math.floor(baseFontSize * scale));
+      }
+      try { this.term.resize(this.ptySize.cols, this.ptySize.rows); } catch {}
+    }
     const chunk = base64ToBytes(result.output);
     if (chunk.length) {
       this._suppressInput = true;
@@ -559,7 +601,12 @@ class TerminalTab {
     this.button.classList.remove("exited");
     this.updateScrollbackClass();
     this.transport.onResize = (cols, rows) => {
-      try { this.term.resize(cols, rows); } catch {}
+      this.ptySize = { cols, rows };
+      if (this.role === "follow") {
+        this.fitFollower();
+      } else {
+        try { this.term.resize(cols, rows); } catch {}
+      }
     };
     this.transport.startReading(
       data => this.term.write(data),
@@ -575,6 +622,8 @@ class TerminalTab {
 
   handlePromotion() {
     this.role = "lead";
+    this.ptySize = null;
+    this.term.options.fontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
     this.updateRoleIndicator();
     this.fitTerminal();
   }
@@ -595,15 +644,33 @@ class TerminalTab {
     try {
       this.term._core?._charSizeService?.measure();
     } catch {}
-    this.fit.fit();
-    try {
-      this.term.resize(this.term.cols, this.term.rows);
-    } catch {}
+    if (this.role === "follow" && this.ptySize) {
+      this.fitFollower();
+    } else {
+      this.term.options.fontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
+      this.fit.fit();
+      try { this.term.resize(this.term.cols, this.term.rows); } catch {}
+    }
     this.term.scrollToBottom();
     this.updateScrollbackClass();
     if (!this.disconnected) {
       this.transport.resize(this.term.cols, this.term.rows).catch(() => this.markDisconnected());
     }
+  }
+
+  fitFollower() {
+    const baseFontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
+    this.term.options.fontSize = baseFontSize;
+    const dims = this.fit.proposeDimensions();
+    if (!dims || !dims.cols || !dims.rows) {
+      try { this.term.resize(this.ptySize.cols, this.ptySize.rows); } catch {}
+      return;
+    }
+    if (dims.cols < this.ptySize.cols || dims.rows < this.ptySize.rows) {
+      const scale = Math.min(dims.cols / this.ptySize.cols, dims.rows / this.ptySize.rows);
+      this.term.options.fontSize = Math.max(4, Math.floor(baseFontSize * scale));
+    }
+    try { this.term.resize(this.ptySize.cols, this.ptySize.rows); } catch {}
   }
 
   focus() {
@@ -781,7 +848,8 @@ class TabManager {
   }
 
   updateTabBar() {
-    this.elements.tabs.parentElement.classList.toggle("single", this.tabs.length <= 1);
+    const el = this.elements.tabs.parentElement;
+    el.classList.toggle("single", this.tabs.length <= 1 && !el.classList.contains("force-show"));
   }
 
   syncHash() {
@@ -2057,39 +2125,9 @@ function init(baseTransport, config) {
 
   const sessionsList = document.getElementById("sessions-list");
   const sessionsClose = document.getElementById("sessions-close");
-  const sessionsRenameInput = document.getElementById("sessions-rename-input");
-
-  function saveSessionTitle() {
-    const tab = manager.activeTab;
-    if (!tab || !tab.transport.sessionId) return;
-    const title = sessionsRenameInput.value.trim();
-    const basePath = baseTransport.basePath || "/envoy";
-    fetch(basePath + "/api/rename_session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: tab.transport.sessionId, title }),
-    }).catch(() => {});
-    tab.updateTitle(title || `Tab ${tab.index}`);
-    manager.saveTabState();
-  }
-
-  sessionsRenameInput.addEventListener("keydown", (e) => {
-    e.stopPropagation();
-    if (e.key === "Enter") {
-      saveSessionTitle();
-      sessionsRenameInput.blur();
-    }
-    if (e.key === "Escape") {
-      sessionsModal.classList.remove("active");
-    }
-  });
-  sessionsRenameInput.addEventListener("blur", saveSessionTitle);
-
   async function openSessionPicker() {
     sessionsModal.classList.add("active");
     const tab = manager.activeTab;
-    sessionsRenameInput.value = tab ? (tab.title === `Tab ${tab.index}` ? "" : tab.title) : "";
-    sessionsRenameInput.disabled = !tab;
     sessionsList.innerHTML = '<p class="sessions-empty">Loading...</p>';
     try {
       const basePath = baseTransport.basePath || "/envoy";
@@ -2640,8 +2678,26 @@ function init(baseTransport, config) {
     else enterSelectMode();
   });
 
-  tabAdd.addEventListener("click", () => {
-    manager.createTab({ activate: true }).catch(err => showToast(String(err)));
+  let tabAddLongPress = null;
+  tabAdd.addEventListener("pointerdown", () => {
+    tabAddLongPress = setTimeout(() => {
+      tabAddLongPress = null;
+      tabBar.parentElement.classList.toggle("force-show");
+      manager.updateTabBar();
+    }, 500);
+  });
+  tabAdd.addEventListener("pointerup", () => {
+    if (tabAddLongPress !== null) {
+      clearTimeout(tabAddLongPress);
+      tabAddLongPress = null;
+      manager.createTab({ activate: true }).catch(err => showToast(String(err)));
+    }
+  });
+  tabAdd.addEventListener("pointercancel", () => {
+    if (tabAddLongPress !== null) {
+      clearTimeout(tabAddLongPress);
+      tabAddLongPress = null;
+    }
   });
 
   const focusTerminalFromTouch = e => {
@@ -2994,9 +3050,7 @@ function init(baseTransport, config) {
     if (!sid) return;
     const tab = manager.activeTab;
     if (tab && tab.transport.sessionId === sid) return;
-    if (tab) {
-      tab.connect(sid).then(() => { tab.fitTerminal(); manager.saveTabState(); }).catch(err => showToast(String(err), true));
-    }
+    openSessionPicker();
   });
 
   const recoverConnections = () => {
@@ -3033,8 +3087,24 @@ function init(baseTransport, config) {
     if (!manager.tabs.length) {
       if (hashSid && claimed.has(hashSid)) {
         await manager.createTab({ activate: true });
+      } else if (hashSid) {
+        // Check if session is already attached before auto-connecting
+        try {
+          const basePath = baseTransport.basePath || "/envoy";
+          const resp = await fetch(basePath + "/api/sessions");
+          const sessions = await resp.json();
+          const target = sessions.find(s => s.sid === hashSid);
+          if (target && target.attached) {
+            await manager.createTab({ activate: true });
+            openSessionPicker();
+          } else {
+            await manager.createTab({ activate: true, sessionId: hashSid });
+          }
+        } catch {
+          await manager.createTab({ activate: true, sessionId: hashSid });
+        }
       } else {
-        await manager.createTab({ activate: true, sessionId: hashSid });
+        await manager.createTab({ activate: true });
       }
     }
     performLayoutRefresh();

@@ -76,7 +76,22 @@ input, textarea, #select-overlay, #select-overlay * {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: text;
 }
+.tab-title-input {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-bottom: 1px solid #4af;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  outline: none;
+}
+.tab-item.editing .tab-title { display: none; }
+.tab-item.editing .tab-title-input { display: block; }
 .tab-close {
   width: 20px;
   height: 20px;
@@ -252,15 +267,6 @@ input, textarea, #select-overlay, #select-overlay * {
   margin: 0 0 14px 0;
   color: #fff; font-size: 16px;
 }
-#sessions-rename { margin-bottom: 10px; }
-#sessions-rename-input {
-  width: 100%; box-sizing: border-box;
-  background: #222; color: #ccc; border: 1px solid #444;
-  border-radius: 4px; padding: 6px 10px;
-  font-family: 'Source Code Pro', monospace; font-size: 13px;
-  outline: none;
-}
-#sessions-rename-input:focus { border-color: #4af; }
 #sessions-list {
   overflow-y: auto; flex: 1;
 }
