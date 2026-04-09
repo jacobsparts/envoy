@@ -134,13 +134,17 @@ def make_handler():
                         if session.alive:
                             session.cancel_timeout()
                         session.last_seen = time.monotonic()
-                        output, events, promoted = session.wait_for_client(client_id, 30)
+                        output, events, promoted, resize = session.wait_for_client(client_id, 30)
                         if client_id not in session.clients:
                             self.wfile.write(b"event: evicted\ndata: {}\n\n")
                             self.wfile.flush()
                             break
                         if promoted:
                             self.wfile.write(b"event: promoted\ndata: {}\n\n")
+                            self.wfile.flush()
+                        if resize:
+                            rdata = json.dumps({"cols": resize[0], "rows": resize[1]}, separators=(",", ":"))
+                            self.wfile.write(f"event: resize\ndata: {rdata}\n\n".encode())
                             self.wfile.flush()
                         msg = {"output": service._encode(output), "events": events, "alive": session.alive}
                         if not session.alive:

@@ -93,7 +93,7 @@ def build_title(path: str) -> str:
 
 
 class ClientState:
-    __slots__ = ("client_id", "role", "output", "events", "promoted", "joined")
+    __slots__ = ("client_id", "role", "output", "events", "promoted", "joined", "pending_resize")
 
     def __init__(self, client_id: str, role: str):
         self.client_id = client_id
@@ -102,6 +102,7 @@ class ClientState:
         self.events: list[dict[str, str]] = []
         self.promoted = False
         self.joined = time.monotonic()
+        self.pending_resize: tuple[int, int] | None = None
 
 
 class Session:
@@ -253,31 +254,33 @@ class Session:
                 return cs
         return None
 
-    def wait_for_client(self, client_id: str, timeout: float) -> tuple[bytes, list[dict[str, str]], bool]:
-        """Block until this client has output, events, promotion, or timeout.
-        Returns (output_bytes, agent_events, promoted)."""
+    def wait_for_client(self, client_id: str, timeout: float) -> tuple[bytes, list[dict[str, str]], bool, tuple[int, int] | None]:
+        """Block until this client has output, events, promotion, resize, or timeout.
+        Returns (output_bytes, agent_events, promoted, pending_resize)."""
         deadline = time.monotonic() + max(timeout, 0.0)
         with self._lock:
             cs = self.clients.get(client_id)
             if not cs:
-                return b"", [], False
-            while self.alive and not cs.output and not cs.events and not cs.promoted:
+                return b"", [], False, None
+            while self.alive and not cs.output and not cs.events and not cs.promoted and not cs.pending_resize:
                 if client_id not in self.clients:
-                    return b"", [], False
+                    return b"", [], False, None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._pending_ready.wait(remaining)
             cs = self.clients.get(client_id)
             if not cs:
-                return b"", [], False
+                return b"", [], False, None
             data = bytes(cs.output)
             cs.output.clear()
             events = copy.deepcopy(cs.events)
             cs.events.clear()
             promoted = cs.promoted
             cs.promoted = False
-            return data, events, promoted
+            resize = cs.pending_resize
+            cs.pending_resize = None
+            return data, events, promoted, resize
 
     def write(self, data: bytes) -> None:
         if self.alive:
@@ -426,6 +429,8 @@ class EnvoyService:
                     "sid": session.sid,
                     "client_id": client_id,
                     "role": role,
+                    "cols": session._pyte_screen.columns,
+                    "rows": session._pyte_screen.lines,
                     "title": build_title(session.path),
                     "output": self._encode(session.get_scrollback()),
                     "alive": session.alive,
@@ -463,7 +468,7 @@ class EnvoyService:
             session.cancel_timeout()
         session.last_seen = time.monotonic()
         if client_id and wait_timeout > 0:
-            output, events, _ = session.wait_for_client(client_id, wait_timeout)
+            output, events, _, _ = session.wait_for_client(client_id, wait_timeout)
         elif client_id:
             with session._lock:
                 cs = session.clients.get(client_id)
@@ -499,6 +504,11 @@ class EnvoyService:
                 if cs and cs.role != "lead":
                     return {"ok": False}
         session.resize(cols, rows)
+        with session._lock:
+            for cs in session.clients.values():
+                if cs.role == "follow":
+                    cs.pending_resize = (cols, rows)
+            session._pending_ready.notify_all()
         return {"ok": True}
 
     def upload_file(self, session_id: str, name: str, data_b64: str) -> dict[str, str]:

@@ -296,6 +296,11 @@ class BrowserTransport {
       this.role = "lead";
       if (onPromoted) onPromoted();
     });
+    es.addEventListener("resize", (e) => {
+      if (this.closed) return;
+      const { cols, rows } = JSON.parse(e.data);
+      if (this.onResize) this.onResize(cols, rows);
+    });
     es.onerror = () => {
       if (this.closed) return;
       // EventSource auto-reconnects; if it gave up, fire disconnect
@@ -538,6 +543,10 @@ class TerminalTab {
     this.button.dataset.sid = result.sid;
     this.updateRoleIndicator();
     if (result.custom_title) this.updateTitle(result.custom_title);
+    // For follow clients, adopt the PTY's current size before writing scrollback
+    if (this.role === "follow" && result.cols && result.rows) {
+      this.term.resize(result.cols, result.rows);
+    }
     this.term.reset();
     const chunk = base64ToBytes(result.output);
     if (chunk.length) {
@@ -549,6 +558,9 @@ class TerminalTab {
     this.reconnecting = false;
     this.button.classList.remove("exited");
     this.updateScrollbackClass();
+    this.transport.onResize = (cols, rows) => {
+      try { this.term.resize(cols, rows); } catch {}
+    };
     this.transport.startReading(
       data => this.term.write(data),
       info => this.handleDisconnect(info),
