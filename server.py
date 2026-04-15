@@ -175,7 +175,7 @@ def make_handler():
                 self.send_error(404)
                 return
 
-            body = render_html("web").encode("utf-8")
+            body = render_html("web", web_prefix=WEB_PREFIX).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))

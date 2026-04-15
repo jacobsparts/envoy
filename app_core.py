@@ -31,8 +31,6 @@ STATIC_DIR = APP_DIR / "static"
 APP_TEMPLATE = STATIC_DIR / "app.html"
 HOME_DIR = os.path.expanduser("~")
 
-WEB_STATIC_PREFIX = "/envoy/static/"
-
 _WEB_HEAD_EXTRA = """<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
 <meta name="color-scheme" content="dark">
 <meta name="mobile-web-app-capable" content="yes">
@@ -44,19 +42,20 @@ _WEB_HEAD_EXTRA = """<meta name="theme-color" content="#000000" media="(prefers-
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="manifest" href="manifest.json">"""
 
-_WEB_BODY_EXTRA = """<script>
-if ('serviceWorker' in navigator && window.isSecureContext) {
-  navigator.serviceWorker.register('/envoy/static/sw.js', { scope: '/envoy/' });
-}
-</script>"""
 
-
-def render_html(mode: str) -> str:
+def render_html(mode: str, web_prefix: str = "") -> str:
     template = APP_TEMPLATE.read_text()
     if mode == "web":
-        base_tag = f'<base href="{WEB_STATIC_PREFIX}">'
+        static_prefix = f"{web_prefix}/static/"
+        base_tag = f'<base href="{static_prefix}">'
         head_extra = _WEB_HEAD_EXTRA
-        body_extra = _WEB_BODY_EXTRA
+        body_extra = (
+            "<script>\n"
+            "if ('serviceWorker' in navigator && window.isSecureContext) {\n"
+            f"  navigator.serviceWorker.register('{static_prefix}sw.js', {{ scope: '{web_prefix}/' }});\n"
+            "}\n"
+            "</script>"
+        )
     elif mode == "desktop":
         base_tag = ""
         head_extra = ""
