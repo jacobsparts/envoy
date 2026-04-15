@@ -71,11 +71,14 @@ def read_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, object]:
 
 def make_handler():
     class Handler(SimpleHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 self.send_response(302)
                 self.send_header("Location", f"{WEB_PREFIX}/")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
 
@@ -120,10 +123,12 @@ def make_handler():
                 if not session:
                     self.send_error(404)
                     return
+                self.close_connection = True
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
                 self.end_headers()
                 try:
                     while True:
@@ -134,7 +139,7 @@ def make_handler():
                         if session.alive:
                             session.cancel_timeout()
                         session.last_seen = time.monotonic()
-                        output, events, promoted, resize = session.wait_for_client(client_id, 30)
+                        output, events, promoted, resize = session.wait_for_client(client_id, 10)
                         if client_id not in session.clients:
                             self.wfile.write(b"event: evicted\ndata: {}\n\n")
                             self.wfile.flush()
@@ -146,6 +151,10 @@ def make_handler():
                             rdata = json.dumps({"cols": resize[0], "rows": resize[1]}, separators=(",", ":"))
                             self.wfile.write(f"event: resize\ndata: {rdata}\n\n".encode())
                             self.wfile.flush()
+                        if not output and not events and not promoted and not resize and session.alive:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            continue
                         msg = {"output": service._encode(output), "events": events, "alive": session.alive}
                         if not session.alive:
                             msg["exit_code"] = session.exit_code

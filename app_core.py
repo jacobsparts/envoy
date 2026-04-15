@@ -37,6 +37,31 @@ SCROLLBACK_BUFFER_SIZE = 100_000
 SESSION_TIMEOUT = 60 * 60 * 24
 
 
+def _login_env() -> dict[str, str]:
+    """Build a minimal seed environment like sshd does.
+
+    The login shell will source /etc/profile and ~/.bash_profile to
+    build up the full environment from scratch, so we only need to
+    provide the essentials here.
+    """
+    import pwd
+    pw = pwd.getpwuid(os.getuid())
+    return {
+        "HOME": pw.pw_dir,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "SHELL": pw.pw_shell,
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "LANG": os.environ.get("LANG", "en_US.UTF-8"),
+    }
+
+
+def _login_shell() -> str:
+    """Return the user's login shell from the passwd database."""
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+
+
 def sanitize_filename(name: str) -> str:
     name = os.path.basename(name).lstrip(".")
     return name or "upload"
@@ -60,7 +85,8 @@ def load_aliases() -> dict[str, str]:
     return aliases
 
 
-def resolve_cli(url_path: str) -> tuple[list[str], str]:
+def resolve_cli(url_path: str) -> tuple[list[str], str, bool]:
+    """Resolve a URL path to (command, working dir, is_login_shell)."""
     path = "/" + url_path.strip("/")
 
     aliases = load_aliases()
@@ -71,18 +97,18 @@ def resolve_cli(url_path: str) -> tuple[list[str], str]:
         if not os.path.isfile(cmd_path):
             raise ValueError(f"Alias target not found: {parts[0]}")
         parts[0] = cmd_path
-        return parts, os.path.dirname(cmd_path)
+        return parts, os.path.dirname(cmd_path), False
 
     rel = url_path.strip("/")
     if not rel:
-        return ["/bin/bash"], HOME_DIR
+        return [_login_shell()], HOME_DIR, True
 
     script = os.path.realpath(os.path.join(HOME_DIR, rel))
     if not script.startswith(HOME_DIR + "/"):
         raise ValueError(f"Path escapes home directory: {url_path}")
     if not os.path.isfile(script):
         raise ValueError(f"Not found: {script}")
-    return [script], os.path.dirname(script)
+    return [script], os.path.dirname(script), False
 
 
 def build_title(path: str) -> str:
@@ -106,22 +132,28 @@ class ClientState:
 
 
 class Session:
-    def __init__(self, sid: str, path: str, cmd: list[str], cwd: str):
+    def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *, login: bool = False):
         self.sid = sid
         self.path = path
         self.cmd = list(cmd)
         self.cwd = cwd
         self.title = ""
         self.master, slave = pty.openpty()
-        self.proc = subprocess.Popen(
-            cmd,
+        popen_kwargs: dict = dict(
             stdin=slave,
             stdout=slave,
             stderr=slave,
             cwd=cwd,
             start_new_session=True,
-            env={**os.environ, "TERM": "xterm-256color", "UPLOAD_DIR": UPLOAD_DIR},
+            env={**_login_env(), "TERM": "xterm-256color", "UPLOAD_DIR": UPLOAD_DIR},
         )
+        if login:
+            # Convention: argv[0] prefixed with '-' tells the shell
+            # it is a login shell (same as sshd / getty / login(1)).
+            shell_name = os.path.basename(cmd[0])
+            popen_kwargs["executable"] = cmd[0]
+            cmd = [f"-{shell_name}"] + cmd[1:]
+        self.proc = subprocess.Popen(cmd, **popen_kwargs)
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
@@ -382,8 +414,8 @@ class EnvoyService:
         return session
 
     def _new_session(self, path: str) -> Session:
-        cmd, cwd = resolve_cli(path)
-        session = Session(self._new_session_id(), path, cmd, cwd)
+        cmd, cwd, login = resolve_cli(path)
+        session = Session(self._new_session_id(), path, cmd, cwd, login=login)
         with self._lock:
             while session.sid in self._sessions:
                 session.sid = self._new_session_id()

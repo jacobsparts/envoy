@@ -270,14 +270,23 @@ class BrowserTransport {
 
   startReading(onData, onDisconnect, onEvents, onPromoted) {
     this.stopReading();
+    this._streamCallbacks = { onData, onDisconnect, onEvents, onPromoted };
     this.closed = false;
+    this._paused = false;
+    this._openStream();
+  }
+
+  _openStream() {
+    if (!this._streamCallbacks) return;
+    const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
     const url = new URL(this.basePath + "/api/stream", location.origin);
     url.searchParams.set("session_id", this.sessionId);
     url.searchParams.set("client_id", this.clientId);
     const es = new EventSource(url);
     this.eventSource = es;
+    const isActive = () => !this.closed && !this._paused && this.eventSource === es;
     es.onmessage = (e) => {
-      if (this.closed) return;
+      if (!isActive()) return;
       const result = JSON.parse(e.data);
       const chunk = base64ToBytes(result.output);
       if (chunk.length) onData(chunk);
@@ -289,29 +298,54 @@ class BrowserTransport {
     };
     es.addEventListener("evicted", () => {
       es.close();
-      if (!this.closed) onDisconnect({ kind: "evicted" });
+      if (isActive()) onDisconnect({ kind: "evicted" });
     });
     es.addEventListener("promoted", () => {
-      if (this.closed) return;
+      if (!isActive()) return;
       this.role = "lead";
       if (onPromoted) onPromoted();
     });
     es.addEventListener("resize", (e) => {
-      if (this.closed) return;
+      if (!isActive()) return;
       const { cols, rows } = JSON.parse(e.data);
       if (this.onResize) this.onResize(cols, rows);
     });
     es.onerror = () => {
-      if (this.closed) return;
-      // EventSource auto-reconnects; if it gave up, fire disconnect
+      if (!isActive()) return;
       if (es.readyState === EventSource.CLOSED) {
+        const suppress = document.hidden || (performance.now() - (this._visibleAt || 0) < 1500);
+        if (suppress) {
+          this._paused = true;
+          this.eventSource = null;
+          if (!document.hidden) queueMicrotask(() => { try { this.resumeReading(); } catch {} });
+          return;
+        }
         onDisconnect({ kind: "error", error: new Error("stream closed") });
       }
     };
   }
 
+  pauseStream() {
+    if (this._paused) return;
+    this._paused = true;
+    if (this.eventSource) {
+      const es = this.eventSource;
+      this.eventSource = null;
+      try { es.close(); } catch {}
+    }
+  }
+
   resumeReading() {
-    // SSE auto-reconnects, nothing to do
+    if (this.closed || !this._streamCallbacks || !this.sessionId) return;
+    this._paused = false;
+    this._visibleAt = performance.now();
+    const es = this.eventSource;
+    if (es && es.readyState === EventSource.OPEN) return;
+    if (es) {
+      this.eventSource = null;
+      try { es.close(); } catch {}
+    }
+    this._openStream();
   }
 
   stopReading() {
@@ -322,25 +356,64 @@ class BrowserTransport {
     }
   }
 
-  async write(data) {
-    if (!this.sessionId) return;
+  write(data) {
+    if (!this.sessionId) return Promise.resolve();
     const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
-    if (transformed == null) return;
-    const payload = transformed instanceof Uint8Array ? bytesToBase64(transformed) : stringToBase64(transformed);
-    await this.requestJson("/api/write", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: this.sessionId, data: payload }),
+    if (transformed == null) return Promise.resolve();
+    return this._enqueueWrite(transformed);
+  }
+
+  writeBytes(bytes) {
+    if (!this.sessionId) return Promise.resolve();
+    return this._enqueueWrite(bytes);
+  }
+
+  _enqueueWrite(data) {
+    return new Promise((resolve, reject) => {
+      (this._writeQueue || (this._writeQueue = [])).push({ data, resolve, reject });
+      if (!this._writeInFlight) this._flushWrites();
     });
   }
 
-  async writeBytes(bytes) {
-    if (!this.sessionId) return;
-    await this.requestJson("/api/write", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: this.sessionId, data: bytesToBase64(bytes) }),
-    });
+  _combineWriteEntries(entries) {
+    const parts = entries.map(e => e.data instanceof Uint8Array ? e.data : new TextEncoder().encode(e.data));
+    const total = parts.reduce((n, p) => n + p.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const p of parts) { out.set(p, offset); offset += p.length; }
+    return out;
+  }
+
+  async _flushWrites() {
+    if (this._writeInFlight) return;
+    this._writeInFlight = true;
+    try {
+      while (this._writeQueue && this._writeQueue.length) {
+        const batch = this._writeQueue;
+        this._writeQueue = [];
+        const payload = bytesToBase64(this._combineWriteEntries(batch));
+        try {
+          await this.requestJson("/api/write", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: this.sessionId, data: payload }),
+          });
+          for (const entry of batch) entry.resolve();
+          this._writeRetries = 0;
+        } catch (err) {
+          if (err?.status) {
+            for (const entry of batch) entry.reject(err);
+          } else {
+            this._writeQueue = batch.concat(this._writeQueue);
+            const attempt = (this._writeRetries || 0) + 1;
+            this._writeRetries = attempt;
+            await new Promise(r => setTimeout(r, Math.min(2000, 100 * attempt)));
+          }
+        }
+      }
+    } finally {
+      this._writeInFlight = false;
+    }
   }
 
   async resize(cols, rows) {
@@ -502,18 +575,22 @@ class TerminalTab {
     this.updateScrollbackClass();
     this.button = document.createElement("div");
     this.button.className = "tab-item";
-    this.button.innerHTML = `<span class="tab-title"></span><input class="tab-title-input" type="text"><button class="tab-close" type="button" title="Close tab">&times;</button>`;
+    this.button.innerHTML = `<span class="tab-title"></span><input class="tab-title-input" type="text" spellcheck="false"><button class="tab-close" type="button" title="Close tab">&times;</button>`;
     this.button.querySelector(".tab-title").textContent = this.title;
     this.button.addEventListener("click", () => this.manager.activateTab(this.id));
     const titleSpan = this.button.querySelector(".tab-title");
     const titleInput = this.button.querySelector(".tab-title-input");
     titleSpan.addEventListener("click", e => {
       if (this.manager.activeTab !== this) return;
+      const range = document.createRange();
+      range.selectNodeContents(titleSpan);
+      const textRect = range.getBoundingClientRect();
+      if (e.clientX > textRect.right) return;
       e.stopPropagation();
       titleInput.value = this.title;
       this.button.classList.add("editing");
       titleInput.focus();
-      titleInput.select();
+      titleInput.setSelectionRange(titleInput.value.length, titleInput.value.length);
     });
     const commitTitle = () => {
       this.button.classList.remove("editing");
@@ -546,7 +623,7 @@ class TerminalTab {
     this.term.onData(data => {
       if (!this.disconnected && !this._suppressInput) {
         this.hasInput = true;
-        this.transport.write(data).catch(() => this.markDisconnected());
+        this.transport.write(data).catch(err => this.handleWriteError(err));
       }
     });
     this.term.onRender(() => this.updateScrollbackClass());
@@ -598,6 +675,11 @@ class TerminalTab {
     this.disconnected = false;
     this.disconnectInfo = null;
     this.reconnecting = false;
+    this._autoReconnectAttempts = 0;
+    if (this._autoReconnectTimer) {
+      clearTimeout(this._autoReconnectTimer);
+      this._autoReconnectTimer = null;
+    }
     this.button.classList.remove("exited");
     this.updateScrollbackClass();
     this.transport.onResize = (cols, rows) => {
@@ -654,7 +736,7 @@ class TerminalTab {
     this.term.scrollToBottom();
     this.updateScrollbackClass();
     if (!this.disconnected) {
-      this.transport.resize(this.term.cols, this.term.rows).catch(() => this.markDisconnected());
+      this.transport.resize(this.term.cols, this.term.rows).catch(err => this.handleWriteError(err));
     }
   }
 
@@ -689,6 +771,11 @@ class TerminalTab {
     }
   }
 
+  handleWriteError(err) {
+    if (err?.status) this.markDisconnected();
+    else console.warn("envoy: transient write error", err);
+  }
+
   handleDisconnect(info) {
     if (this.closed) return;
     if (info?.kind === "evicted") {
@@ -700,6 +787,23 @@ class TerminalTab {
       return;
     }
     this.markDisconnected(info);
+    if (info?.kind === "error") this.scheduleAutoReconnect();
+  }
+
+  scheduleAutoReconnect() {
+    if (this._autoReconnectTimer) return;
+    const delay = Math.min(30000, 1000 * Math.pow(2, this._autoReconnectAttempts || 0));
+    this._autoReconnectAttempts = (this._autoReconnectAttempts || 0) + 1;
+    this._autoReconnectTimer = setTimeout(async () => {
+      this._autoReconnectTimer = null;
+      if (!this.canAutoReconnect()) return;
+      const ok = await this.reconnect().catch(() => false);
+      if (ok) {
+        this._autoReconnectAttempts = 0;
+      } else if (this.disconnected && !this.closed) {
+        this.scheduleAutoReconnect();
+      }
+    }, delay);
   }
 
   canReconnect() {
@@ -770,6 +874,10 @@ class TerminalTab {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    if (this._autoReconnectTimer) {
+      clearTimeout(this._autoReconnectTimer);
+      this._autoReconnectTimer = null;
+    }
     this.resizeObserver?.disconnect();
     this.pane.remove();
     this.button.remove();
@@ -989,6 +1097,14 @@ class TabManager {
   resumeActiveReads() {
     for (const tab of this.tabs) {
       tab.resumeReading();
+    }
+  }
+
+  pauseActiveReads() {
+    for (const tab of this.tabs) {
+      if (typeof tab.transport.pauseStream === "function") {
+        tab.transport.pauseStream();
+      }
     }
   }
 
@@ -1296,13 +1412,13 @@ function init(baseTransport, config) {
   function writeSequenceToCurrentTab(sequence) {
     const tab = currentTab();
     if (!tab || tab.disconnected) return Promise.resolve();
-    return tab.transport.write(sequence).catch(() => tab.markDisconnected());
+    return tab.transport.write(sequence).catch(err => tab.handleWriteError(err));
   }
 
   function writeBytesToCurrentTab(bytes) {
     const tab = currentTab();
     if (!tab || tab.disconnected) return Promise.resolve();
-    return tab.transport.writeBytes(bytes).catch(() => tab.markDisconnected());
+    return tab.transport.writeBytes(bytes).catch(err => tab.handleWriteError(err));
   }
 
   function suppressNextMobileTerminalData(values) {
@@ -1331,6 +1447,9 @@ function init(baseTransport, config) {
       return new Uint8Array([0x1b, 0x66]);
     }
 
+    if (mobileModifiers.Control && typeof data === "string" && data.length > 0 && data[0] !== "\x1b") {
+      return encodeMobileInputSequence(data);
+    }
     if (!mobileModifiers.Alt || mobileModifiers.Control) return data;
     if (data === "\x7f" || data === "\x08") {
       resetMobileModifiers();
@@ -1894,7 +2013,7 @@ function init(baseTransport, config) {
     if (baseTransport.toggleFullscreen) {
       const paths = Array.from(e.dataTransfer.files, f => f.path).filter(Boolean);
       if (paths.length) {
-        tab.transport.write(paths.map(p => p.includes(" ") ? `'${p}'` : p).join(" ")).catch(() => tab.markDisconnected());
+        tab.transport.write(paths.map(p => p.includes(" ") ? `'${p}'` : p).join(" ")).catch(err => tab.handleWriteError(err));
       }
     } else {
       for (const file of e.dataTransfer.files) {
@@ -2377,7 +2496,7 @@ function init(baseTransport, config) {
     pasteEditorOpen = false;
     pasteEditorModal.classList.remove("active");
     spPaste.classList.remove("sp-active");
-    if (text && tab) tab.transport.write("\x1b[200~" + text + "\x1b[201~").catch(() => tab.markDisconnected());
+    if (text && tab) tab.transport.write("\x1b[200~" + text + "\x1b[201~").catch(err => tab.handleWriteError(err));
     pasteEditorArea.value = "";
     focusCurrent();
     updateMobileInputBar();
@@ -2732,6 +2851,10 @@ function init(baseTransport, config) {
       e.preventDefault();
       openSettings();
     }
+    if (e.ctrlKey && !e.shiftKey && (e.key === "+" || e.key === "=" || e.key === "-" || e.key === "0")) {
+      e.preventDefault();
+      return;
+    }
     if (e.ctrlKey && e.shiftKey && (e.key === "+" || e.key === "=")) {
       e.preventDefault();
       adjustFontSize(1);
@@ -3060,7 +3183,11 @@ function init(baseTransport, config) {
   };
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) recoverConnections();
+    if (document.hidden) {
+      manager.pauseActiveReads();
+    } else {
+      recoverConnections();
+    }
   });
   window.addEventListener("focus", recoverConnections);
   window.addEventListener("online", recoverConnections);

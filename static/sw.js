@@ -1,4 +1,4 @@
-const CACHE_NAME = 'envoy-v6';
+const CACHE_NAME = 'envoy-v7';
 const urlsToCache = [
   '/envoy/static/index.html',
   '/envoy/static/app.css',
@@ -43,9 +43,11 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') return;
 
-  // API requests: always network
+  // API requests: bypass the service worker entirely so streaming responses
+  // (e.g. /api/stream SSE) aren't tied to the SW lifecycle. On Firefox
+  // Android, SWs can be terminated while the PWA is backgrounded, which
+  // would tear down any fetch routed through event.respondWith.
   if (event.request.url.includes('/envoy/api/')) {
-    event.respondWith(fetch(event.request));
     return;
   }
 

@@ -76,15 +76,15 @@ input, textarea, #select-overlay, #select-overlay * {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  cursor: text;
+  cursor: pointer;
 }
 .tab-title-input {
   display: none;
   flex: 1;
   min-width: 0;
   padding: 0;
+  cursor: pointer;
   border: 0;
-  border-bottom: 1px solid #4af;
   background: transparent;
   color: inherit;
   font: inherit;
@@ -330,7 +330,7 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 .xterm.select-mode { visibility: hidden; }
 
-.sp-btn.sp-icon-lg { font-size: 40px; }
+.sp-btn.sp-icon-lg svg { width: 22px; height: 22px; }
 .sp-btn.sp-active { border-color: #4af; color: #4af; }
 
 #toast {
@@ -373,6 +373,7 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 .sp-btn:active { background: #333; }
 .sp-btn:disabled { opacity: 0.3; cursor: default; }
+.sp-btn svg { width: 18px; height: 18px; pointer-events: none; }
 .sp-group {
   width: 100%;
   border-left: 1px solid darkslategray;
@@ -395,10 +396,7 @@ input, textarea, #select-overlay, #select-overlay * {
   0%, 100% { opacity: 0.35; }
   50% { opacity: 1; }
 }
-#sp-cancel { color: #f55; font-size: 20px; }
-#sp-log { font-size: 16px; }
-#sp-settings { font-size: 18px; }
-#sp-help { color: #4af; font-size: 18px; }
+#sp-help { font-size: 18px; }
 
 #voice-log-modal {
   display: none; position: fixed; inset: 0;
@@ -709,7 +707,6 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 
 @media (pointer: coarse) {
-  .sp-btn.sp-icon-lg { font-size: 24px; }
   .tab-item { max-width: 180px; }
   #workspace.with-mobile-input-bar { padding-bottom: 44px; }
   #side-panel {
