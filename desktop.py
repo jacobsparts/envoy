@@ -45,11 +45,13 @@ class DesktopApi:
     def upload_file(self, session_id: str, name: str, data_b64: str) -> dict[str, str]:
         return self._service.upload_file(session_id, name, data_b64)
 
-    def send_text_message(self, session_id: str, text: str) -> dict[str, object]:
-        return self._service.send_text_message(session_id, text)
+    def send_text_message(self, session_id: str, text: str,
+                          agent_settings: dict | None = None) -> dict[str, object]:
+        return self._service.send_text_message(session_id, text, agent_settings)
 
-    def send_voice_message(self, session_id: str, audio_b64: str, mime_type: str) -> dict[str, object]:
-        return self._service.send_voice_message(session_id, audio_b64, mime_type)
+    def send_voice_message(self, session_id: str, audio_b64: str, mime_type: str,
+                           agent_settings: dict | None = None) -> dict[str, object]:
+        return self._service.send_voice_message(session_id, audio_b64, mime_type, agent_settings)
 
     def transcribe_audio(self, audio_b64: str, mime_type: str) -> dict[str, str]:
         return self._service.transcribe_audio(audio_b64, mime_type)
