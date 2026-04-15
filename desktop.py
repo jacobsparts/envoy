@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import tempfile
+from pathlib import Path
 
 import webview
 
-from app_core import DESKTOP_HTML, UPLOAD_DIR, EnvoyService, build_title
+from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, build_title, render_html
 
 
 class DesktopApi:
@@ -90,10 +92,29 @@ def main() -> None:
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     api = DesktopApi(args.path)
 
+    rendered = render_html("desktop")
+    html_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".html",
+        dir=str(STATIC_DIR),
+        delete=False,
+    )
+    html_file.write(rendered)
+    html_file.close()
+    html_path = html_file.name
+
+    def cleanup_html() -> None:
+        try:
+            os.unlink(html_path)
+        except OSError:
+            pass
+
     def force_shutdown(*_args) -> None:
         try:
             api.shutdown()
         finally:
+            cleanup_html()
             os._exit(0)
 
     signal.signal(signal.SIGINT, force_shutdown)
@@ -101,7 +122,7 @@ def main() -> None:
 
     window = webview.create_window(
         api.title,
-        DESKTOP_HTML.as_uri(),
+        Path(html_path).as_uri(),
         js_api=api,
         width=args.width,
         height=args.height,
@@ -115,6 +136,7 @@ def main() -> None:
         webview.start(gui="qt", icon=icon_path)
     finally:
         api.shutdown()
+        cleanup_html()
 
 
 if __name__ == "__main__":

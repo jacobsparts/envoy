@@ -14,7 +14,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from app_core import STATIC_DIR, UPLOAD_DIR, WEB_HTML, EnvoyService
+from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, render_html
 
 
 WEB_PREFIX = "/envoy"
@@ -175,10 +175,9 @@ def make_handler():
                 self.send_error(404)
                 return
 
-            with open(WEB_HTML, "rb") as handle:
-                body = handle.read()
+            body = render_html("web").encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)

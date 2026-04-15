@@ -1,6 +1,6 @@
-const CACHE_NAME = 'envoy-v7';
+const CACHE_NAME = 'envoy-v8';
 const urlsToCache = [
-  '/envoy/static/index.html',
+  '/envoy/',
   '/envoy/static/app.css',
   '/envoy/static/app.js',
   '/envoy/static/xterm.js',
@@ -51,18 +51,18 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Navigation requests (e.g. /envoy/foo): network first, fallback to cached index.html
+  // Navigation requests (e.g. /envoy/foo): network first, fallback to cached shell
   if (event.request.mode === 'navigate') {
     event.respondWith(
       fetch(event.request)
         .then(response => {
           const responseToCache = response.clone();
           caches.open(CACHE_NAME).then(cache => {
-            cache.put('/envoy/static/index.html', responseToCache);
+            cache.put('/envoy/', responseToCache);
           });
           return response;
         })
-        .catch(() => caches.match('/envoy/static/index.html'))
+        .catch(() => caches.match('/envoy/'))
     );
     return;
   }

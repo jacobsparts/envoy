@@ -28,9 +28,46 @@ from voice_chat import CancelledError, process_text_message, process_voice_messa
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
-DESKTOP_HTML = STATIC_DIR / "desktop.html"
-WEB_HTML = STATIC_DIR / "index.html"
+APP_TEMPLATE = STATIC_DIR / "app.html"
 HOME_DIR = os.path.expanduser("~")
+
+WEB_STATIC_PREFIX = "/envoy/static/"
+
+_WEB_HEAD_EXTRA = """<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="dark">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="envoy">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" type="image/png" sizes="192x192">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="manifest" href="manifest.json">"""
+
+_WEB_BODY_EXTRA = """<script>
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('/envoy/static/sw.js', { scope: '/envoy/' });
+}
+</script>"""
+
+
+def render_html(mode: str) -> str:
+    template = APP_TEMPLATE.read_text()
+    if mode == "web":
+        base_tag = f'<base href="{WEB_STATIC_PREFIX}">'
+        head_extra = _WEB_HEAD_EXTRA
+        body_extra = _WEB_BODY_EXTRA
+    elif mode == "desktop":
+        base_tag = ""
+        head_extra = ""
+        body_extra = ""
+    else:
+        raise ValueError(f"unknown render mode: {mode!r}")
+    return (template
+            .replace("{{BASE_TAG}}", base_tag)
+            .replace("{{WEB_HEAD_EXTRA}}", head_extra)
+            .replace("{{WEB_BODY_EXTRA}}", body_extra))
+
 UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000

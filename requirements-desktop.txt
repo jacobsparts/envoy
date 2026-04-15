@@ -1,4 +1,5 @@
 pywebview
 qtpy
 pyside6
+pyte
 requests
