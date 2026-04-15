@@ -11,14 +11,14 @@ from pathlib import Path
 
 import webview
 
-from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, build_title, render_html
+from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, build_title, desktop_inherited_env, render_html
 
 
 class DesktopApi:
     def __init__(self, path: str):
         self.path = path
         self.title = build_title(path)
-        self._service = EnvoyService()
+        self._service = EnvoyService(extra_env=desktop_inherited_env())
         self.window = None
 
     def get_config(self) -> dict[str, str]:

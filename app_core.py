@@ -94,6 +94,31 @@ def _login_env() -> dict[str, str]:
     }
 
 
+# Env vars a desktop-launched shell expects to inherit so GUI apps,
+# dbus, keyrings, and agents work. The user's rc files still run on
+# top, so anything here is just a default.
+_DESKTOP_PASSTHROUGH_VARS = (
+    "DISPLAY",
+    "XAUTHORITY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_RUNTIME_DIR",
+    "XDG_SESSION_TYPE",
+    "XDG_SESSION_ID",
+    "XDG_SESSION_DESKTOP",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_DATA_DIRS",
+    "XDG_CONFIG_DIRS",
+    "DESKTOP_SESSION",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+)
+
+
+def desktop_inherited_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in _DESKTOP_PASSTHROUGH_VARS if k in os.environ}
+
+
 def _login_shell() -> str:
     """Return the user's login shell from the passwd database."""
     import pwd
@@ -170,20 +195,22 @@ class ClientState:
 
 
 class Session:
-    def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *, login: bool = False):
+    def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
+                 login: bool = False, extra_env: dict[str, str] | None = None):
         self.sid = sid
         self.path = path
         self.cmd = list(cmd)
         self.cwd = cwd
         self.title = ""
         self.master, slave = pty.openpty()
+        env = {**(extra_env or {}), **_login_env(), "TERM": "xterm-256color", "UPLOAD_DIR": UPLOAD_DIR}
         popen_kwargs: dict = dict(
             stdin=slave,
             stdout=slave,
             stderr=slave,
             cwd=cwd,
             start_new_session=True,
-            env={**_login_env(), "TERM": "xterm-256color", "UPLOAD_DIR": UPLOAD_DIR},
+            env=env,
         )
         if login:
             # Convention: argv[0] prefixed with '-' tells the shell
@@ -419,8 +446,9 @@ CLIENT_STALE_SECONDS = 30
 
 
 class EnvoyService:
-    def __init__(self):
+    def __init__(self, extra_env: dict[str, str] | None = None):
         self._sessions: dict[str, Session] = {}
+        self._extra_env = dict(extra_env) if extra_env else None
         self._lock = threading.Lock()
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True, name="session-reaper")
         self._reaper.start()
@@ -453,7 +481,7 @@ class EnvoyService:
 
     def _new_session(self, path: str) -> Session:
         cmd, cwd, login = resolve_cli(path)
-        session = Session(self._new_session_id(), path, cmd, cwd, login=login)
+        session = Session(self._new_session_id(), path, cmd, cwd, login=login, extra_env=self._extra_env)
         with self._lock:
             while session.sid in self._sessions:
                 session.sid = self._new_session_id()
