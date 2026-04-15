@@ -133,7 +133,7 @@ def main() -> None:
     window.events.closed += force_shutdown
     icon_path = os.path.join(os.path.dirname(__file__), "static", "icon-512.png")
     try:
-        webview.start(gui="qt", icon=icon_path)
+        webview.start(gui="qt", icon=icon_path, debug=True)
     finally:
         api.shutdown()
         cleanup_html()
