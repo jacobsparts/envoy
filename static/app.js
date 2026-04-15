@@ -84,6 +84,7 @@ class PywebviewTransport {
     this.pollInFlight = false;
     this.pollTimer = null;
     this.sessionId = "";
+    this.clientId = "";
   }
 
   async init() {
@@ -106,6 +107,7 @@ class PywebviewTransport {
   async connect(existingSessionId) {
     const result = await this.api.connect(existingSessionId || "");
     this.sessionId = result.sid;
+    this.clientId = result.client_id || "";
     return result;
   }
 
@@ -115,7 +117,11 @@ class PywebviewTransport {
       if (this.pollInFlight || !this.sessionId) return;
       this.pollInFlight = true;
       try {
-        const result = await this.api.read(this.sessionId);
+        const result = await this.api.read(this.sessionId, this.clientId);
+        if (result.evicted) {
+          onDisconnect({ kind: "evicted" });
+          return;
+        }
         const chunk = base64ToBytes(result.output);
         if (chunk.length) onData(chunk);
         if (result.events && result.events.length) onEvents(result.events);
@@ -153,7 +159,7 @@ class PywebviewTransport {
 
   async resize(cols, rows) {
     if (!this.sessionId) return;
-    await this.api.resize(this.sessionId, cols, rows);
+    await this.api.resize(this.sessionId, cols, rows, this.clientId);
   }
 
   async uploadFile(name, b64data) {

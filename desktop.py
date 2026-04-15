@@ -33,14 +33,14 @@ class DesktopApi:
     def connect(self, session_id: str = "") -> dict[str, object]:
         return self._service.connect(self.path, session_id)
 
-    def read(self, session_id: str) -> dict[str, object]:
-        return self._service.read(session_id)
+    def read(self, session_id: str, client_id: str = "") -> dict[str, object]:
+        return self._service.read(session_id, client_id)
 
     def write(self, session_id: str, data_b64: str) -> dict[str, bool]:
         return self._service.write(session_id, data_b64)
 
-    def resize(self, session_id: str, cols: int, rows: int) -> dict[str, bool]:
-        return self._service.resize(session_id, cols, rows)
+    def resize(self, session_id: str, cols: int, rows: int, client_id: str = "") -> dict[str, bool]:
+        return self._service.resize(session_id, cols, rows, client_id=client_id)
 
     def upload_file(self, session_id: str, name: str, data_b64: str) -> dict[str, str]:
         return self._service.upload_file(session_id, name, data_b64)
