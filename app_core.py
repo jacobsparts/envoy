@@ -31,39 +31,41 @@ STATIC_DIR = APP_DIR / "static"
 APP_TEMPLATE = STATIC_DIR / "app.html"
 HOME_DIR = os.path.expanduser("~")
 
-_WEB_HEAD_EXTRA = """<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
-<meta name="color-scheme" content="dark">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black">
-<meta name="apple-mobile-web-app-title" content="envoy">
-<link rel="icon" href="icon.svg" type="image/svg+xml">
-<link rel="icon" href="icon-192.png" type="image/png" sizes="192x192">
-<link rel="apple-touch-icon" href="icon-192.png">
-<link rel="manifest" href="manifest.json">"""
+def _web_head_extra(static: str) -> str:
+    return (
+        '<meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">\n'
+        '<meta name="color-scheme" content="dark">\n'
+        '<meta name="mobile-web-app-capable" content="yes">\n'
+        '<meta name="apple-mobile-web-app-capable" content="yes">\n'
+        '<meta name="apple-mobile-web-app-status-bar-style" content="black">\n'
+        '<meta name="apple-mobile-web-app-title" content="envoy">\n'
+        f'<link rel="icon" href="{static}icon.svg" type="image/svg+xml">\n'
+        f'<link rel="icon" href="{static}icon-192.png" type="image/png" sizes="192x192">\n'
+        f'<link rel="apple-touch-icon" href="{static}icon-192.png">\n'
+        f'<link rel="manifest" href="{static}manifest.json">'
+    )
 
 
 def render_html(mode: str, web_prefix: str = "") -> str:
     template = APP_TEMPLATE.read_text()
     if mode == "web":
-        static_prefix = f"{web_prefix}/static/"
-        base_tag = f'<base href="{static_prefix}">'
-        head_extra = _WEB_HEAD_EXTRA
+        static = f"{web_prefix}/static/"
+        head_extra = _web_head_extra(static)
         body_extra = (
             "<script>\n"
             "if ('serviceWorker' in navigator && window.isSecureContext) {\n"
-            f"  navigator.serviceWorker.register('{static_prefix}sw.js', {{ scope: '{web_prefix}/' }});\n"
+            f"  navigator.serviceWorker.register('{static}sw.js', {{ scope: '{web_prefix}/' }});\n"
             "}\n"
             "</script>"
         )
     elif mode == "desktop":
-        base_tag = ""
+        static = ""
         head_extra = ""
         body_extra = ""
     else:
         raise ValueError(f"unknown render mode: {mode!r}")
     return (template
-            .replace("{{BASE_TAG}}", base_tag)
+            .replace("{{STATIC}}", static)
             .replace("{{WEB_HEAD_EXTRA}}", head_extra)
             .replace("{{WEB_BODY_EXTRA}}", body_extra))
 

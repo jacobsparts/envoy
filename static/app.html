@@ -2,16 +2,15 @@
 <html>
 <head>
 <meta charset="utf-8">
-{{BASE_TAG}}
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, interactive-widget=resizes-content, viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 {{WEB_HEAD_EXTRA}}
 <title>envoy</title>
-<link rel="stylesheet" href="xterm.css">
-<link rel="stylesheet" href="app.css">
-<script defer src="xterm.js"></script>
-<script defer src="xterm-addon-fit.js"></script>
-<script defer src="xterm-addon-serialize.js"></script>
+<link rel="stylesheet" href="{{STATIC}}xterm.css">
+<link rel="stylesheet" href="{{STATIC}}app.css">
+<script defer src="{{STATIC}}xterm.js"></script>
+<script defer src="{{STATIC}}xterm-addon-fit.js"></script>
+<script defer src="{{STATIC}}xterm-addon-serialize.js"></script>
 </head>
 <body>
 <div id="side-panel">
@@ -164,7 +163,7 @@
   <button class="mobile-input-key mobile-nav-key" data-action="home" aria-label="Home, long press for Page Up" title="Long press: Page Up" type="button">Home<span class="mobile-input-hint">Pg↑</span></button>
   <button class="mobile-input-key mobile-nav-key" data-action="end" aria-label="End, long press for Page Down" title="Long press: Page Down" type="button">End<span class="mobile-input-hint">Pg↓</span></button>
 </div>
-<script defer src="app.js"></script>
+<script defer src="{{STATIC}}app.js"></script>
 {{WEB_BODY_EXTRA}}
 </body>
 </html>
