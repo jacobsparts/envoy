@@ -626,6 +626,10 @@ class EnvoyService:
             reply = process_text_message(text, iface, cancel,
                                          agent_settings=agent_settings or {})
             speech = "\n".join(iface.messages) or reply
+            if speech:
+                session.push_agent_event("status", "Generating audio...")
+            if speech and not iface.messages:
+                session.push_agent_event("message", speech)
             return {
                 "response": reply,
                 "speech": speech,
@@ -649,6 +653,10 @@ class EnvoyService:
             reply = process_voice_message(self._decode(audio_b64), mime_type, iface, cancel,
                                           agent_settings=agent_settings or {})
             speech = "\n".join(iface.messages) or reply
+            if speech:
+                session.push_agent_event("status", "Generating audio...")
+            if speech and not iface.messages:
+                session.push_agent_event("message", speech)
             return {
                 "response": reply,
                 "speech": speech,

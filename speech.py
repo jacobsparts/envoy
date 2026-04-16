@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import os
 import re
 import wave
@@ -16,8 +15,16 @@ from env_config import load_app_env
 
 load_app_env()
 
-INWORLD_TTS_URL = "https://api.inworld.ai/tts/v1/voice:stream"
-TTS_SAMPLE_RATE = 48000
+GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent"
+TTS_SAMPLE_RATE = 24000
+DEFAULT_TTS_VOICE = "Sulafat"
+DEFAULT_TTS_DIRECTOR_NOTES = (
+    "Style: Deadpan. Dry, restrained, matter-of-fact delivery. "
+    "Avoid upbeat or overly expressive reads.\n"
+    "Pacing: Rapid-fire. Fast, efficient delivery with minimal pauses, "
+    "but still clear and intelligible.\n"
+    "Accent: General American."
+)
 
 
 def strip_markdown(text: str) -> str:
@@ -34,7 +41,7 @@ def strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def chunk_text(text: str, limit: int = 200) -> list[str]:
+def chunk_text(text: str, limit: int = 800) -> list[str]:
     chunks = []
     while len(text) > limit:
         cut = -1
@@ -53,46 +60,56 @@ def chunk_text(text: str, limit: int = 200) -> list[str]:
     return chunks
 
 
-def synthesize_speech(text: str, voice: str = "Ashley") -> str | None:
-    inworld_api_key = os.environ.get("INWORLD_API_KEY", "").strip()
+def build_tts_prompt(transcript: str, director_notes: str = DEFAULT_TTS_DIRECTOR_NOTES) -> str:
+    return (
+        "Generate speech audio for the transcript below. "
+        "Follow the director notes, but speak only the transcript content.\n\n"
+        "### DIRECTOR'S NOTES\n"
+        f"{director_notes.strip()}\n\n"
+        "### TRANSCRIPT\n"
+        f"{transcript.strip()}"
+    )
+
+
+def synthesize_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
+    google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     text = strip_markdown(text)
-    if not text or not inworld_api_key:
+    if not text or not google_api_key:
         return None
 
     pcm_data = bytearray()
     for chunk in chunk_text(text):
+        prompt = build_tts_prompt(chunk)
         resp = requests.post(
-            INWORLD_TTS_URL,
+            GEMINI_TTS_URL,
             headers={
-                "Authorization": f"Basic {inworld_api_key}",
                 "Content-Type": "application/json",
+                "x-goog-api-key": google_api_key,
             },
             json={
-                "text": chunk,
-                "voice_id": voice,
-                "model_id": "inworld-tts-1.5-mini",
-                "audio_config": {
-                    "audio_encoding": "LINEAR16",
-                    "sample_rate_hertz": TTS_SAMPLE_RATE,
-                    "speaking_rate": 1.2,
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": voice,
+                            }
+                        }
+                    },
                 },
+                "model": "gemini-3.1-flash-tts-preview",
             },
-            stream=True,
+            timeout=120,
         )
         if not resp.ok:
             continue
-        for line in resp.iter_lines(decode_unicode=True):
-            if not line or not line.strip():
-                continue
-            try:
-                result = json.loads(line).get("result", {})
-                if "audioContent" in result:
-                    audio_bytes = base64.b64decode(result["audioContent"])
-                    if len(audio_bytes) > 44 and audio_bytes[:4] == b"RIFF":
-                        audio_bytes = audio_bytes[44:]
-                    pcm_data.extend(audio_bytes)
-            except (json.JSONDecodeError, KeyError):
-                continue
+        try:
+            data = resp.json()
+            audio_b64 = data["candidates"][0]["content"]["parts"][0]["inlineData"]["data"]
+            pcm_data.extend(base64.b64decode(audio_b64))
+        except (ValueError, KeyError, IndexError, TypeError):
+            continue
 
     if not pcm_data:
         return None

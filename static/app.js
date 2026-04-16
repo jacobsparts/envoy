@@ -1051,7 +1051,7 @@ class TabManager {
   handleAgentEvent(tab, event) {
     if (tab !== this.activeTab) return;
     if (!event || !event.text) return;
-    showToast(event.text.length > 80 ? event.text.substring(0, 77) + "..." : event.text, false, true);
+    if (this.showToast) this.showToast(event.text, false, true);
   }
 
   async closeTab(id) {
@@ -1202,7 +1202,7 @@ function init(baseTransport, config) {
   const MOBILE_ALT_BACKSPACE_TOKEN = "__ENVOY_ALT_BACKSPACE__";
 
   function dismissToast() {
-    if (toastLocked) return;
+    toastLocked = false;
     toast.classList.remove("active", "persistent");
     if (toastTimer) {
       clearTimeout(toastTimer);
@@ -1221,9 +1221,7 @@ function init(baseTransport, config) {
     if (persistent) {
       toast.classList.add("persistent");
     } else if (sticky) {
-      toast.classList.add("active");
-      toastLocked = true;
-      toastTimer = setTimeout(() => { toastLocked = false; }, 3000);
+      toast.classList.add("active", "persistent");
     } else {
       toast.classList.add("active");
       toastTimer = setTimeout(() => toast.classList.remove("active"), 1500);
@@ -1254,6 +1252,8 @@ function init(baseTransport, config) {
     agentLog: agentLogEntries,
     selectOverlay,
   });
+  manager.showToast = showToast;
+  manager.dismissToast = dismissToast;
   window.__envoyTransformWriteData = data => transformMobileTerminalInput(data);
 
   function currentTab() {
@@ -1649,6 +1649,9 @@ function init(baseTransport, config) {
   }
 
   sidePanel.addEventListener("transitionend", syncPanelWidth);
+  sidePanel.addEventListener("contextmenu", e => {
+    if (e.target.closest(".sp-btn")) e.preventDefault();
+  });
   sidePanel.addEventListener("touchstart", preserveTerminalFocusFromSidebarPress, { passive: false, capture: true });
   sidePanel.addEventListener("touchmove", cancelSidebarTouchIfMoved, { passive: true, capture: true });
   sidePanel.addEventListener("touchend", triggerSidebarButtonWithoutBlur, { passive: false, capture: true });
@@ -2170,7 +2173,7 @@ function init(baseTransport, config) {
           manager.renderAgentLog();
           if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
           const msg = data.speech || data.response;
-          if (msg) showToast(msg.length > 80 ? msg.substring(0, 77) + "..." : msg, false, true);
+          if (msg) showToast(msg, false, true);
           else dismissToast();
         }).catch(err => {
           if (controller.signal.aborted) {
@@ -2225,25 +2228,33 @@ function init(baseTransport, config) {
     toggleDictation();
   });
 
-  spCancel.addEventListener("click", () => {
+  function requestVoiceCancel() {
     if (voiceCancelPending) {
-      return;
+      return false;
     }
     if (voiceRecorder && voiceRecorder.state === "recording") {
       voiceCancelled = true;
       voiceRecorder.stop();
-    } else if (voiceAbort) {
+      return true;
+    }
+    if (voiceAbort) {
       if (voiceMode === "agent") {
         voiceCancelPending = true;
         cancelVoiceAgent();
         updateVoiceControls();
         showToast("Cancelling...", true);
-        return;
+        return true;
       }
       voiceAbort.abort();
       voiceReset();
       showToast("Cancelled");
+      return true;
     }
+    return false;
+  }
+
+  spCancel.addEventListener("click", () => {
+    requestVoiceCancel();
   });
 
   spHelp.addEventListener("click", () => helpModal.classList.add("active"));
@@ -2384,7 +2395,7 @@ function init(baseTransport, config) {
       manager.renderAgentLog();
       if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
       const msg = data.speech || data.response;
-      if (msg) showToast(msg.length > 80 ? msg.substring(0, 77) + "..." : msg, false, true);
+      if (msg) showToast(msg, false, true);
       else dismissToast();
     }).catch(err => {
       spText.classList.remove("processing");
@@ -2609,7 +2620,6 @@ function init(baseTransport, config) {
     const missing = [];
     if (!settings.GOOGLE_API_KEY?.present) missing.push("Google");
     if (!settings.GROQ_API_KEY?.present) missing.push("Groq");
-    if (!settings.INWORLD_API_KEY?.present) missing.push("Inworld");
     if (!missing.length) {
       settingsStatus.textContent = "All configured.";
       settingsStatus.className = "success";
@@ -2734,6 +2744,11 @@ function init(baseTransport, config) {
     updateMobileInputBar();
   }
 
+  function toggleTabBarVisibility() {
+    tabBar.parentElement.classList.toggle("force-show");
+    manager.updateTabBar();
+  }
+
   agentLookback.addEventListener("input", () => {
     agentLookbackVal.textContent = agentLookback.value;
   });
@@ -2769,6 +2784,15 @@ function init(baseTransport, config) {
     if (micLongPressTimer && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
       clearTimeout(micLongPressTimer);
     }
+  });
+  spMic.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (micLongPressTimer) {
+      clearTimeout(micLongPressTimer);
+      micLongPressTimer = null;
+    }
+    micLongPressFired = true;
+    openAgentSettings();
   });
 
   function scheduleFullscreenLayoutRefresh() {
@@ -2807,8 +2831,7 @@ function init(baseTransport, config) {
   tabAdd.addEventListener("pointerdown", () => {
     tabAddLongPress = setTimeout(() => {
       tabAddLongPress = null;
-      tabBar.parentElement.classList.toggle("force-show");
-      manager.updateTabBar();
+      toggleTabBarVisibility();
     }, 500);
   });
   tabAdd.addEventListener("pointerup", () => {
@@ -2823,6 +2846,14 @@ function init(baseTransport, config) {
       clearTimeout(tabAddLongPress);
       tabAddLongPress = null;
     }
+  });
+  tabAdd.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (tabAddLongPress !== null) {
+      clearTimeout(tabAddLongPress);
+      tabAddLongPress = null;
+    }
+    toggleTabBarVisibility();
   });
 
   const focusTerminalFromTouch = e => {
@@ -2898,6 +2929,10 @@ function init(baseTransport, config) {
     }
     if (e.ctrlKey && e.shiftKey && e.code === "Space") {
       e.preventDefault();
+      toggleDictation();
+    }
+    if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "a") {
+      e.preventDefault();
       startVoiceRecording("agent");
     }
     if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "e") {
@@ -2914,6 +2949,9 @@ function init(baseTransport, config) {
     if (e.key === "Escape" && selectOverlay.classList.contains("active")) {
       e.preventDefault();
       exitSelectMode();
+    }
+    if (e.key === "Escape" && requestVoiceCancel()) {
+      e.preventDefault();
     }
   }, { capture: true });
 

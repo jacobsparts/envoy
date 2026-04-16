@@ -40,7 +40,7 @@ Browser / pywebview
 Python backend
   ├── app_core.py       PTY session management, file uploads
   ├── voice_chat.py     Gemini agent with terminal tools
-  ├── speech.py         Inworld TTS synthesis
+  ├── speech.py         Gemini 3.1 Flash TTS synthesis
   ├── agent.py          Gemini tool-calling runtime
   └── env_config.py     API key management
 ```
@@ -94,7 +94,8 @@ The terminal itself works without any keys configured.
 | `Ctrl+W` | Close tab |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+\` | Toggle toolbar |
-| `Ctrl+Shift+Space` | Voice agent |
+| `Ctrl+Shift+Space` | Dictation |
+| `Ctrl+Shift+A` | Voice agent |
 | `Ctrl+Shift+E` | Text agent / paste editor |
 | `Ctrl+Shift+0` / `+` / `-` | Reset / increase / decrease font size |
 
