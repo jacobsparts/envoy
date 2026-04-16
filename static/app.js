@@ -729,6 +729,7 @@ class TerminalTab {
   }
 
   fitTerminal() {
+    if (!this.host.offsetWidth || !this.host.offsetHeight) return;
     try {
       this.term._core?._charSizeService?.measure();
     } catch {}
@@ -3224,6 +3225,7 @@ function init(baseTransport, config) {
     manager.resumeActiveReads();
     manager.reconnectDisconnectedTabs();
     updateMobileInputBar();
+    manager.activeTab?.fitTerminal();
   };
 
   document.addEventListener("visibilitychange", () => {

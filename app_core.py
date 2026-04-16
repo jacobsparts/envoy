@@ -71,7 +71,7 @@ def render_html(mode: str, web_prefix: str = "") -> str:
 
 UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
-SCROLLBACK_BUFFER_SIZE = 100_000
+SCROLLBACK_BUFFER_SIZE = 10_000_000
 SESSION_TIMEOUT = 60 * 60 * 24
 
 
