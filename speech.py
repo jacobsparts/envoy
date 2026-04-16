@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import re
 import wave
@@ -16,8 +17,11 @@ from env_config import load_app_env
 load_app_env()
 
 GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-tts-preview:generateContent"
-TTS_SAMPLE_RATE = 24000
+INWORLD_TTS_URL = "https://api.inworld.ai/tts/v1/voice:stream"
+GOOGLE_TTS_SAMPLE_RATE = 24000
+INWORLD_TTS_SAMPLE_RATE = 48000
 DEFAULT_TTS_VOICE = "Sulafat"
+DEFAULT_INWORLD_VOICE = "Ashley"
 DEFAULT_TTS_DIRECTOR_NOTES = (
     "Style: Deadpan. Dry, restrained, matter-of-fact delivery. "
     "Avoid upbeat or overly expressive reads.\n"
@@ -71,9 +75,20 @@ def build_tts_prompt(transcript: str, director_notes: str = DEFAULT_TTS_DIRECTOR
     )
 
 
-def synthesize_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
+def _pcm_to_wav_base64(pcm_data: bytes, sample_rate: int) -> str | None:
+    if not pcm_data:
+        return None
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_data)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _synthesize_google_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
     google_api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    text = strip_markdown(text)
     if not text or not google_api_key:
         return None
 
@@ -111,13 +126,56 @@ def synthesize_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
         except (ValueError, KeyError, IndexError, TypeError):
             continue
 
-    if not pcm_data:
+    return _pcm_to_wav_base64(bytes(pcm_data), GOOGLE_TTS_SAMPLE_RATE)
+
+
+def _synthesize_inworld_speech(text: str, voice: str = DEFAULT_INWORLD_VOICE) -> str | None:
+    inworld_api_key = os.environ.get("INWORLD_API_KEY", "").strip()
+    if not text or not inworld_api_key:
         return None
 
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(TTS_SAMPLE_RATE)
-        wf.writeframes(bytes(pcm_data))
-    return base64.b64encode(buf.getvalue()).decode()
+    pcm_data = bytearray()
+    for chunk in chunk_text(text, limit=200):
+        resp = requests.post(
+            INWORLD_TTS_URL,
+            headers={
+                "Authorization": f"Basic {inworld_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "text": chunk,
+                "voice_id": voice,
+                "model_id": "inworld-tts-1.5-mini",
+                "audio_config": {
+                    "audio_encoding": "LINEAR16",
+                    "sample_rate_hertz": INWORLD_TTS_SAMPLE_RATE,
+                    "speaking_rate": 1.2,
+                },
+            },
+            stream=True,
+        )
+        if not resp.ok:
+            continue
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.strip():
+                continue
+            try:
+                result = json.loads(line).get("result", {})
+                if "audioContent" in result:
+                    audio_bytes = base64.b64decode(result["audioContent"])
+                    if len(audio_bytes) > 44 and audio_bytes[:4] == b"RIFF":
+                        audio_bytes = audio_bytes[44:]
+                    pcm_data.extend(audio_bytes)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    return _pcm_to_wav_base64(bytes(pcm_data), INWORLD_TTS_SAMPLE_RATE)
+
+
+def synthesize_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
+    text = strip_markdown(text)
+    if not text:
+        return None
+    if os.environ.get("INWORLD_API_KEY", "").strip():
+        return _synthesize_inworld_speech(text)
+    return _synthesize_google_speech(text, voice=voice)

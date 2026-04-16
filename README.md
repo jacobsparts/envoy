@@ -40,7 +40,7 @@ Browser / pywebview
 Python backend
   ├── app_core.py       PTY session management, file uploads
   ├── voice_chat.py     Gemini agent with terminal tools
-  ├── speech.py         Gemini 3.1 Flash TTS synthesis
+  ├── speech.py         TTS synthesis with Inworld-first, Google fallback
   ├── agent.py          Gemini tool-calling runtime
   └── env_config.py     API key management
 ```
@@ -82,7 +82,9 @@ Voice and agent features require API keys. Set them as environment variables, in
 |-----|-------------|
 | `GOOGLE_API_KEY` | Voice & text agent (Gemini) |
 | `GROQ_API_KEY` | Dictation (Whisper) |
-| `INWORLD_API_KEY` | Spoken agent responses (TTS) |
+| `INWORLD_API_KEY` | Spoken agent responses (TTS, preferred when set) |
+
+Spoken responses use Inworld TTS when `INWORLD_API_KEY` is set; otherwise they fall back to Google TTS via `GOOGLE_API_KEY`.
 
 The terminal itself works without any keys configured.
 
