@@ -71,7 +71,7 @@ def render_html(mode: str, web_prefix: str = "") -> str:
 
 UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
-SCROLLBACK_BUFFER_SIZE = 10_000_000
+SCROLLBACK_BUFFER_SIZE = 100_000
 SESSION_TIMEOUT = 60 * 60 * 24
 
 
@@ -222,6 +222,10 @@ class Session:
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
+        self._archive_pyte_screen = pyte.HistoryScreen(80, 24, history=200000)
+        self._archive_pyte_stream = pyte.Stream(self._archive_pyte_screen)
+        self._last_archive_cut = {"kind": "init", "bytes": 0}
+        self._archive_total_bytes = 0
         self.session_files: list[str] = []
         self.alive = True
         self.exit_message = b""
@@ -242,15 +246,117 @@ class Session:
     def _append_output(self, data: bytes) -> None:
         self.scrollback.append(data)
         self.scrollback_bytes += len(data)
-        while self.scrollback_bytes > SCROLLBACK_BUFFER_SIZE and self.scrollback:
-            removed = self.scrollback.popleft()
-            self.scrollback_bytes -= len(removed)
+        self._trim_scrollback_locked()
         for cs in self.clients.values():
             cs.output.extend(data)
         try:
             self._pyte_stream.feed(data.decode("utf-8", errors="replace"))
         except Exception:
             pass
+
+    def _feed_archive(self, data: bytes, cut_kind: str = "unknown") -> None:
+        if not data:
+            return
+        self._archive_total_bytes += len(data)
+        self._last_archive_cut = {"kind": cut_kind, "bytes": len(data)}
+        try:
+            self._archive_pyte_stream.feed(data.decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    def _ansi_safe_cut(self, data: bytes, overflow: int) -> tuple[int, str]:
+        if not data:
+            return 0, "empty"
+        target = min(len(data), overflow + 8192)
+        preferred = (
+            (b"\n", "newline"),
+            (b"\r", "carriage_return"),
+        )
+        for needle, kind in preferred:
+            idx = data.rfind(needle, 0, target)
+            if idx != -1:
+                cut = idx + 1
+                if self._is_escape_boundary_safe(data, cut):
+                    return cut, kind
+        hard = overflow
+        while hard < len(data) and (data[hard] & 0b1100_0000) == 0b1000_0000:
+            hard += 1
+        if hard > len(data):
+            hard = len(data)
+        while hard > overflow and not self._is_escape_boundary_safe(data, hard):
+            hard -= 1
+        if hard > 0:
+            return hard, "hard_safe"
+        return min(len(data), overflow), "hard"
+
+    def _is_escape_boundary_safe(self, data: bytes, cut: int) -> bool:
+        state = "ground"
+        i = 0
+        end = min(max(cut, 0), len(data))
+        while i < end:
+            ch = data[i]
+            if state == "ground":
+                if ch == 0x1B:
+                    state = "esc"
+                elif ch == 0x9B:
+                    state = "csi"
+                elif ch == 0x9D:
+                    state = "osc"
+                elif ch == 0x90:
+                    state = "dcs"
+                elif ch == 0x98:
+                    state = "sos"
+                elif ch == 0x9E:
+                    state = "pm"
+                elif ch == 0x9F:
+                    state = "apc"
+            elif state == "esc":
+                if ch == ord('['):
+                    state = "csi"
+                elif ch == ord(']'):
+                    state = "osc"
+                elif ch == ord('P'):
+                    state = "dcs"
+                elif ch == ord('X'):
+                    state = "sos"
+                elif ch == ord('^'):
+                    state = "pm"
+                elif ch == ord('_'):
+                    state = "apc"
+                else:
+                    state = "ground"
+            elif state == "csi":
+                if 0x40 <= ch <= 0x7E:
+                    state = "ground"
+            elif state in {"osc", "dcs", "sos", "pm", "apc"}:
+                if ch == 0x07:
+                    state = "ground"
+                elif ch == 0x1B and i + 1 < end and data[i + 1] == ord("\\"):
+                    state = "ground"
+                    i += 1
+            i += 1
+        return state == "ground"
+
+    def _trim_scrollback_locked(self) -> None:
+        while self.scrollback_bytes > SCROLLBACK_BUFFER_SIZE and self.scrollback:
+            removed = self.scrollback.popleft()
+            overflow = self.scrollback_bytes - SCROLLBACK_BUFFER_SIZE
+            if overflow <= 0:
+                self.scrollback.appendleft(removed)
+                return
+            if overflow >= len(removed):
+                self.scrollback_bytes -= len(removed)
+                self._feed_archive(removed, "chunk")
+                continue
+            cut, cut_kind = self._ansi_safe_cut(removed, overflow)
+            archived = removed[:cut]
+            kept = removed[cut:]
+            self.scrollback_bytes -= len(archived)
+            self._feed_archive(archived, cut_kind)
+            if kept:
+                self.scrollback.appendleft(kept)
+            if cut == 0:
+                break
 
     def _read_loop(self) -> None:
         try:
@@ -289,21 +395,43 @@ class Session:
         with self._lock:
             return b"".join(self.scrollback)
 
+    def _render_pyte_screen(self, screen: pyte.HistoryScreen) -> list[str]:
+        lines = []
+        for hist_line in screen.history.top:
+            cols = screen.columns
+            rendered = "".join(
+                hist_line[i].data if i in hist_line else " "
+                for i in range(cols)
+            )
+            lines.append(rendered.rstrip())
+        for row in screen.display:
+            lines.append(row.rstrip())
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
+    def get_archived_text(self) -> str:
+        with self._lock:
+            return "\n".join(self._render_pyte_screen(self._archive_pyte_screen))
+
+    def get_reconnect_debug(self) -> dict[str, object]:
+        with self._lock:
+            archive_lines = self._render_pyte_screen(self._archive_pyte_screen)
+            return {
+                "archive_lines": len(archive_lines),
+                "archive_bytes": self._archive_total_bytes,
+                "recent_bytes": self.scrollback_bytes,
+                "recent_chunks": len(self.scrollback),
+                "last_archive_cut": dict(self._last_archive_cut),
+                "live_lines": len(self._render_pyte_screen(self._pyte_screen)),
+                "cols": self._pyte_screen.columns,
+                "rows": self._pyte_screen.lines,
+            }
+
     def get_terminal_lines(self) -> list[str]:
         """Return rendered lines from pyte: history + current screen."""
         with self._lock:
-            screen = self._pyte_screen
-            lines = []
-            for hist_line in screen.history.top:
-                cols = screen.columns
-                rendered = "".join(
-                    hist_line[i].data if i in hist_line else " "
-                    for i in range(cols)
-                )
-                lines.append(rendered.rstrip())
-            for row in screen.display:
-                lines.append(row.rstrip())
-            return lines
+            return self._render_pyte_screen(self._pyte_screen)
 
     def reset_context_lookback(self, rows: int) -> None:
         """Reset the context watermark to include the last *rows* lines."""
@@ -389,6 +517,7 @@ class Session:
             fcntl.ioctl(self.master, termios.TIOCSWINSZ, winsize)
         with self._lock:
             self._pyte_screen.resize(rows, cols)
+            self._archive_pyte_screen.resize(rows, cols)
 
     def save_upload(self, name: str, content: bytes) -> str:
         os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -530,6 +659,8 @@ class EnvoyService:
                     "cols": session._pyte_screen.columns,
                     "rows": session._pyte_screen.lines,
                     "title": build_title(session.path),
+                    "archive_text": session.get_archived_text(),
+                    "reconnect_debug": session.get_reconnect_debug(),
                     "output": self._encode(session.get_scrollback()),
                     "alive": session.alive,
                     "exit_code": session.exit_code,
@@ -547,6 +678,8 @@ class EnvoyService:
             "client_id": client_id,
             "role": "lead",
             "title": build_title(session.path),
+            "archive_text": session.get_archived_text(),
+            "reconnect_debug": session.get_reconnect_debug(),
             "output": self._encode(session.get_scrollback()),
             "alive": session.alive,
             "exit_code": session.exit_code,

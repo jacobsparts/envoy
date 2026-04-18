@@ -570,6 +570,9 @@ class TerminalTab {
     this.term.loadAddon(this.serialize);
     this.term.open(this.host);
     this.term.attachCustomKeyEventHandler(e => {
+      if (e.key === "AltGraph" && e.code === "CapsLock") {
+        return false;
+      }
       if (e.ctrlKey && e.shiftKey && e.key === "C" && e.type === "keydown") {
         const sel = this.term.getSelection();
         if (sel) copyToClipboard(sel);
@@ -673,10 +676,28 @@ class TerminalTab {
       }
       try { this.term.resize(this.ptySize.cols, this.ptySize.rows); } catch {}
     }
+    if (result.archive_text) {
+      this._suppressInput = true;
+      this.term.write(result.archive_text.replace(/\n/g, "\r\n"));
+    }
     const chunk = base64ToBytes(result.output);
+    if (result.reconnect_debug) {
+      const debug = {
+        sid: result.sid,
+        archiveTextChars: result.archive_text ? result.archive_text.length : 0,
+        rawReplayBytes: chunk.length,
+        ...result.reconnect_debug,
+      };
+      console.info("envoy reconnect debug", debug);
+      this._lastReconnectDebug = debug;
+    } else {
+      this._lastReconnectDebug = null;
+    }
     if (chunk.length) {
       this._suppressInput = true;
       this.term.write(chunk, () => { this._suppressInput = false; });
+    } else if (this._suppressInput) {
+      this._suppressInput = false;
     }
     this.disconnected = false;
     this.disconnectInfo = null;
