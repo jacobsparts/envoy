@@ -584,11 +584,18 @@ class TerminalTab {
     this.updateScrollbackClass();
     this.button = document.createElement("div");
     this.button.className = "tab-item";
+    this.button.draggable = true;
     this.button.innerHTML = `<span class="tab-title"></span><input class="tab-title-input" type="text" spellcheck="false"><button class="tab-close" type="button" title="Close tab">&times;</button>`;
     this.button.querySelector(".tab-title").textContent = this.title;
     this.button.addEventListener("click", () => this.manager.activateTab(this.id));
     const titleSpan = this.button.querySelector(".tab-title");
     const titleInput = this.button.querySelector(".tab-title-input");
+    const startEditing = () => {
+      titleInput.value = this.title;
+      this.button.classList.add("editing");
+      titleInput.focus();
+      titleInput.setSelectionRange(titleInput.value.length, titleInput.value.length);
+    };
     titleSpan.addEventListener("click", e => {
       if (this.manager.activeTab !== this) return;
       const range = document.createRange();
@@ -596,10 +603,62 @@ class TerminalTab {
       const textRect = range.getBoundingClientRect();
       if (e.clientX > textRect.right) return;
       e.stopPropagation();
-      titleInput.value = this.title;
-      this.button.classList.add("editing");
-      titleInput.focus();
-      titleInput.setSelectionRange(titleInput.value.length, titleInput.value.length);
+      startEditing();
+    });
+    let longPressTimer = null;
+    this.button.addEventListener("touchstart", () => {
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        const val = prompt("Rename tab", this.title);
+        if (val === null) return;
+        const newTitle = val.trim() || this.transport.sessionId || `Tab ${this.index}`;
+        this.updateTitle(newTitle);
+        if (this.transport.sessionId) {
+          const basePath = this.transport.basePath || "/envoy";
+          fetch(basePath + "/api/rename_session", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ session_id: this.transport.sessionId, title: val.trim() }),
+          }).catch(() => {});
+        }
+        this.manager.saveTabState();
+      }, 500);
+    });
+    this.button.addEventListener("touchend", () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } });
+    this.button.addEventListener("touchmove", () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } });
+    this.button.addEventListener("dragstart", e => {
+      this.manager._dragTab = this;
+      this.button.classList.add("dragging");
+      e.dataTransfer.effectAllowed = "move";
+    });
+    this.button.addEventListener("dragend", () => {
+      this.button.classList.remove("dragging");
+      this.manager._dragTab = null;
+      for (const el of this.manager.elements.tabs.children) {
+        el.classList.remove("drag-over-left", "drag-over-right");
+      }
+    });
+    this.button.addEventListener("dragover", e => {
+      if (!this.manager._dragTab || this.manager._dragTab === this) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      const rect = this.button.getBoundingClientRect();
+      const mid = rect.left + rect.width / 2;
+      this.button.classList.toggle("drag-over-left", e.clientX < mid);
+      this.button.classList.toggle("drag-over-right", e.clientX >= mid);
+    });
+    this.button.addEventListener("dragleave", () => {
+      this.button.classList.remove("drag-over-left", "drag-over-right");
+    });
+    this.button.addEventListener("drop", e => {
+      e.preventDefault();
+      this.button.classList.remove("drag-over-left", "drag-over-right");
+      const from = this.manager._dragTab;
+      if (!from || from === this) return;
+      const rect = this.button.getBoundingClientRect();
+      const mid = rect.left + rect.width / 2;
+      const before = e.clientX < mid;
+      this.manager.moveTab(from, this, before);
     });
     const commitTitle = () => {
       this.button.classList.remove("editing");
@@ -934,6 +993,7 @@ class TabManager {
     this.activeTab = null;
     this.nextIndex = 1;
     this.elements = elements;
+    this._dragTab = null;
     this._bc = typeof BroadcastChannel === "function" ? new BroadcastChannel("envoy-tabs") : null;
     if (this._bc) {
       this._bc.onmessage = e => {
@@ -960,6 +1020,22 @@ class TabManager {
         resolve(sids);
       }, 150);
     });
+  }
+
+  moveTab(from, to, before) {
+    const fromIdx = this.tabs.indexOf(from);
+    if (fromIdx < 0) return;
+    this.tabs.splice(fromIdx, 1);
+    let toIdx = this.tabs.indexOf(to);
+    if (!before) toIdx++;
+    this.tabs.splice(toIdx, 0, from);
+    const parent = this.elements.tabs;
+    if (before) {
+      parent.insertBefore(from.button, to.button);
+    } else {
+      parent.insertBefore(from.button, to.button.nextSibling);
+    }
+    this.saveTabState();
   }
 
   saveTabState() {
@@ -1019,6 +1095,13 @@ class TabManager {
     if (this.activeTab) this.activeTab.hide();
     this.activeTab = tab;
     tab.show();
+    const selOv = this.elements.selectOverlay || document.getElementById("select-overlay");
+    if (selOv?.classList.contains("active")) {
+      selOv.classList.remove("active");
+      selOv.innerHTML = "";
+      selOv.style.height = "";
+      for (const x of this.elements.stack.querySelectorAll(".xterm.select-mode")) x.classList.remove("select-mode");
+    }
     this.updateDisconnectOverlay();
     this.renderAgentLog();
     this.syncHash();
@@ -2025,17 +2108,30 @@ function init(baseTransport, config) {
     updateMobileInputBar();
   }
 
+  function eventHasFiles(e) {
+    const types = e.dataTransfer?.types;
+    if (!types) return false;
+    return Array.from(types).includes("Files");
+  }
+
   let dragCount = 0;
   document.addEventListener("dragenter", e => {
+    if (!eventHasFiles(e)) return;
     e.preventDefault();
     if (++dragCount === 1) overlay.classList.add("active");
   });
   document.addEventListener("dragleave", e => {
+    if (!eventHasFiles(e)) return;
     e.preventDefault();
-    if (--dragCount === 0) overlay.classList.remove("active");
+    dragCount = Math.max(0, dragCount - 1);
+    if (dragCount === 0) overlay.classList.remove("active");
   });
-  document.addEventListener("dragover", e => e.preventDefault());
+  document.addEventListener("dragover", e => {
+    if (!eventHasFiles(e)) return;
+    e.preventDefault();
+  });
   document.addEventListener("drop", e => {
+    if (!eventHasFiles(e)) return;
     e.preventDefault();
     dragCount = 0;
     overlay.classList.remove("active");
@@ -2346,11 +2442,20 @@ function init(baseTransport, config) {
         sessionsList.appendChild(item);
       }
       function attachSession(sid, mode) {
-        sessionsModal.classList.remove("active");
         const unused = tab && tab.isNew && !tab.hasInput ? tab : null;
         manager.createTab({ activate: true, sessionId: sid, mode }).then(() => {
           if (unused) manager.closeTab(unused.id).catch(() => {});
-        }).catch(err => showToast(String(err), true));
+          const openSidsNow = new Set(manager.tabs.map(t => t.transport.sessionId).filter(Boolean));
+          const hasUnopenedSessions = sessions.some(s => !openSidsNow.has(s.sid));
+          if (hasUnopenedSessions) {
+            openSessionPicker();
+          } else {
+            sessionsModal.classList.remove("active");
+          }
+        }).catch(err => {
+          sessionsModal.classList.remove("active");
+          showToast(String(err), true);
+        });
       }
     } catch (err) {
       sessionsList.innerHTML = `<p class="sessions-empty">${err.message || err}</p>`;

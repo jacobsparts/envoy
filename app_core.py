@@ -9,6 +9,7 @@ import socket
 import fcntl
 import os
 import pty
+import resource
 import secrets
 import shlex
 import struct
@@ -218,7 +219,10 @@ class Session:
             shell_name = os.path.basename(cmd[0])
             popen_kwargs["executable"] = cmd[0]
             cmd = [f"-{shell_name}"] + cmd[1:]
-        self.proc = subprocess.Popen(cmd, **popen_kwargs)
+        _SESSION_MEM_LIMIT = 4 * 1024 * 1024 * 1024  # 4 GB
+        def _limit_mem():
+            resource.setrlimit(resource.RLIMIT_AS, (_SESSION_MEM_LIMIT, _SESSION_MEM_LIMIT))
+        self.proc = subprocess.Popen(cmd, **popen_kwargs, preexec_fn=_limit_mem)
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0

@@ -107,8 +107,12 @@ input, textarea, #select-overlay, #select-overlay * {
   background: #222;
   color: #ddd;
 }
+.tab-item.drag-over-left { box-shadow: inset 3px 0 0 #4af; }
+.tab-item.drag-over-right { box-shadow: inset -3px 0 0 #4af; }
+.tab-item.dragging { opacity: 0.4; }
 #tab-bar.single { display: none; }
 #terminal-stack {
+  position: relative;
   flex: 1;
   min-height: 0;
   min-width: 0;
@@ -317,7 +321,7 @@ input, textarea, #select-overlay, #select-overlay * {
 
 #select-overlay {
   display: none; position: absolute; inset: 0;
-  overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch;
+  overflow-y: scroll; overflow-x: hidden; -webkit-overflow-scrolling: touch;
   z-index: 15;
   user-select: text; -webkit-user-select: text;
   white-space: pre; margin-bottom: 10px;
