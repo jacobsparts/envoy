@@ -1724,6 +1724,7 @@ function init(baseTransport, config) {
   const spDict = document.getElementById("sp-dict");
   const spCancel = document.getElementById("sp-cancel");
   const spHelp = document.getElementById("sp-help");
+  const spFind = document.getElementById("sp-find");
   const spSessions = document.getElementById("sp-sessions");
   const spSettings = document.getElementById("sp-settings");
   const spLog = document.getElementById("sp-log");
@@ -1737,6 +1738,35 @@ function init(baseTransport, config) {
 
   let pendingSidebarTouchButton = null;
   let sidebarTouchStart = null;
+
+  const MODAL_OPENING_SIDEBAR_BUTTON_IDS = new Set([
+    "sp-help",
+    "sp-sessions",
+    "sp-log",
+    "sp-text",
+    "sp-paste",
+    "sp-settings",
+    "sp-mic",
+  ]);
+
+  function setSidebarButtonsFocusable(focusable) {
+    for (const button of sidePanel.querySelectorAll(".sp-btn")) {
+      button.tabIndex = focusable ? 0 : -1;
+    }
+  }
+
+  function shouldRestoreTerminalFocusAfterSidebarClick(button) {
+    if (!button || button.disabled) return false;
+    return !MODAL_OPENING_SIDEBAR_BUTTON_IDS.has(button.id);
+  }
+
+  function maybeRestoreTerminalFocusAfterSidebarClick(button) {
+    if (!shouldRestoreTerminalFocusAfterSidebarClick(button)) return;
+    requestAnimationFrame(() => {
+      button.blur();
+      if (!hasActiveModal()) focusCurrent();
+    });
+  }
 
   function preserveTerminalFocusFromSidebarPress(e) {
     if (!isMobileClient) return;
@@ -1812,6 +1842,17 @@ function init(baseTransport, config) {
   }
 
   sidePanel.addEventListener("transitionend", syncPanelWidth);
+  setSidebarButtonsFocusable(false);
+  sidePanel.addEventListener("mousedown", e => {
+    const button = e.target.closest(".sp-btn");
+    if (!button) return;
+    e.preventDefault();
+  }, { capture: true });
+  sidePanel.addEventListener("click", e => {
+    const button = e.target.closest(".sp-btn");
+    if (!button) return;
+    maybeRestoreTerminalFocusAfterSidebarClick(button);
+  }, { capture: false });
   sidePanel.addEventListener("contextmenu", e => {
     if (e.target.closest(".sp-btn")) e.preventDefault();
   });
@@ -2151,6 +2192,7 @@ function init(baseTransport, config) {
     if (xtermEl) xtermEl.classList.add("select-mode");
     selectOverlay.scrollTop = selectOverlay.scrollHeight;
     spSel.classList.add("sp-active");
+    if (spFind) spFind.hidden = false;
     setTerminalInputActive(false);
   }
 
@@ -2161,9 +2203,26 @@ function init(baseTransport, config) {
     const xtermEl = currentXtermEl();
     if (xtermEl) xtermEl.classList.remove("select-mode");
     spSel.classList.remove("sp-active");
+    if (spFind) spFind.hidden = true;
     currentTerm()?.scrollToBottom();
     focusCurrent();
     updateMobileInputBar();
+  }
+
+  function triggerSelectModeFind() {
+    if (!selectOverlay.classList.contains("active")) return false;
+    if (window.find) {
+      try {
+        const found = window.find("", false, false, true, false, false, false);
+        if (typeof found === "boolean") return true;
+      } catch {}
+      try {
+        window.find();
+        return true;
+      } catch {}
+    }
+    showToast("Browser find is not available here");
+    return false;
   }
 
   function eventHasFiles(e) {
@@ -2434,6 +2493,11 @@ function init(baseTransport, config) {
   });
 
   spHelp.addEventListener("click", () => helpModal.classList.add("active"));
+  if (spFind) {
+    spFind.addEventListener("click", () => {
+      triggerSelectModeFind();
+    });
+  }
 
   const sessionsList = document.getElementById("sessions-list");
   const sessionsClose = document.getElementById("sessions-close");
@@ -3063,6 +3127,11 @@ function init(baseTransport, config) {
     if (e.key.toLowerCase() === "a" && e.ctrlKey && selectOverlay.classList.contains("active")) {
       e.preventDefault();
       manager.selectAllVisibleTerminal();
+      return;
+    }
+    if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === "f" && selectOverlay.classList.contains("active")) {
+      e.preventDefault();
+      triggerSelectModeFind();
       return;
     }
     if (e.ctrlKey && e.key === "\\") {

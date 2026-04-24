@@ -383,6 +383,10 @@ input, textarea, #select-overlay, #select-overlay * {
   font: 16px 'Source Code Pro', monospace;
   padding: 0; flex-shrink: 0;
 }
+.sp-btn:focus,
+.sp-btn:focus-visible {
+  outline: none;
+}
 .sp-btn:active { background: #333; }
 .sp-btn:disabled { opacity: 0.3; cursor: default; }
 .sp-btn svg { width: 18px; height: 18px; pointer-events: none; }
