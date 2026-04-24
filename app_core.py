@@ -922,44 +922,45 @@ class EnvoyService:
         if session_id:
             with self._lock:
                 session = self._sessions.get(session_id)
-            if session and session.alive:
-                session.cancel_timeout()
-                client_id = secrets.token_hex(8)
-                with session._lock:
-                    if mode == "takeover":
-                        session._push_callbacks.clear()
-                        session.clients.clear()
-                        session.add_client(client_id, "lead")
-                    elif mode == "lead":
-                        # Demote existing lead to follow
-                        for cs in session.clients.values():
-                            if cs.role == "lead":
-                                cs.role = "follow"
-                        session.add_client(client_id, "lead")
-                    elif mode == "follow":
-                        session.add_client(client_id, "follow")
-                    else:
-                        session._push_callbacks.clear()
-                        session.clients.clear()
-                        session.add_client(client_id, "lead")
-                    session._pending_ready.notify_all()
-                role = session.clients[client_id].role
-                resp = {
-                    "sid": session.sid,
-                    "client_id": client_id,
-                    "role": role,
-                    "cols": session._pyte_screen.columns,
-                    "rows": session._pyte_screen.lines,
-                    "title": build_title(session.path),
-                    "archive_text": session.get_archived_text(),
-                    "reconnect_debug": session.get_reconnect_debug(),
-                    "output": self._encode(session.get_scrollback()),
-                    "alive": session.alive,
-                    "exit_code": session.exit_code,
-                }
-                if session.title:
-                    resp["custom_title"] = session.title
-                return resp
+            if not session or not session.alive:
+                raise ValueError("No active session")
+            session.cancel_timeout()
+            client_id = secrets.token_hex(8)
+            with session._lock:
+                if mode == "takeover":
+                    session._push_callbacks.clear()
+                    session.clients.clear()
+                    session.add_client(client_id, "lead")
+                elif mode == "lead":
+                    # Demote existing lead to follow
+                    for cs in session.clients.values():
+                        if cs.role == "lead":
+                            cs.role = "follow"
+                    session.add_client(client_id, "lead")
+                elif mode == "follow":
+                    session.add_client(client_id, "follow")
+                else:
+                    session._push_callbacks.clear()
+                    session.clients.clear()
+                    session.add_client(client_id, "lead")
+                session._pending_ready.notify_all()
+            role = session.clients[client_id].role
+            resp = {
+                "sid": session.sid,
+                "client_id": client_id,
+                "role": role,
+                "cols": session._pyte_screen.columns,
+                "rows": session._pyte_screen.lines,
+                "title": build_title(session.path),
+                "archive_text": session.get_archived_text(),
+                "reconnect_debug": session.get_reconnect_debug(),
+                "output": self._encode(session.get_scrollback()),
+                "alive": session.alive,
+                "exit_code": session.exit_code,
+            }
+            if session.title:
+                resp["custom_title"] = session.title
+            return resp
 
         session = self._new_session(path)
         client_id = secrets.token_hex(8)
