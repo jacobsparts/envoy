@@ -799,13 +799,30 @@ class TerminalTab {
   show() {
     this.pane.classList.add("active");
     this.button.classList.add("active");
-    this.fitTerminal();
+    this.scheduleActivationResize();
     this.focus();
   }
 
   hide() {
     this.pane.classList.remove("active");
     this.button.classList.remove("active");
+    if (this._activationResizeTimer) {
+      clearTimeout(this._activationResizeTimer);
+      this._activationResizeTimer = null;
+    }
+  }
+
+  scheduleActivationResize() {
+    this.fitTerminal();
+    if (this._activationResizeTimer) {
+      clearTimeout(this._activationResizeTimer);
+    }
+    this._activationResizeTimer = setTimeout(() => {
+      this._activationResizeTimer = null;
+      if (this.manager.activeTab === this && !this.closed) {
+        this.fitTerminal();
+      }
+    }, 1000);
   }
 
   fitTerminal() {
@@ -961,6 +978,10 @@ class TerminalTab {
   async close() {
     if (this.closed) return;
     this.closed = true;
+    if (this._activationResizeTimer) {
+      clearTimeout(this._activationResizeTimer);
+      this._activationResizeTimer = null;
+    }
     if (this._autoReconnectTimer) {
       clearTimeout(this._autoReconnectTimer);
       this._autoReconnectTimer = null;
