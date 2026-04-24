@@ -81,10 +81,12 @@ function getEnvoyPath() {
 class PywebviewTransport {
   constructor(api = null) {
     this.api = api;
-    this.pollInFlight = false;
-    this.pollTimer = null;
     this.sessionId = "";
     this.clientId = "";
+    this.closed = false;
+    this._pushCallbackName = "";
+    this._streamCallbacks = null;
+    this._paused = false;
   }
 
   async init() {
@@ -108,37 +110,72 @@ class PywebviewTransport {
     const result = await this.api.connect(existingSessionId || "");
     this.sessionId = result.sid;
     this.clientId = result.client_id || "";
+    this.closed = false;
     return result;
   }
 
-  startReading(onData, onDisconnect, onEvents) {
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    this.pollTimer = setInterval(async () => {
-      if (this.pollInFlight || !this.sessionId) return;
-      this.pollInFlight = true;
-      try {
-        const result = await this.api.read(this.sessionId, this.clientId);
-        if (result.evicted) {
-          onDisconnect({ kind: "evicted" });
-          return;
-        }
-        const chunk = base64ToBytes(result.output);
-        if (chunk.length) onData(chunk);
-        if (result.events && result.events.length) onEvents(result.events);
-        if (!result.alive) onDisconnect({ kind: "exit", exitCode: result.exit_code });
-      } catch (err) {
-        onDisconnect({ kind: "error", error: err });
-      } finally {
-        this.pollInFlight = false;
+  startReading(onData, onDisconnect, onEvents, onPromoted) {
+    this.stopReading();
+    if (!this.sessionId || !this.clientId) return;
+    this.closed = false;
+    this._paused = false;
+    this._streamCallbacks = { onData, onDisconnect, onEvents, onPromoted };
+    this._pushCallbackName = `__envoyPush_${this.clientId}`;
+    const isActive = () => !this.closed && !!this.sessionId && window[this._pushCallbackName];
+    window[this._pushCallbackName] = (jsonStr) => {
+      if (!isActive()) return;
+      const result = JSON.parse(jsonStr);
+      if (result.evicted) {
+        this.closed = true;
+        delete window[this._pushCallbackName];
+        onDisconnect({ kind: "evicted" });
+        return;
       }
-    }, 33);
+      const chunk = base64ToBytes(result.output);
+      if (chunk.length) onData(chunk);
+      if (result.events && result.events.length) onEvents(result.events);
+      if (result.promoted) {
+        if (onPromoted) onPromoted();
+      }
+      if (result.resize && this.onResize) {
+        this.onResize(result.resize.cols, result.resize.rows);
+      }
+      if (!result.alive) {
+        this.closed = true;
+        delete window[this._pushCallbackName];
+        onDisconnect({ kind: "exit", exitCode: result.exit_code });
+      }
+    };
+    this.api.start_push(this.sessionId, this.clientId).catch(err => {
+      if (!isActive()) return;
+      this.closed = true;
+      delete window[this._pushCallbackName];
+      onDisconnect({ kind: "error", error: err });
+    });
   }
 
   stopReading() {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    this.closed = true;
+    const callbackName = this._pushCallbackName;
+    if (callbackName) {
+      delete window[callbackName];
+      this._pushCallbackName = "";
     }
+    if (this.sessionId && this.clientId) {
+      this.api.stop_push(this.sessionId, this.clientId).catch(() => {});
+    }
+  }
+
+  pauseStream() {
+    this._paused = true;
+    this.stopReading();
+  }
+
+  resumeReading() {
+    if (!this._paused || !this._streamCallbacks || !this.sessionId || !this.clientId) return;
+    this._paused = false;
+    const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
+    this.startReading(onData, onDisconnect, onEvents, onPromoted);
   }
 
   async write(data) {

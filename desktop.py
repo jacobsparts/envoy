@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import tempfile
@@ -35,6 +36,29 @@ class DesktopApi:
 
     def read(self, session_id: str, client_id: str = "") -> dict[str, object]:
         return self._service.read(session_id, client_id)
+
+    def start_push(self, session_id: str, client_id: str) -> dict[str, bool]:
+        session = self._service._get_session(session_id)
+
+        def push(payload: dict[str, object]) -> None:
+            if not self.window:
+                return
+            encoded = dict(payload)
+            output = encoded.get("output")
+            if isinstance(output, (bytes, bytearray)):
+                encoded["output"] = self._service._encode(bytes(output))
+            js_arg = json.dumps(json.dumps(encoded, separators=(",", ":")))
+            self.window.evaluate_js(f"window.__envoyPush_{client_id}({js_arg})")
+
+        initial = session.register_push(client_id, push)
+        if initial:
+            push(initial)
+        return {"ok": True}
+
+    def stop_push(self, session_id: str, client_id: str) -> dict[str, bool]:
+        session = self._service._get_session(session_id)
+        session.unregister_push(client_id)
+        return {"ok": True}
 
     def write(self, session_id: str, data_b64: str) -> dict[str, bool]:
         return self._service.write(session_id, data_b64)

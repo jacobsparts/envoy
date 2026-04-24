@@ -17,6 +17,7 @@ import subprocess
 import termios
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pyte
@@ -240,12 +241,73 @@ class Session:
         self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
         self.clients: dict[str, ClientState] = {}
+        self._push_callbacks: dict[str, Callable[[dict[str, object]], None]] = {}
         self.last_seen: float = time.monotonic()
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name=f"pty-{sid}")
         self._reader.start()
+
+    def _drain_client_locked(self, client_id: str) -> dict[str, object] | None:
+        cs = self.clients.get(client_id)
+        if not cs:
+            return None
+        output = bytes(cs.output)
+        cs.output.clear()
+        events = copy.deepcopy(cs.events)
+        cs.events.clear()
+        promoted = cs.promoted
+        cs.promoted = False
+        resize = cs.pending_resize
+        cs.pending_resize = None
+        payload: dict[str, object] = {
+            "output": output,
+            "events": events,
+            "promoted": promoted,
+            "alive": self.alive,
+            "exit_code": self.exit_code,
+        }
+        if resize:
+            payload["resize"] = {"cols": resize[0], "rows": resize[1]}
+        return payload
+
+    def _collect_push_payloads_locked(self) -> list[tuple[Callable[[dict[str, object]], None], dict[str, object]]]:
+        deliveries: list[tuple[Callable[[dict[str, object]], None], dict[str, object]]] = []
+        for client_id, callback in list(self._push_callbacks.items()):
+            payload = self._drain_client_locked(client_id)
+            if payload is None:
+                deliveries.append((callback, {"output": b"", "events": [], "evicted": True, "alive": False, "exit_code": -1}))
+                continue
+            deliveries.append((callback, payload))
+        return deliveries
+
+    def _dispatch_push_payloads(self, deliveries: list[tuple[Callable[[dict[str, object]], None], dict[str, object]]]) -> None:
+        stale_clients: list[str] = []
+        for callback, payload in deliveries:
+            try:
+                callback(payload)
+            except Exception:
+                stale_clients.extend([
+                    client_id for client_id, cb in self._push_callbacks.items()
+                    if cb is callback
+                ])
+        if stale_clients:
+            with self._lock:
+                for client_id in stale_clients:
+                    self._push_callbacks.pop(client_id, None)
+
+    def register_push(self, client_id: str, callback: Callable[[dict[str, object]], None]) -> dict[str, object] | None:
+        with self._lock:
+            if client_id not in self.clients:
+                return {"output": b"", "events": [], "evicted": True, "alive": False, "exit_code": -1}
+            self._push_callbacks[client_id] = callback
+            payload = self._drain_client_locked(client_id)
+        return payload
+
+    def unregister_push(self, client_id: str) -> None:
+        with self._lock:
+            self._push_callbacks.pop(client_id, None)
 
     def _append_output(self, data: bytes) -> None:
         self.scrollback.append(data)
@@ -371,9 +433,12 @@ class Session:
                     break
                 if not data:
                     break
+                deliveries = []
                 with self._lock:
                     self._append_output(data)
                     self._pending_ready.notify_all()
+                    deliveries = self._collect_push_payloads_locked()
+                self._dispatch_push_payloads(deliveries)
         finally:
             rc = self.proc.wait()
             self.exit_code = rc
@@ -384,11 +449,14 @@ class Session:
                 message = f"{hide_cursor}\r\n\x1b[31m[process exited with code {rc}]\x1b[0m\r\n"
             else:
                 message = f"{hide_cursor}\r\n\x1b[31m[process killed by signal {-rc}]\x1b[0m\r\n"
+            deliveries = []
             with self._lock:
                 self.alive = False
                 self.exit_message = message.encode("utf-8")
                 self._append_output(self.exit_message)
                 self._pending_ready.notify_all()
+                deliveries = self._collect_push_payloads_locked()
+            self._dispatch_push_payloads(deliveries)
             self.cancel_timeout()
             try:
                 os.close(self.master)
@@ -444,10 +512,13 @@ class Session:
         self._pyte_known_lines = lines[:start]
 
     def push_agent_event(self, kind: str, text: str) -> None:
+        deliveries = []
         with self._lock:
             for cs in self.clients.values():
                 cs.events.append({"kind": kind, "text": text})
             self._pending_ready.notify_all()
+            deliveries = self._collect_push_payloads_locked()
+        self._dispatch_push_payloads(deliveries)
 
     def add_client(self, client_id: str, role: str) -> ClientState:
         """Add a client under the lock. Caller must hold self._lock."""
@@ -458,7 +529,9 @@ class Session:
 
     def remove_client(self, client_id: str) -> str | None:
         """Remove a client. Returns promoted client_id if a follow was promoted, else None."""
+        deliveries = []
         with self._lock:
+            self._push_callbacks.pop(client_id, None)
             cs = self.clients.pop(client_id, None)
             if not cs:
                 return None
@@ -473,8 +546,15 @@ class Session:
                     oldest.role = "lead"
                     oldest.promoted = True
                     self._pending_ready.notify_all()
-                    return oldest.client_id
-            return None
+                    deliveries = self._collect_push_payloads_locked()
+                    promoted_client_id = oldest.client_id
+                else:
+                    promoted_client_id = None
+            else:
+                promoted_client_id = None
+        if deliveries:
+            self._dispatch_push_payloads(deliveries)
+        return promoted_client_id
 
     def get_lead_client(self) -> ClientState | None:
         """Return the lead client, if any. Caller must hold self._lock or accept races."""
@@ -501,15 +581,12 @@ class Session:
             cs = self.clients.get(client_id)
             if not cs:
                 return b"", [], False, None
-            data = bytes(cs.output)
-            cs.output.clear()
-            events = copy.deepcopy(cs.events)
-            cs.events.clear()
-            promoted = cs.promoted
-            cs.promoted = False
-            resize = cs.pending_resize
-            cs.pending_resize = None
-            return data, events, promoted, resize
+            payload = self._drain_client_locked(client_id)
+            if not payload:
+                return b"", [], False, None
+            resize = payload.get("resize")
+            resize_tuple = None if not resize else (int(resize["cols"]), int(resize["rows"]))
+            return payload["output"], payload["events"], bool(payload["promoted"]), resize_tuple
 
     def write(self, data: bytes) -> None:
         if self.alive:
@@ -562,6 +639,8 @@ class Session:
         cancel = self.voice_cancel
         if cancel:
             cancel.set()
+        with self._lock:
+            self._push_callbacks.clear()
         if self.alive:
             self.proc.terminate()
             try:
@@ -641,6 +720,7 @@ class EnvoyService:
                 client_id = secrets.token_hex(8)
                 with session._lock:
                     if mode == "takeover":
+                        session._push_callbacks.clear()
                         session.clients.clear()
                         session.add_client(client_id, "lead")
                     elif mode == "lead":
@@ -652,6 +732,7 @@ class EnvoyService:
                     elif mode == "follow":
                         session.add_client(client_id, "follow")
                     else:
+                        session._push_callbacks.clear()
                         session.clients.clear()
                         session.add_client(client_id, "lead")
                     session._pending_ready.notify_all()
@@ -703,27 +784,33 @@ class EnvoyService:
             session.cancel_timeout()
         session.last_seen = time.monotonic()
         if client_id and wait_timeout > 0:
-            output, events, _, _ = session.wait_for_client(client_id, wait_timeout)
+            output, events, promoted, resize = session.wait_for_client(client_id, wait_timeout)
         elif client_id:
             with session._lock:
-                cs = session.clients.get(client_id)
-                if not cs:
+                payload = session._drain_client_locked(client_id)
+                if not payload:
                     return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
-                output = bytes(cs.output)
-                cs.output.clear()
-                events = copy.deepcopy(cs.events)
-                cs.events.clear()
+                output = payload["output"]
+                events = payload["events"]
+                promoted = payload["promoted"]
+                resize = payload.get("resize")
         else:
             output = b""
             events = []
+            promoted = False
+            resize = None
         if client_id and client_id not in session.clients:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
-        return {
+        result = {
             "output": self._encode(output),
             "events": events,
+            "promoted": promoted,
             "alive": session.alive,
             "exit_code": session.exit_code,
         }
+        if resize:
+            result["resize"] = resize
+        return result
 
     def write(self, session_id: str, data_b64: str) -> dict[str, bool]:
         session = self._get_session(session_id)
@@ -744,6 +831,8 @@ class EnvoyService:
                 if cs.role == "follow":
                     cs.pending_resize = (cols, rows)
             session._pending_ready.notify_all()
+            deliveries = session._collect_push_payloads_locked()
+        session._dispatch_push_payloads(deliveries)
         return {"ok": True}
 
     def upload_file(self, session_id: str, name: str, data_b64: str) -> dict[str, str]:
