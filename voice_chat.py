@@ -4,7 +4,8 @@ Handles LLM-based voice conversations. Communicates with the terminal
 and user through a *terminal* interface object that must provide:
 
   - get_terminal_context() -> str
-  - run_command(cmd: str)
+  - get_terminal_state() -> dict
+  - execute_action(action_json: str) -> dict
   - send_message(text: str)   # text is spoken to the user as audio
 """
 
@@ -58,8 +59,12 @@ what was said, ask for clarification rather than guessing.
 
 The terminal session is persistent across turns. Programs you start \
 (python, vim, etc.) remain running between exchanges. Check the \
-terminal_output attachment to see the current state before running \
-commands -- do not re-launch programs that are already running.
+terminal_output attachment and tool results before taking another action.
+
+Do not assume the terminal is a bash shell. The session may currently be \
+at a shell prompt, in a Python REPL, inside a debugger, inside a custom CLI \
+app, or in another interactive program. Treat the current mode as unknown \
+until the terminal state or visible output gives clear evidence.
 
 Never claim a command succeeded unless you can verify it from the \
 terminal output. If you cannot see the result, say so.
@@ -67,7 +72,26 @@ terminal output. If you cannot see the result, say so.
 Keep responses brief and conversational -- they will be spoken aloud. \
 Do not use markdown formatting.
 
-You can run terminal commands using the provided tools. \
+You must control the terminal through one structured action at a time \
+using the execute_action tool. The action JSON must contain exactly one \
+object with a type of command, wait, or keypress.
+
+Always call get_terminal_state before deciding whether to send input if the \
+mode is not already obvious from the latest tool result.
+
+Use command actions only when the terminal state indicates an actual shell \
+prompt, not merely any prompt-looking line.
+Use wait actions to wait for prompt return or output settling.
+Use keypress actions for interactive programs, REPLs, debuggers, menus, \
+pagers, or interrupts like CTRL-C.
+
+Prefer wait_for_settle=true and expect_prompt=true for ordinary shell commands.
+Set expect_prompt=false when intentionally entering an interactive program.
+
+If the terminal state says input_mode is not shell, do not send shell \
+commands. Either use keypress, wait, or explain that the session is not \
+currently at a shell prompt.
+
 Your final text response will be spoken aloud to the user."""
 
 
@@ -113,21 +137,16 @@ class VoiceChatAgent(Agent):
         return self.run_loop(max_turns=max_turns)
 
     @Agent.tool
-    def run_command(self, command: str = "Terminal command to execute"):
-        """Run a command in the user's terminal and return the output."""
+    def get_terminal_state(self):
+        """Return the current structured terminal state."""
         self._check_cancelled()
-        self._terminal.run_command(command)
-        time.sleep(0.1)
-        output = self._terminal.read_output()
-        return output if output.strip() else "(no output yet)"
+        return self._terminal.get_terminal_state()
 
     @Agent.tool
-    def wait(self, seconds: float = "Seconds to wait (e.g. for a long-running command)"):
-        """Wait for more terminal output."""
+    def execute_action(self, action_json: str = "JSON object with exactly one action: command, wait, or keypress"):
+        """Execute one structured terminal action and return a structured result."""
         self._check_cancelled()
-        time.sleep(seconds)
-        output = self._terminal.read_output()
-        return output if output.strip() else "(no new output)"
+        return self._terminal.execute_action(action_json)
 
 
 
@@ -165,7 +184,8 @@ def process_voice_message(audio_data, mime_type, terminal, cancel,
     """Process voice audio through the LLM (audio sent directly to model).
 
     Returns reply text.
-    Side-effects: calls terminal.run_command() and terminal.send_message().
+    Side-effects: may call terminal.get_terminal_state(),
+    terminal.execute_action(), and terminal.send_message().
     cancel: threading.Event — set to abort the agent between tool calls.
     """
     require_voice_agent_env()
@@ -189,7 +209,8 @@ def process_text_message(text, terminal, cancel, agent_settings=None):
     """Process a text message through the LLM agent.
 
     Returns reply text.
-    Side-effects: calls terminal.run_command() and terminal.send_message().
+    Side-effects: may call terminal.get_terminal_state(),
+    terminal.execute_action(), and terminal.send_message().
     cancel: threading.Event — set to abort the agent between tool calls.
     """
     require_voice_agent_env()

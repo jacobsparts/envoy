@@ -9,6 +9,7 @@ import socket
 import fcntl
 import os
 import pty
+import re
 import resource
 import secrets
 import shlex
@@ -75,6 +76,8 @@ UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
 SESSION_TIMEOUT = 60 * 60 * 24
+TERMINAL_SETTLE_SECONDS = 0.75
+TERMINAL_POLL_SECONDS = 0.1
 
 
 def _login_env() -> dict[str, str]:
@@ -205,7 +208,15 @@ class Session:
         self.cwd = cwd
         self.title = ""
         self.master, slave = pty.openpty()
-        env = {**(extra_env or {}), **_login_env(), "TERM": "xterm-256color", "UPLOAD_DIR": UPLOAD_DIR}
+        self._prompt_sentinel = f"__ENVOY_PROMPT_{secrets.token_hex(6)}__"
+        env = {
+            **(extra_env or {}),
+            **_login_env(),
+            "TERM": "xterm-256color",
+            "UPLOAD_DIR": UPLOAD_DIR,
+            "ENVOY_PROMPT_SENTINEL": self._prompt_sentinel,
+            "PS1": f"{self._prompt_sentinel} ",
+        }
         popen_kwargs: dict = dict(
             stdin=slave,
             stdout=slave,
@@ -243,6 +254,8 @@ class Session:
         self.clients: dict[str, ClientState] = {}
         self._push_callbacks: dict[str, Callable[[dict[str, object]], None]] = {}
         self.last_seen: float = time.monotonic()
+        self._last_output_at: float = self.last_seen
+        self._last_input_at: float = self.last_seen
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
@@ -310,6 +323,7 @@ class Session:
             self._push_callbacks.pop(client_id, None)
 
     def _append_output(self, data: bytes) -> None:
+        self._last_output_at = time.monotonic()
         self.scrollback.append(data)
         self.scrollback_bytes += len(data)
         self._trim_scrollback_locked()
@@ -590,7 +604,200 @@ class Session:
 
     def write(self, data: bytes) -> None:
         if self.alive:
+            with self._lock:
+                self._last_input_at = time.monotonic()
             os.write(self.master, data)
+
+    def _screen_excerpt_locked(self, lines: list[str], max_lines: int = 20) -> str:
+        excerpt = lines[-max_lines:]
+        return "\n".join(excerpt)
+
+    def _detect_prompt_locked(self, lines: list[str]) -> tuple[bool, str, str]:
+        for line in reversed(lines[-3:]):
+            if self._prompt_sentinel in line:
+                return True, "high", "shell"
+        last_nonempty = next((line for line in reversed(lines) if line.strip()), "")
+        if not last_nonempty:
+            return False, "low", "unknown"
+        if re.match(r"^(>>>|\.\.\.|In \[\d+\]:) ?$", last_nonempty):
+            return True, "high", "python_repl"
+        if re.match(r"^\((Pdb|gdb)\) ?$", last_nonempty):
+            return True, "high", "debugger"
+        if re.match(r"^.{0,200}[#$%>] ?$", last_nonempty):
+            return True, "medium", "shell_like"
+        if re.match(r"^\(.+\) .{0,200}[#$] ?$", last_nonempty):
+            return True, "medium", "shell_like"
+        return False, "low", "unknown"
+
+    def _terminal_state_locked(self) -> dict[str, object]:
+        now = time.monotonic()
+        lines = self._render_pyte_screen(self._pyte_screen)
+        prompt_visible, prompt_confidence, prompt_kind = self._detect_prompt_locked(lines)
+        last_output_ms_ago = int(max(0.0, now - self._last_output_at) * 1000)
+        last_input_ms_ago = int(max(0.0, now - self._last_input_at) * 1000)
+        settled = last_output_ms_ago >= int(TERMINAL_SETTLE_SECONDS * 1000)
+        input_mode = "unknown"
+        if prompt_kind == "shell":
+            input_mode = "shell"
+        elif prompt_kind in {"python_repl", "debugger"}:
+            input_mode = prompt_kind
+        elif settled and prompt_visible:
+            input_mode = "shell_like"
+        elif self.alive and settled:
+            input_mode = "interactive"
+        interactive_mode = bool(self.alive and input_mode != "shell")
+        busy = bool(self.alive and not settled)
+        return {
+            "busy": busy,
+            "prompt_visible": prompt_visible,
+            "prompt_confidence": prompt_confidence,
+            "prompt_kind": prompt_kind,
+            "settled": settled,
+            "interactive_mode": interactive_mode,
+            "input_mode": input_mode,
+            "last_output_ms_ago": last_output_ms_ago,
+            "last_input_ms_ago": last_input_ms_ago,
+            "screen_excerpt": self._screen_excerpt_locked(lines),
+            "cursor_row": self._pyte_screen.cursor.y + 1,
+            "cursor_col": self._pyte_screen.cursor.x + 1,
+            "alive": self.alive,
+            "exit_code": self.exit_code,
+        }
+
+    def get_terminal_state(self) -> dict[str, object]:
+        with self._lock:
+            return self._terminal_state_locked()
+
+    def _wait_for_state(self, *, seconds: float = 0.0, wait_for_settle: bool = False,
+                        expect_prompt: bool = False, timeout: float = 30.0) -> tuple[dict[str, object], bool, int]:
+        start = time.monotonic()
+        minimum_deadline = start + max(0.0, seconds)
+        deadline = start + max(0.0, timeout)
+        with self._lock:
+            while True:
+                now = time.monotonic()
+                state = self._terminal_state_locked()
+                minimum_elapsed = now >= minimum_deadline
+                if minimum_elapsed:
+                    if expect_prompt and state["prompt_visible"]:
+                        return state, False, int((now - start) * 1000)
+                    if wait_for_settle and state["settled"] and (not expect_prompt or state["prompt_visible"]):
+                        return state, False, int((now - start) * 1000)
+                    if not expect_prompt and not wait_for_settle:
+                        return state, False, int((now - start) * 1000)
+                if now >= deadline:
+                    return state, True, int((now - start) * 1000)
+                next_wake = min(deadline, now + TERMINAL_POLL_SECONDS)
+                if not minimum_elapsed:
+                    next_wake = min(next_wake, minimum_deadline)
+                self._pending_ready.wait(max(0.0, next_wake - now))
+
+    def execute_terminal_action(self, action: dict[str, object]) -> dict[str, object]:
+        action_type = str(action.get("type") or "").strip()
+        wait_for_settle = bool(action.get("wait_for_settle", False))
+        expect_prompt = bool(action.get("expect_prompt", False))
+        timeout = float(action.get("timeout", 30) or 30)
+
+        if not action_type:
+            return {"ok": False, "error": "invalid_action", "message": "Missing action type", "state": self.get_terminal_state()}
+        if not self.alive and action_type != "wait":
+            return {"type": f"{action_type}_result", "ok": False, "error": "session_not_alive", "state": self.get_terminal_state()}
+
+        initial_state = self.get_terminal_state()
+        if action_type == "command":
+            command = str(action.get("command") or "")
+            if not command:
+                return {"type": "command_result", "ok": False, "error": "invalid_command", "state": initial_state}
+            if (
+                initial_state["busy"]
+                or not initial_state["prompt_visible"]
+                or initial_state["input_mode"] != "shell"
+            ):
+                return {
+                    "type": "command_result",
+                    "ok": False,
+                    "error": "not_input_safe",
+                    "message": "Terminal is not in a confirmed shell prompt state",
+                    "state": initial_state,
+                }
+            self.write((command + "\n").encode("utf-8"))
+            state, timed_out, duration_ms = self._wait_for_state(
+                wait_for_settle=wait_for_settle,
+                expect_prompt=expect_prompt,
+                timeout=timeout,
+            )
+            return {
+                "type": "command_result",
+                "ok": not timed_out,
+                "timed_out": timed_out,
+                "prompt_seen": bool(state["prompt_visible"]),
+                "settled": bool(state["settled"]),
+                "duration_ms": duration_ms,
+                "output_excerpt": state["screen_excerpt"],
+                "state": state,
+            }
+
+        if action_type == "wait":
+            seconds = float(action.get("seconds", 0) or 0)
+            state, timed_out, duration_ms = self._wait_for_state(
+                seconds=seconds,
+                wait_for_settle=wait_for_settle,
+                expect_prompt=expect_prompt,
+                timeout=timeout,
+            )
+            return {
+                "type": "wait_result",
+                "ok": not timed_out,
+                "timed_out": timed_out,
+                "duration_ms": duration_ms,
+                "prompt_seen": bool(state["prompt_visible"]),
+                "settled": bool(state["settled"]),
+                "output_excerpt": state["screen_excerpt"],
+                "state": state,
+            }
+
+        if action_type == "keypress":
+            keys = action.get("keys")
+            if not isinstance(keys, list) or not keys:
+                return {"type": "keypress_result", "ok": False, "error": "invalid_keys", "state": initial_state}
+            key_map = {
+                "ENTER": b"\r",
+                "TAB": b"\t",
+                "ESC": b"\x1b",
+                "CTRL-C": b"\x03",
+                "CTRL-D": b"\x04",
+                "ARROW_UP": b"\x1b[A",
+                "ARROW_DOWN": b"\x1b[B",
+                "ARROW_RIGHT": b"\x1b[C",
+                "ARROW_LEFT": b"\x1b[D",
+            }
+            payload = bytearray()
+            for key in keys:
+                token = str(key)
+                payload.extend(key_map.get(token, token.encode("utf-8")))
+            self.write(bytes(payload))
+            state, timed_out, duration_ms = self._wait_for_state(
+                wait_for_settle=wait_for_settle,
+                expect_prompt=expect_prompt,
+                timeout=timeout,
+            )
+            return {
+                "type": "keypress_result",
+                "ok": not timed_out,
+                "timed_out": timed_out,
+                "prompt_seen": bool(state["prompt_visible"]),
+                "settled": bool(state["settled"]),
+                "duration_ms": duration_ms,
+                "output_excerpt": state["screen_excerpt"],
+                "state": state,
+            }
+
+        return {
+            "ok": False,
+            "error": "unsupported_action",
+            "message": f"Unsupported action type: {action_type}",
+            "state": initial_state,
+        }
 
     def resize(self, cols: int, rows: int) -> None:
         if self.alive:

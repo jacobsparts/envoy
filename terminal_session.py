@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 
@@ -39,12 +40,17 @@ class SessionTerminal:
     def get_terminal_context(self) -> str:
         return get_terminal_context(self._session)
 
-    def run_command(self, cmd: str) -> None:
-        os.write(self._session.master, (cmd + "\n").encode())
-        self.commands.append(cmd)
+    def get_terminal_state(self) -> dict[str, object]:
+        return self._session.get_terminal_state()
 
-    def read_output(self) -> str:
-        return get_terminal_context(self._session)
+    def execute_action(self, action_json: str = "JSON object with one action: command, wait, or keypress") -> dict[str, object]:
+        if isinstance(action_json, str):
+            action = json.loads(action_json)
+        else:
+            action = action_json
+        result = self._session.execute_terminal_action(action)
+        self.commands.append(action)
+        return result
 
     def send_status(self, text: str) -> None:
         self._session.push_agent_event("status", text)
