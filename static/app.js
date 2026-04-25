@@ -3026,7 +3026,71 @@ function init(baseTransport, config) {
     updateMobileInputBar();
   }
 
-  spPaste.addEventListener("click", () => { if (!pasteEditorOpen) openPasteEditor(); });
+  async function pasteClipboardToTerminal() {
+    const tab = currentTab();
+    if (!tab) return;
+    if (!navigator.clipboard?.readText || !window.isSecureContext) {
+      showToast("Clipboard paste is not available here");
+      return;
+    }
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text) {
+        showToast("Clipboard is empty");
+        return;
+      }
+      await tab.transport.write("\x1b[200~" + text + "\x1b[201~");
+      showToast("Pasted");
+      focusCurrent();
+    } catch (err) {
+      showToast("Paste failed");
+    }
+  }
+
+  let pasteButtonLongPress = null;
+  let pasteButtonLongPressFired = false;
+  spPaste.addEventListener("pointerdown", () => {
+    pasteButtonLongPressFired = false;
+    pasteButtonLongPress = setTimeout(() => {
+      pasteButtonLongPress = null;
+      pasteButtonLongPressFired = true;
+      pasteClipboardToTerminal();
+    }, 500);
+  });
+  spPaste.addEventListener("pointerup", () => {
+    if (pasteButtonLongPress !== null) {
+      clearTimeout(pasteButtonLongPress);
+      pasteButtonLongPress = null;
+    }
+  });
+  spPaste.addEventListener("pointercancel", () => {
+    if (pasteButtonLongPress !== null) {
+      clearTimeout(pasteButtonLongPress);
+      pasteButtonLongPress = null;
+    }
+  });
+  spPaste.addEventListener("pointermove", e => {
+    if (pasteButtonLongPress && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
+      clearTimeout(pasteButtonLongPress);
+      pasteButtonLongPress = null;
+    }
+  });
+  spPaste.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (pasteButtonLongPress !== null) {
+      clearTimeout(pasteButtonLongPress);
+      pasteButtonLongPress = null;
+    }
+    pasteButtonLongPressFired = true;
+    pasteClipboardToTerminal();
+  });
+  spPaste.addEventListener("click", () => {
+    if (pasteButtonLongPressFired) {
+      pasteButtonLongPressFired = false;
+      return;
+    }
+    if (!pasteEditorOpen) openPasteEditor();
+  });
   document.getElementById("paste-editor-submit").addEventListener("click", closePasteEditorWithPaste);
   pasteEditorCancel.addEventListener("click", closePasteEditorCancel);
   pasteEditorModal.addEventListener("click", e => { if (e.target === pasteEditorModal) closePasteEditorCancel(); });
