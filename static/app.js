@@ -3814,6 +3814,21 @@ function init(baseTransport, config) {
   const saved = window.matchMedia('(display-mode: standalone)').matches ? TabManager.loadTabState() : null;
   const hashSid = window.location.hash.slice(1);
 
+  async function createFreshSessionAfterMissingHash(sid) {
+    showToast(`Session not found: ${sid}`);
+    history.replaceState(null, "", window.location.pathname + window.location.search);
+    await manager.createTab({ activate: true });
+  }
+
+  async function createTabFromHashSid(sid, mode = "takeover") {
+    try {
+      return await manager.createTab({ activate: true, sessionId: sid, mode });
+    } catch (err) {
+      await createFreshSessionAfterMissingHash(sid);
+      return null;
+    }
+  }
+
   (async () => {
     const claimed = await manager.getClaimedSids();
     if (saved) {
@@ -3831,7 +3846,7 @@ function init(baseTransport, config) {
     }
     if (!manager.tabs.length) {
       if (hashSid && claimed.has(hashSid)) {
-        await manager.createTab({ activate: true });
+        await createTabFromHashSid(hashSid, "follow");
       } else if (hashSid) {
         // Check if session is already attached before auto-connecting
         try {
@@ -3840,13 +3855,12 @@ function init(baseTransport, config) {
           const sessions = await resp.json();
           const target = sessions.find(s => s.sid === hashSid);
           if (target && target.attached) {
-            await manager.createTab({ activate: true });
-            openSessionPicker();
+            await createTabFromHashSid(hashSid, "lead");
           } else {
-            await manager.createTab({ activate: true, sessionId: hashSid });
+            await createTabFromHashSid(hashSid);
           }
         } catch {
-          await manager.createTab({ activate: true, sessionId: hashSid });
+          await createTabFromHashSid(hashSid);
         }
       } else {
         await manager.createTab({ activate: true });
