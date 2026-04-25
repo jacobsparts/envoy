@@ -328,6 +328,17 @@ input, textarea, #select-overlay, #select-overlay * {
 }
 #select-overlay.active { display: block; }
 #select-overlay pre, #select-overlay div, #select-overlay span { margin: 0; font-family: 'Source Code Pro', monospace !important; font-size: var(--cell-font-size) !important; line-height: var(--cell-height) !important; }
+#select-overlay .select-find-match {
+  background: #665200;
+  color: #fff !important;
+}
+#select-overlay .select-find-match.active {
+  background: #ffcc00;
+  color: #000 !important;
+}
+.sp-btn.find-nav-disabled {
+  opacity: 0.3;
+}
 
 @media (pointer: coarse) {
   .xterm.select-mode .xterm-helper-textarea { display: none; }
@@ -390,6 +401,8 @@ input, textarea, #select-overlay, #select-overlay * {
 .sp-btn:active { background: #333; }
 .sp-btn:disabled { opacity: 0.3; cursor: default; }
 .sp-btn svg { width: 18px; height: 18px; pointer-events: none; }
+.sp-btn .find-icon-clear[hidden],
+.sp-btn .find-icon-search[hidden] { display: none; }
 .sp-group {
   width: 100%;
   border-left: 1px solid darkslategray;

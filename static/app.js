@@ -1448,6 +1448,7 @@ function init(baseTransport, config) {
   }
 
   function focusCurrent() {
+    if (isMobileClient && hasFindQuery()) return;
     currentTab()?.focus();
   }
 
@@ -1471,7 +1472,7 @@ function init(baseTransport, config) {
 
   function updateMobileInputBar() {
     if (!mobileInputBar || !isMobileClient) return;
-    const visible = keyboardVisible && terminalInputActive && !selectOverlay.classList.contains("active") && !hasActiveModal();
+    const visible = keyboardVisible && terminalInputActive && !selectOverlay.classList.contains("active") && !hasActiveModal() && !hasFindQuery();
     mobileInputBar.classList.toggle("active", visible);
     workspace.classList.toggle("with-mobile-input-bar", visible);
     sidePanel.classList.toggle("with-mobile-input-bar", visible);
@@ -1479,6 +1480,7 @@ function init(baseTransport, config) {
   }
 
   function setTerminalInputActive(active) {
+    if (active && isMobileClient && hasFindQuery()) active = false;
     if (terminalInputActive === active) return;
     terminalInputActive = active;
     updateMobileInputBar();
@@ -1724,7 +1726,9 @@ function init(baseTransport, config) {
   const spDict = document.getElementById("sp-dict");
   const spCancel = document.getElementById("sp-cancel");
   const spHelp = document.getElementById("sp-help");
+  const spFindPrev = document.getElementById("sp-find-prev");
   const spFind = document.getElementById("sp-find");
+  const spFindNext = document.getElementById("sp-find-next");
   const spSessions = document.getElementById("sp-sessions");
   const spSettings = document.getElementById("sp-settings");
   const spLog = document.getElementById("sp-log");
@@ -1738,6 +1742,11 @@ function init(baseTransport, config) {
 
   let pendingSidebarTouchButton = null;
   let sidebarTouchStart = null;
+  let findQuery = "";
+  let selectModeFindMatches = [];
+  let selectModeFindIndex = -1;
+  let terminalFindMatches = [];
+  let terminalFindIndex = -1;
 
   const MODAL_OPENING_SIDEBAR_BUTTON_IDS = new Set([
     "sp-help",
@@ -1748,6 +1757,11 @@ function init(baseTransport, config) {
     "sp-settings",
     "sp-mic",
   ]);
+  const NO_REFOCUS_SIDEBAR_BUTTON_IDS = new Set([
+    "sp-find",
+    "sp-find-prev",
+    "sp-find-next",
+  ]);
 
   function setSidebarButtonsFocusable(focusable) {
     for (const button of sidePanel.querySelectorAll(".sp-btn")) {
@@ -1757,6 +1771,7 @@ function init(baseTransport, config) {
 
   function shouldRestoreTerminalFocusAfterSidebarClick(button) {
     if (!button || button.disabled) return false;
+    if (NO_REFOCUS_SIDEBAR_BUTTON_IDS.has(button.id)) return false;
     return !MODAL_OPENING_SIDEBAR_BUTTON_IDS.has(button.id);
   }
 
@@ -1764,8 +1779,30 @@ function init(baseTransport, config) {
     if (!shouldRestoreTerminalFocusAfterSidebarClick(button)) return;
     requestAnimationFrame(() => {
       button.blur();
-      if (!hasActiveModal()) focusCurrent();
+      if (!hasActiveModal() && !(isMobileClient && hasFindQuery())) focusCurrent();
     });
+  }
+
+  function hasFindQuery() {
+    return !!findQuery;
+  }
+
+  function updateFindButtonState() {
+    const enabled = hasFindQuery();
+    const searchIcon = spFind?.querySelector(".find-icon-search");
+    const clearIcon = spFind?.querySelector(".find-icon-clear");
+    if (spFind) {
+      spFind.title = enabled ? "Clear find" : "Find";
+      spFind.setAttribute("aria-label", enabled ? "Clear find" : "Find");
+      spFind.classList.toggle("sp-active", enabled);
+    }
+    if (searchIcon) searchIcon.hidden = enabled;
+    if (clearIcon) clearIcon.hidden = !enabled;
+    for (const button of [spFindPrev, spFindNext]) {
+      if (!button) continue;
+      button.disabled = !enabled;
+      button.classList.toggle("find-nav-disabled", !enabled);
+    }
   }
 
   function preserveTerminalFocusFromSidebarPress(e) {
@@ -1843,6 +1880,7 @@ function init(baseTransport, config) {
 
   sidePanel.addEventListener("transitionend", syncPanelWidth);
   setSidebarButtonsFocusable(false);
+  updateFindButtonState();
   sidePanel.addEventListener("mousedown", e => {
     const button = e.target.closest(".sp-btn");
     if (!button) return;
@@ -2192,37 +2230,249 @@ function init(baseTransport, config) {
     if (xtermEl) xtermEl.classList.add("select-mode");
     selectOverlay.scrollTop = selectOverlay.scrollHeight;
     spSel.classList.add("sp-active");
-    if (spFind) spFind.hidden = false;
     setTerminalInputActive(false);
   }
 
+  function clearSelectModeFindHighlights() {
+    for (const match of selectModeFindMatches) {
+      const parent = match.parentNode;
+      if (!parent) continue;
+      parent.replaceChild(document.createTextNode(match.textContent || ""), match);
+      parent.normalize();
+    }
+    selectModeFindMatches = [];
+    selectModeFindIndex = -1;
+  }
+
+  function clearTerminalFindSelection() {
+    const term = currentTerm();
+    try { term?.clearSelection?.(); } catch {}
+    terminalFindIndex = -1;
+  }
+
+  function clearAllFindState({ keepQuery = false } = {}) {
+    clearSelectModeFindHighlights();
+    clearTerminalFindSelection();
+    terminalFindMatches = [];
+    if (!keepQuery) findQuery = "";
+    if (isMobileClient && !keepQuery) {
+      updateViewportState();
+      updateMobileInputBar();
+    }
+    updateFindButtonState();
+  }
+
+  function setActiveSelectModeFindMatch(index) {
+    if (!selectModeFindMatches.length) {
+      selectModeFindIndex = -1;
+      return false;
+    }
+    const nextIndex = ((index % selectModeFindMatches.length) + selectModeFindMatches.length) % selectModeFindMatches.length;
+    for (let i = 0; i < selectModeFindMatches.length; i++) {
+      selectModeFindMatches[i].classList.toggle("active", i === nextIndex);
+    }
+    selectModeFindIndex = nextIndex;
+    selectModeFindMatches[nextIndex].scrollIntoView({ block: "center", inline: "nearest" });
+    return true;
+  }
+
+  function buildSelectModeFindHighlights(query) {
+    clearSelectModeFindHighlights();
+    if (!query) return 0;
+    const lowerQuery = query.toLocaleLowerCase();
+    const walker = document.createTreeWalker(selectOverlay, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+        if (node.parentElement?.closest(".select-find-match")) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const textNodes = [];
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      textNodes.push(node);
+    }
+    for (const node of textNodes) {
+      const text = node.nodeValue || "";
+      const lowerText = text.toLocaleLowerCase();
+      let searchIndex = 0;
+      let matchIndex = lowerText.indexOf(lowerQuery, searchIndex);
+      if (matchIndex === -1) continue;
+      const fragment = document.createDocumentFragment();
+      while (matchIndex !== -1) {
+        if (matchIndex > searchIndex) {
+          fragment.appendChild(document.createTextNode(text.slice(searchIndex, matchIndex)));
+        }
+        const mark = document.createElement("mark");
+        mark.className = "select-find-match";
+        mark.textContent = text.slice(matchIndex, matchIndex + query.length);
+        fragment.appendChild(mark);
+        selectModeFindMatches.push(mark);
+        searchIndex = matchIndex + query.length;
+        matchIndex = lowerText.indexOf(lowerQuery, searchIndex);
+      }
+      if (searchIndex < text.length) {
+        fragment.appendChild(document.createTextNode(text.slice(searchIndex)));
+      }
+      node.parentNode.replaceChild(fragment, node);
+    }
+    return selectModeFindMatches.length;
+  }
+
+  function buildTerminalFindMatches(query) {
+    terminalFindMatches = [];
+    terminalFindIndex = -1;
+    const term = currentTerm();
+    const buffer = term?.buffer?.active;
+    if (!term || !buffer || !query) return 0;
+    const lowerQuery = query.toLocaleLowerCase();
+    for (let row = 0; row < buffer.length; row++) {
+      const line = buffer.getLine(row);
+      if (!line) continue;
+      const text = line.translateToString(false);
+      const lowerText = text.toLocaleLowerCase();
+      let start = 0;
+      while (true) {
+        const index = lowerText.indexOf(lowerQuery, start);
+        if (index === -1) break;
+        terminalFindMatches.push({ row, column: index, length: query.length });
+        start = index + Math.max(1, query.length);
+      }
+    }
+    return terminalFindMatches.length;
+  }
+
+  function activateTerminalFindMatch(index) {
+    if (!terminalFindMatches.length) {
+      terminalFindIndex = -1;
+      return false;
+    }
+    const term = currentTerm();
+    const buffer = term?.buffer?.active;
+    if (!term || !buffer) return false;
+    const nextIndex = ((index % terminalFindMatches.length) + terminalFindMatches.length) % terminalFindMatches.length;
+    const match = terminalFindMatches[nextIndex];
+    const targetTop = Math.max(0, match.row - Math.floor(term.rows / 2));
+    term.scrollToLine(targetTop);
+    term.clearSelection();
+    term.select(match.column, match.row, match.length);
+    terminalFindIndex = nextIndex;
+    return true;
+  }
+
+  function buildFindMatches(query) {
+    return selectOverlay.classList.contains("active")
+      ? buildSelectModeFindHighlights(query)
+      : buildTerminalFindMatches(query);
+  }
+
+  function activateFindMatch(index) {
+    return selectOverlay.classList.contains("active")
+      ? setActiveSelectModeFindMatch(index)
+      : activateTerminalFindMatch(index);
+  }
+
+  function scheduleInitialTerminalFindActivation(index) {
+    const delays = [0, 40, 120, 250];
+    for (const delay of delays) {
+      setTimeout(() => {
+        activateTerminalFindMatch(index);
+      }, delay);
+    }
+    return true;
+  }
+
+  function getCurrentFindIndex() {
+    return selectOverlay.classList.contains("active") ? selectModeFindIndex : terminalFindIndex;
+  }
+
+  function performFindNavigation(direction) {
+    if (!findQuery) return triggerFindPrompt(direction);
+    const hasMatches = selectOverlay.classList.contains("active")
+      ? selectModeFindMatches.length
+      : terminalFindMatches.length;
+    if (!hasMatches) {
+      const rebuilt = buildFindMatches(findQuery);
+      if (!rebuilt) {
+        showToast(`No matches for "${findQuery}"`);
+        return false;
+      }
+    }
+    const currentIndex = getCurrentFindIndex();
+    const startIndex = currentIndex === -1
+      ? (direction > 0 ? -1 : 0)
+      : currentIndex;
+    return activateFindMatch(startIndex + direction);
+  }
+
+  function triggerFindPrompt(initialDirection = 1) {
+    if (isMobileClient) {
+      setTerminalInputActive(false);
+      try { document.activeElement?.blur?.(); } catch {}
+      updateMobileInputBar();
+    }
+    const query = window.prompt("Find", findQuery);
+    if (query === null) return false;
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      clearAllFindState();
+      return false;
+    }
+    if (normalizedQuery !== findQuery) {
+      clearAllFindState({ keepQuery: true });
+      findQuery = normalizedQuery;
+      const count = buildFindMatches(normalizedQuery);
+      updateFindButtonState();
+      if (!count) {
+        showToast(`No matches for "${normalizedQuery}"`);
+        return false;
+      }
+      showToast(`${count} match${count === 1 ? "" : "es"} for "${normalizedQuery}"`);
+      const inSelectMode = selectOverlay.classList.contains("active");
+      const firstIndex = initialDirection > 0 ? count - 1 : 0;
+      if (inSelectMode) {
+        return activateFindMatch(firstIndex);
+      }
+      if (!isMobileClient) {
+        try { window.getSelection?.()?.removeAllRanges?.(); } catch {}
+        focusCurrent();
+      }
+      return scheduleInitialTerminalFindActivation(firstIndex);
+    }
+    return performFindNavigation(initialDirection);
+  }
+
   function exitSelectMode() {
+    clearSelectModeFindHighlights();
+    selectModeFindIndex = -1;
     selectOverlay.classList.remove("active");
     selectOverlay.innerHTML = "";
     selectOverlay.style.height = "";
     const xtermEl = currentXtermEl();
     if (xtermEl) xtermEl.classList.remove("select-mode");
     spSel.classList.remove("sp-active");
-    if (spFind) spFind.hidden = true;
     currentTerm()?.scrollToBottom();
     focusCurrent();
     updateMobileInputBar();
+    if (findQuery) {
+      buildTerminalFindMatches(findQuery);
+      updateFindButtonState();
+    }
   }
 
-  function triggerSelectModeFind() {
-    if (!selectOverlay.classList.contains("active")) return false;
-    if (window.find) {
-      try {
-        const found = window.find("", false, false, true, false, false, false);
-        if (typeof found === "boolean") return true;
-      } catch {}
-      try {
-        window.find();
-        return true;
-      } catch {}
+  function triggerFind() {
+    if (findQuery) {
+      clearAllFindState();
+      return false;
     }
-    showToast("Browser find is not available here");
-    return false;
+    return triggerFindPrompt(1);
+  }
+
+  function triggerFindPrev() {
+    return performFindNavigation(-1);
+  }
+
+  function triggerFindNext() {
+    return performFindNavigation(1);
   }
 
   function eventHasFiles(e) {
@@ -2493,11 +2743,9 @@ function init(baseTransport, config) {
   });
 
   spHelp.addEventListener("click", () => helpModal.classList.add("active"));
-  if (spFind) {
-    spFind.addEventListener("click", () => {
-      triggerSelectModeFind();
-    });
-  }
+  if (spFindPrev) spFindPrev.addEventListener("click", () => triggerFindPrev());
+  if (spFind) spFind.addEventListener("click", () => triggerFind());
+  if (spFindNext) spFindNext.addEventListener("click", () => triggerFindNext());
 
   const sessionsList = document.getElementById("sessions-list");
   const sessionsClose = document.getElementById("sessions-close");
@@ -2691,6 +2939,8 @@ function init(baseTransport, config) {
     textDictRecorder = null;
     textInputDict.classList.remove("recording", "processing");
     textInputDict.textContent = "Dictate";
+    updateViewportState();
+    updateMobileInputBar();
   }
 
   textInputDict.addEventListener("click", () => {
@@ -2805,6 +3055,8 @@ function init(baseTransport, config) {
     pasteDictRecorder = null;
     pasteEditorDict.classList.remove("recording", "processing");
     pasteEditorDict.textContent = "Dictate";
+    updateViewportState();
+    updateMobileInputBar();
   }
 
   pasteEditorDict.addEventListener("click", () => {
@@ -2989,6 +3241,7 @@ function init(baseTransport, config) {
   function closeAgentSettings() {
     saveAgentSettingsToStorage();
     agentSettingsModal.classList.remove("active");
+    updateViewportState();
     focusCurrent();
     updateMobileInputBar();
   }
@@ -3107,6 +3360,13 @@ function init(baseTransport, config) {
 
   const focusTerminalFromTouch = e => {
     if (!isMobileClient) return;
+    if (hasFindQuery()) {
+      e.preventDefault?.();
+      setTerminalInputActive(false);
+      try { document.activeElement?.blur?.(); } catch {}
+      updateMobileInputBar();
+      return;
+    }
     if (suppressNextTerminalFocus) {
       suppressNextTerminalFocus = false;
       return;
@@ -3127,11 +3387,6 @@ function init(baseTransport, config) {
     if (e.key.toLowerCase() === "a" && e.ctrlKey && selectOverlay.classList.contains("active")) {
       e.preventDefault();
       manager.selectAllVisibleTerminal();
-      return;
-    }
-    if (e.ctrlKey && !e.shiftKey && !e.altKey && !e.metaKey && e.key.toLowerCase() === "f" && selectOverlay.classList.contains("active")) {
-      e.preventDefault();
-      triggerSelectModeFind();
       return;
     }
     if (e.ctrlKey && e.key === "\\") {
