@@ -2749,15 +2749,21 @@ function init(baseTransport, config) {
 
   const sessionsList = document.getElementById("sessions-list");
   const sessionsClose = document.getElementById("sessions-close");
+  const sessionsTakeoverAll = document.getElementById("sessions-takeover-all");
+  let currentSessionPickerSessions = [];
   async function openSessionPicker() {
     sessionsModal.classList.add("active");
     const tab = manager.activeTab;
     sessionsList.innerHTML = '<p class="sessions-empty">Loading...</p>';
+    if (sessionsTakeoverAll) sessionsTakeoverAll.disabled = true;
     try {
       const basePath = baseTransport.basePath || "/envoy";
       const resp = await fetch(basePath + "/api/sessions");
       const sessions = await resp.json();
+      currentSessionPickerSessions = sessions;
       const openSids = new Set(manager.tabs.map(t => t.transport.sessionId).filter(Boolean));
+      const takeoverAllSessions = sessions.filter(s => !openSids.has(s.sid));
+      if (sessionsTakeoverAll) sessionsTakeoverAll.disabled = !takeoverAllSessions.length;
       if (!sessions.length) {
         sessionsList.innerHTML = '<p class="sessions-empty">No active sessions</p>';
         return;
@@ -2839,6 +2845,26 @@ function init(baseTransport, config) {
       spSessions.style.display = "none";
     }
     spSessions.addEventListener("click", () => openSessionPicker());
+  }
+  if (sessionsTakeoverAll) {
+    sessionsTakeoverAll.addEventListener("click", async () => {
+      const sessions = currentSessionPickerSessions;
+      const openSids = new Set(manager.tabs.map(t => t.transport.sessionId).filter(Boolean));
+      const sessionsToTakeOver = sessions.filter(s => !openSids.has(s.sid));
+      if (!sessionsToTakeOver.length) return;
+      sessionsTakeoverAll.disabled = true;
+      try {
+        const unused = manager.activeTab && manager.activeTab.isNew && !manager.activeTab.hasInput ? manager.activeTab : null;
+        for (const s of sessionsToTakeOver) {
+          await manager.createTab({ activate: true, sessionId: s.sid, mode: "takeover" });
+        }
+        if (unused) await manager.closeTab(unused.id).catch(() => {});
+        sessionsModal.classList.remove("active");
+      } catch (err) {
+        sessionsModal.classList.remove("active");
+        showToast(String(err), true);
+      }
+    });
   }
   sessionsNewTab.addEventListener("click", () => {
     sessionsModal.classList.remove("active");
