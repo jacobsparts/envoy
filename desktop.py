@@ -69,6 +69,20 @@ class DesktopApi:
     def upload_file(self, session_id: str, name: str, data_b64: str) -> dict[str, str]:
         return self._service.upload_file(session_id, name, data_b64)
 
+    def resolve_files(self, session_id: str, paths: list[str]) -> dict[str, object]:
+        result = self._service.resolve_files(session_id, paths)
+        for item in result["files"]:
+            item["url"] = ""
+            item["download_url"] = ""
+            if item.get("is_image"):
+                _info, body = self._service.read_file(session_id, str(item["path"]))
+                item["preview_url"] = f"data:{item['mime']};base64,{self._service._encode(body)}"
+        return result
+
+    def read_file(self, session_id: str, path: str) -> dict[str, object]:
+        info, body = self._service.read_file(session_id, path)
+        return {**info, "data": self._service._encode(body)}
+
     def send_text_message(self, session_id: str, text: str,
                           agent_settings: dict | None = None) -> dict[str, object]:
         return self._service.send_text_message(session_id, text, agent_settings)

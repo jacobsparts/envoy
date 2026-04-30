@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import collections
 import copy
+import mimetypes
 import socket
 import fcntl
 import os
@@ -233,7 +234,7 @@ class Session:
             cmd = [f"-{shell_name}"] + cmd[1:]
         _SESSION_MEM_LIMIT = 4 * 1024 * 1024 * 1024  # 4 GB
         def _limit_mem():
-            resource.setrlimit(resource.RLIMIT_AS, (_SESSION_MEM_LIMIT, _SESSION_MEM_LIMIT))
+            resource.setrlimit(resource.RLIMIT_RSS, (_SESSION_MEM_LIMIT, _SESSION_MEM_LIMIT))
         self.proc = subprocess.Popen(cmd, **popen_kwargs, preexec_fn=_limit_mem)
         os.close(slave)
         self.scrollback = collections.deque()
@@ -243,6 +244,7 @@ class Session:
         self._last_archive_cut = {"kind": "init", "bytes": 0}
         self._archive_total_bytes = 0
         self.session_files: list[str] = []
+        self.resolved_files: dict[str, dict[str, object]] = {}
         self.alive = True
         self.exit_message = b""
         self.exit_code: int | None = None
@@ -318,8 +320,10 @@ class Session:
             payload = self._drain_client_locked(client_id)
         return payload
 
-    def unregister_push(self, client_id: str) -> None:
+    def unregister_push(self, client_id: str, callback: Callable[[dict[str, object]], None] | None = None) -> None:
         with self._lock:
+            if callback is not None and self._push_callbacks.get(client_id) is not callback:
+                return
             self._push_callbacks.pop(client_id, None)
 
     def _append_output(self, data: bytes) -> None:
@@ -823,6 +827,91 @@ class Session:
         self.write(("'" + str(path).replace("'", "'\\''") + "' ").encode("utf-8"))
         return str(path)
 
+    def _proc_cwd(self, pid: int) -> str | None:
+        try:
+            return os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return None
+
+    def _foreground_cwds(self) -> list[str]:
+        try:
+            pgid = os.tcgetpgrp(self.master)
+        except OSError:
+            return []
+        result = []
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return result
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+                fields = stat.rsplit(")", 1)[1].split()
+                if len(fields) > 2 and int(fields[2]) == pgid:
+                    cwd = self._proc_cwd(int(entry.name))
+                    if cwd and cwd not in result:
+                        result.append(cwd)
+            except (OSError, ValueError):
+                continue
+        return result
+
+    def _cwd_candidates(self) -> list[str]:
+        result = []
+        for cwd in [*self._foreground_cwds(), self._proc_cwd(self.proc.pid), self.cwd]:
+            if cwd and cwd not in result:
+                result.append(cwd)
+        return result
+
+    def _file_info(self, raw: str, path: str) -> dict[str, object]:
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        info = {
+            "raw": raw,
+            "path": path,
+            "name": os.path.basename(path),
+            "mime": mime,
+            "size": os.path.getsize(path),
+            "is_image": mime.startswith("image/"),
+        }
+        self.resolved_files[raw] = info
+        return info
+
+    def resolve_file(self, raw_path: str) -> dict[str, object] | None:
+        raw = raw_path.strip()
+        if not raw:
+            return None
+        if (raw[0:1] == raw[-1:] and raw[0:1] in {"'", '"'}):
+            raw = raw[1:-1]
+        raw = raw.rstrip(".,;:")
+        original = raw
+        candidates = []
+        if raw.startswith("file://"):
+            raw = raw[7:]
+        if os.path.isabs(raw):
+            candidates.append(raw)
+        elif raw.startswith("~/"):
+            candidates.append(os.path.expanduser(raw))
+        else:
+            for cwd in self._cwd_candidates():
+                candidates.append(os.path.join(cwd, raw))
+        for candidate in candidates:
+            path = os.path.realpath(os.path.expanduser(candidate))
+            if os.path.isfile(path):
+                return self._file_info(original, path)
+        return None
+
+    def resolve_files(self, raw_paths: list[str]) -> list[dict[str, object]]:
+        results = []
+        seen = set()
+        for raw in raw_paths:
+            if raw in seen:
+                continue
+            seen.add(raw)
+            info = self.resolve_file(raw)
+            if info:
+                results.append(info)
+        return results
+
     def start_timeout(self) -> None:
         self.cancel_timeout()
         timer = threading.Timer(SESSION_TIMEOUT, self._timeout_expired)
@@ -1047,6 +1136,25 @@ class EnvoyService:
         session = self._get_session(session_id)
         path = session.save_upload(name, self._decode(data_b64))
         return {"path": path}
+
+    def resolve_files(self, session_id: str, paths: list[str]) -> dict[str, object]:
+        session = self._get_session(session_id)
+        return {"files": session.resolve_files(paths)}
+
+    def read_file(self, session_id: str, path: str) -> tuple[dict[str, object], bytes]:
+        session = self._get_session(session_id)
+        raw = path
+        info = session.resolved_files.get(raw)
+        if not info or info.get("path") != path:
+            if os.path.isfile(path):
+                info = session._file_info(raw, os.path.realpath(path))
+            else:
+                resolved = session.resolve_file(path)
+                if not resolved:
+                    raise ValueError("File not found")
+                info = resolved
+        with open(str(info["path"]), "rb") as handle:
+            return info, handle.read()
 
     def send_text_message(self, session_id: str, text: str,
                           agent_settings: dict | None = None) -> dict[str, object]:

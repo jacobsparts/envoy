@@ -368,6 +368,51 @@ input, textarea, #select-overlay, #select-overlay * {
 #toast.active { display: block; }
 #toast.persistent { display: block; }
 
+#file-tooltip {
+  position: fixed;
+  z-index: 40;
+  max-width: min(360px, 88vw);
+  background: rgba(18,18,18,0.96);
+  border: 1px solid rgba(120, 180, 255, 0.5);
+  border-radius: 6px;
+  padding: 10px;
+  color: #ddd;
+  font: 12px 'Source Code Pro', monospace;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  user-select: text;
+  -webkit-user-select: text;
+}
+#file-tooltip img {
+  display: block;
+  max-width: min(340px, 82vw);
+  max-height: min(280px, 55vh);
+  object-fit: contain;
+  margin-top: 8px;
+  border-radius: 4px;
+}
+.file-tooltip-title {
+  color: #fff;
+  overflow-wrap: anywhere;
+}
+.file-tooltip-meta {
+  margin-top: 4px;
+  color: #999;
+}
+.file-tooltip-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.file-tooltip-actions button {
+  background: #1a3a5c;
+  color: #9cf;
+  border: 1px solid #4af;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font: 12px 'Source Code Pro', monospace;
+  cursor: pointer;
+}
+
 #side-panel {
   position: fixed; top: 0; right: 0;
   width: 50px; height: 100%;

@@ -59,6 +59,42 @@ function copyToClipboardFallback(text) {
   if (active) active.focus();
 }
 
+const FILE_CANDIDATE_EXT = "[A-Za-z0-9][A-Za-z0-9._-]{0,15}";
+const QUOTED_FILE_RE = new RegExp("([\"'])([^\"'\\r\\n]{1,400}\\." + FILE_CANDIDATE_EXT + ")\\1", "g");
+const UNQUOTED_FILE_RE = new RegExp("(?:file://)?(?:~|\\.{1,2}|/)?[A-Za-z0-9_@%+=:,./~\\\\-]*[A-Za-z0-9_@%+=:,/~\\\\-]\\." + FILE_CANDIDATE_EXT, "g");
+const FILE_CHECK_TTL_MS = 60000;
+
+function extractFileCandidates(text) {
+  const out = [];
+  const quotedSpans = [];
+  const add = (raw, index) => {
+    raw = raw.replace(/\\/g, "/").replace(/[),.;:]+$/g, "");
+    if (!raw || raw.length > 400 || !raw.includes(".")) return;
+    out.push({ raw, index });
+  };
+  for (const match of text.matchAll(QUOTED_FILE_RE)) {
+    quotedSpans.push([match.index, match.index + match[0].length]);
+    add(match[2], match.index + 1);
+  }
+  for (const match of text.matchAll(UNQUOTED_FILE_RE)) {
+    if (quotedSpans.some(([start, end]) => match.index >= start && match.index < end)) continue;
+    add(match[0], match.index);
+  }
+  return out;
+}
+
+function fileUrlFor(info, download = false) {
+  if (download && info.download_url) return info.download_url;
+  return info.url || info.download_url || "";
+}
+
+function stripTerminalControls(text) {
+  return text
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\r/g, "\n");
+}
+
 function waitForPywebview() {
   if (window.pywebview && window.pywebview.api) {
     return Promise.resolve(window.pywebview.api);
@@ -204,6 +240,26 @@ class PywebviewTransport {
     await this.api.upload_file(this.sessionId, name, b64data);
   }
 
+  async resolveFiles(paths) {
+    if (!this.sessionId || !paths.length) return { files: [] };
+    return this.api.resolve_files(this.sessionId, paths);
+  }
+
+  async openFile(info, download = false) {
+    const result = await this.api.read_file(this.sessionId, info.path);
+    const bytes = base64ToBytes(result.data);
+    const blob = new Blob([bytes], { type: result.mime || "application/octet-stream" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    if (download) a.download = result.name || "download";
+    a.target = "_blank";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
   async sendTextMessage(text, agentSettings) {
     return this.api.send_text_message(this.sessionId, text, agentSettings || {});
   }
@@ -316,7 +372,7 @@ class BrowserTransport {
     this._streamCallbacks = { onData, onDisconnect, onEvents, onPromoted };
     this.closed = false;
     this._paused = false;
-    this._openStream();
+    BrowserStreamMultiplexer.instance(this.basePath).register(this);
   }
 
   _openStream() {
@@ -368,9 +424,34 @@ class BrowserTransport {
     };
   }
 
+  _handleStreamResult(result) {
+    if (this.closed || this._paused || !this._streamCallbacks) return;
+    const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
+    if (result.evicted) {
+      this.closed = true;
+      onDisconnect({ kind: "evicted" });
+      return;
+    }
+    const chunk = base64ToBytes(result.output);
+    if (chunk.length) onData(chunk);
+    if (result.events && result.events.length) onEvents(result.events);
+    if (result.promoted) {
+      this.role = "lead";
+      if (onPromoted) onPromoted();
+    }
+    if (result.resize && this.onResize) {
+      this.onResize(result.resize.cols, result.resize.rows);
+    }
+    if (!result.alive) {
+      this.closed = true;
+      onDisconnect({ kind: "exit", exitCode: result.exit_code });
+    }
+  }
+
   pauseStream() {
     if (this._paused) return;
     this._paused = true;
+    BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
     if (this.eventSource) {
       const es = this.eventSource;
       this.eventSource = null;
@@ -382,17 +463,12 @@ class BrowserTransport {
     if (this.closed || !this._streamCallbacks || !this.sessionId) return;
     this._paused = false;
     this._visibleAt = performance.now();
-    const es = this.eventSource;
-    if (es && es.readyState === EventSource.OPEN) return;
-    if (es) {
-      this.eventSource = null;
-      try { es.close(); } catch {}
-    }
-    this._openStream();
+    BrowserStreamMultiplexer.instance(this.basePath).register(this);
   }
 
   stopReading() {
     this.closed = true;
+    BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
     if (this.eventSource) {
       this.eventSource.close();
       this.eventSource = null;
@@ -469,6 +545,10 @@ class BrowserTransport {
     });
   }
 
+  waitForStream() {
+    return BrowserStreamMultiplexer.instance(this.basePath).whenConnected();
+  }
+
   async uploadFile(name, b64data) {
     if (!this.sessionId) return;
     await this.requestJson("/api/upload", {
@@ -476,6 +556,20 @@ class BrowserTransport {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ session_id: this.sessionId, name, data: b64data }),
     });
+  }
+
+  async resolveFiles(paths) {
+    if (!this.sessionId || !paths.length) return { files: [] };
+    return this.requestJson("/api/resolve_files", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: this.sessionId, paths }),
+    });
+  }
+
+  async openFile(info, download = false) {
+    const url = fileUrlFor(info, download);
+    if (url) window.open(url, "_blank");
   }
 
   async sendTextMessage(text, agentSettings) {
@@ -562,6 +656,92 @@ class BrowserTransport {
   async closeApp() {}
 }
 
+class BrowserStreamMultiplexer {
+  static _instances = new Map();
+
+  static instance(basePath) {
+    if (!this._instances.has(basePath)) {
+      this._instances.set(basePath, new BrowserStreamMultiplexer(basePath));
+    }
+    return this._instances.get(basePath);
+  }
+
+  constructor(basePath) {
+    this.basePath = basePath;
+    this.transports = new Map();
+    this.eventSource = null;
+    this.reopenTimer = null;
+  }
+
+  keyFor(transport) {
+    return `${transport.sessionId}:${transport.clientId}`;
+  }
+
+  register(transport) {
+    if (!transport.sessionId || !transport.clientId || transport.closed || transport._paused) return;
+    this.transports.set(this.keyFor(transport), transport);
+    this.scheduleOpen();
+  }
+
+  unregister(transport) {
+    this.transports.delete(this.keyFor(transport));
+    this.scheduleOpen();
+  }
+
+  scheduleOpen() {
+    if (this.reopenTimer) clearTimeout(this.reopenTimer);
+    this.reopenTimer = setTimeout(() => {
+      this.reopenTimer = null;
+      this.open();
+    }, 0);
+  }
+
+  open() {
+    if (this.eventSource) {
+      try { this.eventSource.close(); } catch {}
+      this.eventSource = null;
+    }
+    const entries = this.activeEntries();
+    if (!entries.length) return;
+
+    const url = new URL(this.basePath + "/api/stream_all", location.origin);
+    for (const [key] of entries) url.searchParams.append("pair", key);
+    const es = new EventSource(url);
+    this.eventSource = es;
+    this._connectedResolve = null;
+    this._connected = new Promise(r => { this._connectedResolve = r; });
+    es.addEventListener("open", () => { if (this._connectedResolve) { this._connectedResolve(); this._connectedResolve = null; } }, { once: true });
+    const isActive = () => this.eventSource === es;
+    es.onmessage = e => {
+      if (!isActive()) return;
+      const result = JSON.parse(e.data);
+      const key = `${result.session_id}:${result.client_id}`;
+      const transport = this.transports.get(key);
+      if (transport) transport._handleStreamResult(result);
+    };
+    es.onerror = () => {
+      if (!isActive()) return;
+      if (es.readyState === EventSource.CLOSED) {
+        this.eventSource = null;
+        setTimeout(() => this.open(), 1000);
+      }
+    };
+  }
+
+  activeEntries() {
+    return Array.from(this.transports.entries())
+      .filter(([_key, transport]) => !transport.closed && !transport._paused && transport._streamCallbacks);
+  }
+
+  whenConnected(timeout = 5000) {
+    if (!this._connected) return Promise.resolve();
+    return Promise.race([
+      this._connected,
+      new Promise(resolve => setTimeout(resolve, timeout)),
+    ]);
+  }
+}
+
 async function loadTransport() {
   if (window.pywebview && window.pywebview.api) {
     return new PywebviewTransport();
@@ -588,6 +768,11 @@ class TerminalTab {
     this.hasInput = false;
     this.agentLog = [];
     this.liveAgentEvents = [];
+    this.resolvedFiles = new Map();
+    this.checkedFileCandidates = new Map();
+    this.fileScanTail = "";
+    this.fileResolveTimer = null;
+    this.pendingFileCandidates = new Set();
 
     this.pane = document.createElement("div");
     this.pane.className = "terminal-pane";
@@ -606,6 +791,9 @@ class TerminalTab {
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.serialize);
     this.term.open(this.host);
+    this.term.registerLinkProvider({
+      provideLinks: (line, callback) => callback(this.provideFileLinks(line)),
+    });
     this.term.attachCustomKeyEventHandler(e => {
       if (e.key === "AltGraph" && e.code === "CapsLock") {
         return false;
@@ -789,9 +977,12 @@ class TerminalTab {
     } else {
       this._lastReconnectDebug = null;
     }
+    this.resetFileLinks();
+    this.scanTerminalText(result.archive_text || "");
     if (chunk.length) {
       this._suppressInput = true;
       this.term.write(chunk, () => { this._suppressInput = false; });
+      this.scanTerminalBytes(chunk);
     } else if (this._suppressInput) {
       this._suppressInput = false;
     }
@@ -814,11 +1005,99 @@ class TerminalTab {
       }
     };
     this.transport.startReading(
-      data => this.term.write(data),
+      data => this.writeTerminalData(data),
       info => this.handleDisconnect(info),
       events => this.handleAgentEvents(events),
       () => this.handlePromotion(),
     );
+  }
+
+  resetFileLinks() {
+    this.resolvedFiles.clear();
+    this.checkedFileCandidates.clear();
+    this.fileScanTail = "";
+    this.pendingFileCandidates.clear();
+  }
+
+  writeTerminalData(data) {
+    this.term.write(data);
+    this.scanTerminalBytes(data);
+  }
+
+  scanTerminalBytes(bytes) {
+    this.scanTerminalText(new TextDecoder().decode(bytes));
+  }
+
+  scanTerminalText(text) {
+    if (!text) return;
+    const plain = stripTerminalControls(this.fileScanTail + text);
+    this.fileScanTail = plain.slice(-500);
+    const now = Date.now();
+    for (const item of extractFileCandidates(plain)) {
+      const last = this.checkedFileCandidates.get(item.raw);
+      if (last && now - last < FILE_CHECK_TTL_MS) continue;
+      this.checkedFileCandidates.set(item.raw, now);
+      this.pendingFileCandidates.add(item.raw);
+    }
+    if (this.pendingFileCandidates.size && !this.fileResolveTimer) {
+      this.fileResolveTimer = setTimeout(() => this.flushFileCandidates(), 150);
+    }
+  }
+
+  async flushFileCandidates() {
+    this.fileResolveTimer = null;
+    const paths = Array.from(this.pendingFileCandidates);
+    this.pendingFileCandidates.clear();
+    if (!paths.length || this.closed) return;
+    try {
+      const result = await this.transport.resolveFiles(paths);
+      for (const info of result.files || []) {
+        this.resolvedFiles.set(info.raw, info);
+      }
+      if (result.files?.length) this.term.refresh(0, this.term.rows - 1);
+    } catch (err) {
+      console.warn("envoy: file resolution failed", err);
+    }
+  }
+
+  provideFileLinks(line) {
+    const buffer = this.term.buffer.active;
+    const bufLine = buffer.getLine(line - 1);
+    if (!bufLine) return [];
+    const text = bufLine.translateToString(false);
+    return extractFileCandidates(text)
+      .map(item => {
+        const info = this.resolvedFiles.get(item.raw);
+        if (!info) return null;
+        return {
+          text: item.raw,
+          range: {
+            start: { x: item.index + 1, y: line },
+            end: { x: item.index + item.raw.length, y: line },
+          },
+          activate: () => this.openResolvedFile(info, false),
+          hover: event => this.showFilePreview(info, event),
+          leave: () => this.hideFilePreview(),
+        };
+      })
+      .filter(Boolean);
+  }
+
+  openResolvedFile(info, download) {
+    this.hideFilePreview();
+    this.transport.openFile(info, download).catch(err => this.manager.showToast(String(err)));
+  }
+
+  showFilePreview(info, event) {
+    if (!info.is_image) {
+      this.manager.showFileTooltip(info, event, this);
+      return;
+    }
+    this.manager.showFileTooltip(info, event, this);
+  }
+
+  hideFilePreview() {
+    this.manager.hideFileTooltip();
   }
 
   updateRoleIndicator() {
@@ -1215,6 +1494,72 @@ class TabManager {
     if (tab !== this.activeTab) return;
     if (!event || !event.text) return;
     if (this.showToast) this.showToast(event.text, false, true);
+  }
+
+  showFileTooltip(info, event, tab) {
+    this.hideFileTooltip();
+    const el = document.createElement("div");
+    el.id = "file-tooltip";
+    const title = document.createElement("div");
+    title.className = "file-tooltip-title";
+    title.textContent = info.name || info.raw || info.path;
+    el.appendChild(title);
+    const meta = document.createElement("div");
+    meta.className = "file-tooltip-meta";
+    meta.textContent = `${info.mime || "file"} · ${this.formatBytes(info.size || 0)}`;
+    el.appendChild(meta);
+    if (info.is_image) {
+      const img = document.createElement("img");
+      img.src = info.preview_url || fileUrlFor(info);
+      img.alt = info.name || "image preview";
+      el.appendChild(img);
+    }
+    const actions = document.createElement("div");
+    actions.className = "file-tooltip-actions";
+    const open = document.createElement("button");
+    open.type = "button";
+    const canDownload = !!info.download_url;
+    open.textContent = info.is_image || !canDownload ? "Open" : "Download";
+    open.addEventListener("click", e => {
+      e.stopPropagation();
+      tab.openResolvedFile(info, !info.is_image && canDownload);
+    });
+    actions.appendChild(open);
+    if (info.is_image && canDownload) {
+      const download = document.createElement("button");
+      download.type = "button";
+      download.textContent = "Download";
+      download.addEventListener("click", e => {
+        e.stopPropagation();
+        tab.openResolvedFile(info, true);
+      });
+      actions.appendChild(download);
+    }
+    el.appendChild(actions);
+    document.body.appendChild(el);
+    const rect = el.getBoundingClientRect();
+    const x = Math.min(window.innerWidth - rect.width - 8, Math.max(8, event.clientX + 12));
+    const y = Math.min(window.innerHeight - rect.height - 8, Math.max(8, event.clientY + 12));
+    el.style.left = `${x}px`;
+    el.style.top = `${y}px`;
+    this.fileTooltip = el;
+  }
+
+  hideFileTooltip() {
+    this.fileTooltip?.remove();
+    this.fileTooltip = null;
+  }
+
+  formatBytes(size) {
+    if (!size) return "0 B";
+    const units = ["B", "KB", "MB", "GB"];
+    let value = size;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
   }
 
   async closeTab(id) {
@@ -2530,11 +2875,12 @@ function init(baseTransport, config) {
   fileInput.addEventListener("change", () => {
     const tab = currentTab();
     if (!tab || !fileInput.files.length) return;
+    const wait = tab.transport.waitForStream ? tab.transport.waitForStream() : Promise.resolve();
     for (const file of fileInput.files) {
       const reader = new FileReader();
       reader.onload = () => {
         const b64 = reader.result.split(",")[1];
-        tab.transport.uploadFile(file.name, b64).catch(err => showToast(String(err)));
+        wait.then(() => tab.transport.uploadFile(file.name, b64)).catch(err => showToast(String(err)));
       };
       reader.readAsDataURL(file);
     }

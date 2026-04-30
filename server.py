@@ -12,7 +12,7 @@ import threading
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, render_html
 
@@ -67,6 +67,11 @@ def read_json_body(handler: SimpleHTTPRequestHandler) -> dict[str, object]:
     if not data:
         return {}
     return json.loads(data)
+
+
+def content_disposition(kind: str, filename: str) -> str:
+    safe = filename.replace("\\", "_").replace('"', '\\"')
+    return f'{kind}; filename="{safe}"; filename*=UTF-8\'\'{quote(filename)}'
 
 
 def make_handler():
@@ -167,8 +172,119 @@ def make_handler():
                     pass
                 return
 
+            if parsed.path == f"{WEB_PREFIX}/api/stream_all":
+                qs = parse_qs(parsed.query)
+                pairs = []
+                for raw_pair in qs.get("pair", []):
+                    if ":" not in raw_pair:
+                        continue
+                    session_id, client_id = raw_pair.split(":", 1)
+                    if session_id and client_id:
+                        pairs.append((session_id, client_id))
+                if not pairs:
+                    self.send_error(400)
+                    return
+
+                queue: list[tuple[str, str, dict[str, object]]] = []
+                ready = threading.Condition()
+                registrations: list[tuple[object, str, object]] = []
+
+                def enqueue(session_id: str, client_id: str, payload: dict[str, object]) -> None:
+                    with ready:
+                        queue.append((session_id, client_id, payload))
+                        ready.notify()
+
+                with service._lock:
+                    sessions = {sid: service._sessions.get(sid) for sid, _cid in pairs}
+                missing = [sid for sid, _cid in pairs if sessions.get(sid) is None]
+                if missing:
+                    json_response(self, 404, {"error": "No active session", "session_id": missing[0]})
+                    return
+
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                try:
+                    for session_id, client_id in pairs:
+                        session = sessions[session_id]
+                        if session.alive:
+                            session.cancel_timeout()
+                        session.last_seen = time.monotonic()
+
+                        def callback(payload: dict[str, object], sid=session_id, cid=client_id) -> None:
+                            enqueue(sid, cid, payload)
+
+                        initial = session.register_push(client_id, callback)
+                        registrations.append((session, client_id, callback))
+                        if initial is not None:
+                            enqueue(session_id, client_id, initial)
+
+                    while True:
+                        with ready:
+                            if not queue:
+                                ready.wait(10)
+                            pending = list(queue)
+                            queue.clear()
+                        if not pending:
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            continue
+                        for session_id, client_id, payload in pending:
+                            session = sessions.get(session_id)
+                            if session and session.alive:
+                                session.cancel_timeout()
+                                session.last_seen = time.monotonic()
+                            msg = {
+                                "session_id": session_id,
+                                "client_id": client_id,
+                                "output": service._encode(payload.get("output", b"")),
+                                "events": payload.get("events", []),
+                                "alive": payload.get("alive", False),
+                                "exit_code": payload.get("exit_code"),
+                            }
+                            if payload.get("evicted"):
+                                msg["evicted"] = True
+                            if payload.get("promoted"):
+                                msg["promoted"] = True
+                            if payload.get("resize"):
+                                msg["resize"] = payload["resize"]
+                            line = json.dumps(msg, separators=(",", ":"))
+                            self.wfile.write(f"data: {line}\n\n".encode())
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    for session, client_id, callback in registrations:
+                        session.unregister_push(client_id, callback)
+                return
+
             if parsed.path == f"{WEB_PREFIX}/api/settings":
                 json_response(self, 200, service.get_settings())
+                return
+
+            if parsed.path == f"{WEB_PREFIX}/api/file":
+                qs = parse_qs(parsed.query)
+                session_id = qs.get("session_id", [""])[0]
+                path = qs.get("path", [""])[0]
+                download = qs.get("download", [""])[0] == "1"
+                try:
+                    info, body = service.read_file(session_id, path)
+                except ValueError as exc:
+                    json_response(self, 404, {"error": str(exc)})
+                    return
+                disposition = "attachment" if download or not info.get("is_image") else "inline"
+                self.send_response(200)
+                self.send_header("Content-Type", str(info["mime"]))
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", content_disposition(disposition, str(info["name"])))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
                 return
 
             if not parsed.path.startswith(WEB_PREFIX):
@@ -231,6 +347,22 @@ def make_handler():
                         str(body.get("name") or ""),
                         str(body.get("data") or ""),
                     )
+                    json_response(self, 200, result)
+                    return
+
+                if parsed.path == f"{WEB_PREFIX}/api/resolve_files":
+                    body = read_json_body(self)
+                    raw_paths = body.get("paths") or []
+                    if not isinstance(raw_paths, list):
+                        raw_paths = []
+                    result = service.resolve_files(
+                        str(body.get("session_id") or ""),
+                        [str(path) for path in raw_paths],
+                    )
+                    session_id = str(body.get("session_id") or "")
+                    for item in result["files"]:
+                        item["url"] = f"{WEB_PREFIX}/api/file?session_id={quote(session_id)}&path={quote(str(item['path']))}"
+                        item["download_url"] = item["url"] + "&download=1"
                     json_response(self, 200, result)
                     return
 
