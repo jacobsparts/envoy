@@ -801,6 +801,7 @@ class TerminalTab {
     this.disconnectInfo = null;
     this.closed = false;
     this.reconnecting = false;
+    this.restoring = false;
     this.hasInput = false;
     this.agentLog = [];
     this.liveAgentEvents = [];
@@ -989,6 +990,7 @@ class TerminalTab {
 
   async connect(existingSessionId = "", mode = "takeover") {
     const result = await this.transport.connect(existingSessionId, mode);
+    this.restoring = true;
     this.isNew = !existingSessionId;
     this.role = result.role || "lead";
     this.ptySize = (result.cols && result.rows) ? { cols: result.cols, rows: result.rows } : null;
@@ -996,21 +998,13 @@ class TerminalTab {
     this.updateRoleIndicator();
     this.updateTitle(result.custom_title || result.sid || this.title);
     this.term.reset();
-    // For follow clients, adopt the PTY's size before writing scrollback
-    if (this.role === "follow" && this.ptySize) {
-      const baseFontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
-      this.term.options.fontSize = baseFontSize;
-      const dims = this.fit.proposeDimensions();
-      if (dims && (dims.cols < this.ptySize.cols || dims.rows < this.ptySize.rows)) {
-        const scale = Math.min(dims.cols / this.ptySize.cols, dims.rows / this.ptySize.rows);
-        this.term.options.fontSize = Math.max(4, Math.floor(baseFontSize * scale));
-      }
+
+    // Reconnect replay is geometry-sensitive: restore at the session PTY size
+    // first, then fit/resize for the local viewport after all replay writes drain.
+    if (this.ptySize) {
       try { this.term.resize(this.ptySize.cols, this.ptySize.rows); } catch {}
     }
-    if (result.archive_text) {
-      this._suppressInput = true;
-      this.term.write(result.archive_text.replace(/\n/g, "\r\n"));
-    }
+
     const chunk = base64ToBytes(result.output);
     if (result.reconnect_debug) {
       const debug = {
@@ -1024,15 +1018,29 @@ class TerminalTab {
     } else {
       this._lastReconnectDebug = null;
     }
+
     this.resetFileLinks();
     this.scanTerminalText(result.archive_text || "");
-    if (chunk.length) {
-      this._suppressInput = true;
-      this.term.write(chunk, () => { this._suppressInput = false; });
-      this.scanTerminalBytes(chunk);
-    } else if (this._suppressInput) {
-      this._suppressInput = false;
-    }
+
+    this._suppressInput = true;
+    await new Promise(resolve => {
+      const writeRaw = () => {
+        if (chunk.length) {
+          this.term.write(chunk, resolve);
+          this.scanTerminalBytes(chunk);
+        } else {
+          resolve();
+        }
+      };
+      if (result.archive_text) {
+        this.term.write(result.archive_text.replace(/\n/g, "\r\n"), writeRaw);
+      } else {
+        writeRaw();
+      }
+    });
+    this._suppressInput = false;
+    this.restoring = false;
+
     this.disconnected = false;
     this.disconnectInfo = null;
     this.reconnecting = false;
@@ -1057,6 +1065,11 @@ class TerminalTab {
       events => this.handleAgentEvents(events),
       () => this.handlePromotion(),
     );
+    if (this.role === "follow") {
+      this.fitFollower();
+    } else {
+      this.fitTerminal();
+    }
   }
 
   resetFileLinks() {
@@ -1218,6 +1231,7 @@ class TerminalTab {
   }
 
   fitTerminal() {
+    if (this.restoring) return;
     if (!this.host.offsetWidth || !this.host.offsetHeight) return;
     try {
       this.term._core?._charSizeService?.measure();
