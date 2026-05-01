@@ -16,6 +16,12 @@ log = logging.getLogger("agent")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
+class AgentMaxTurnsError(RuntimeError):
+    def __init__(self, max_turns: int) -> None:
+        self.max_turns = max_turns
+        super().__init__(f"Agent exceeded max turns ({max_turns})")
+
+
 class Agent:
     model = "gemini-2.5-flash"
     system = ""
@@ -92,7 +98,8 @@ class Agent:
             if self._response_text is not None:
                 return self._response_text
             return text
-        raise RuntimeError("Agent exceeded max turns")
+        raise AgentMaxTurnsError(max_turns)
+
 
     def _generate(self) -> dict[str, Any]:
         api_key = os.environ["GOOGLE_API_KEY"]

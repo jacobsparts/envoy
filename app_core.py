@@ -27,6 +27,7 @@ import pyte
 from env_config import get_env_settings, save_env_settings
 from speech import synthesize_speech
 from terminal_session import SessionTerminal
+from agent import AgentMaxTurnsError
 from voice_chat import CancelledError, process_text_message, process_voice_message, transcribe_audio
 
 
@@ -1190,6 +1191,10 @@ class EnvoyService:
                 "commands": iface.commands,
                 "audio": synthesize_speech(speech) if speech else None,
             }
+        except AgentMaxTurnsError as exc:
+            message = f"Agent stopped after reaching the turn limit ({exc.max_turns}). Send another message to continue."
+            session.push_agent_event("status", message)
+            return {"error": message, "turn_limit_reached": True, "response": "", "speech": "", "commands": []}
         except CancelledError:
             return {"response": "", "speech": "", "commands": []}
         finally:
@@ -1217,6 +1222,10 @@ class EnvoyService:
                 "commands": iface.commands,
                 "audio": synthesize_speech(speech) if speech else None,
             }
+        except AgentMaxTurnsError as exc:
+            message = f"Agent stopped after reaching the turn limit ({exc.max_turns}). Send another message to continue."
+            session.push_agent_event("status", message)
+            return {"error": message, "turn_limit_reached": True, "response": "", "speech": "", "commands": []}
         except CancelledError:
             return {"response": "", "speech": "", "commands": []}
         finally:

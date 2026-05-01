@@ -3196,7 +3196,7 @@ function init(baseTransport, config) {
         request.then(data => {
           voiceReset();
           if (data.error) {
-            showToast(data.error);
+            showToast(data.error, false, !!data.turn_limit_reached);
             return;
           }
           if (mode === "dict") {
@@ -3503,7 +3503,7 @@ function init(baseTransport, config) {
       spText.classList.remove("processing");
       textAbort = null;
       if (data.error) {
-        showToast(data.error);
+        showToast(data.error, false, !!data.turn_limit_reached);
         return;
       }
       tab.addAgentLog(data.response, data.commands, text);
