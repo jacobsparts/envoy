@@ -103,6 +103,19 @@
     </div>
   </div>
 </div>
+<div id="file-viewer-modal">
+  <div id="file-viewer-content">
+    <div id="file-viewer-header">
+      <span id="file-viewer-title"></span>
+      <div id="file-viewer-actions">
+        <button id="file-viewer-copy-path" type="button">Copy Path</button>
+        <button id="file-viewer-download" type="button">Download</button>
+        <button id="file-viewer-close" type="button">Close</button>
+      </div>
+    </div>
+    <div id="file-viewer-body"></div>
+  </div>
+</div>
 <div id="settings-modal">
   <div id="settings-content">
     <h2>API Settings</h2>
@@ -118,6 +131,10 @@
     <label class="settings-field" for="settings-inworld">
       <span>Inworld API Key</span>
       <input id="settings-inworld" type="password" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="settings-field" for="settings-upload-link">
+      <span>Upload Link URL</span>
+      <input id="settings-upload-link" type="text" autocomplete="off" spellcheck="false" placeholder="https://example.com/upload?session_id=">
     </label>
     <div id="settings-status"></div>
     <div id="settings-actions">

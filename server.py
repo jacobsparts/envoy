@@ -277,7 +277,7 @@ def make_handler():
                 except ValueError as exc:
                     json_response(self, 404, {"error": str(exc)})
                     return
-                disposition = "attachment" if download or not info.get("is_image") else "inline"
+                disposition = "attachment" if download or not info.get("is_previewable") else "inline"
                 self.send_response(200)
                 self.send_header("Content-Type", str(info["mime"]))
                 self.send_header("Content-Length", str(len(body)))
@@ -347,6 +347,20 @@ def make_handler():
                         str(body.get("name") or ""),
                         str(body.get("data") or ""),
                     )
+                    json_response(self, 200, result)
+                    return
+
+                if parsed.path == f"{WEB_PREFIX}/api/upload_file":
+                    qs = parse_qs(urlparse(self.path).query)
+                    session_id = qs.get("session_id", [""])[0]
+                    filename = qs.get("filename", [""])[0]
+                    if not session_id or not filename:
+                        json_response(self, 400, {"error": "session_id and filename are required"})
+                        return
+                    length = int(self.headers.get("Content-Length", "0"))
+                    file_data = self.rfile.read(length) if length > 0 else b""
+                    data_b64 = service._encode(file_data)
+                    result = service.upload_file(session_id, filename, data_b64)
                     json_response(self, 200, result)
                     return
 

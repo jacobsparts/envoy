@@ -136,6 +136,16 @@ def sanitize_filename(name: str) -> str:
     return name or "upload"
 
 
+_TEXT_MIME_PREFIXES = ("text/", "application/json", "application/javascript",
+                       "application/xml", "application/x-yaml", "application/toml",
+                       "application/x-sh", "application/x-python",
+                       "application/sql", "application/csv")
+
+
+def _is_previewable(mime: str) -> bool:
+    return mime.startswith("image/") or any(mime.startswith(p) for p in _TEXT_MIME_PREFIXES)
+
+
 def load_aliases() -> dict[str, str]:
     aliases: dict[str, str] = {}
     if not os.path.isfile(ALIASES_FILE):
@@ -865,13 +875,15 @@ class Session:
 
     def _file_info(self, raw: str, path: str) -> dict[str, object]:
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        is_image = mime.startswith("image/")
         info = {
             "raw": raw,
             "path": path,
             "name": os.path.basename(path),
             "mime": mime,
             "size": os.path.getsize(path),
-            "is_image": mime.startswith("image/"),
+            "is_image": is_image,
+            "is_previewable": _is_previewable(mime),
         }
         self.resolved_files[raw] = info
         return info

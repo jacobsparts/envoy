@@ -69,6 +69,10 @@ CONFIG_KEYS = {
         "label": "Inworld API Key",
         "required_for": ["speech"],
     },
+    "UPLOAD_LINK_URL": {
+        "label": "Upload Link URL",
+        "required_for": [],
+    },
 }
 
 

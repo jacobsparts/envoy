@@ -62,7 +62,8 @@ function copyToClipboardFallback(text) {
 const FILE_CANDIDATE_EXT = "[A-Za-z0-9][A-Za-z0-9._-]{0,15}";
 const QUOTED_FILE_RE = new RegExp("([\"'])([^\"'\\r\\n]{1,400}\\." + FILE_CANDIDATE_EXT + ")\\1", "g");
 const UNQUOTED_FILE_RE = new RegExp("(?:file://)?(?:~|\\.{1,2}|/)?[A-Za-z0-9_@%+=:,./~\\\\-]*[A-Za-z0-9_@%+=:,/~\\\\-]\\." + FILE_CANDIDATE_EXT, "g");
-const FILE_CHECK_TTL_MS = 60000;
+const FILE_CHECK_FAIL_TTL_MS = 1000;
+const URL_RE = /\bhttps?:\/\/[^\s'"<>]+/g;
 
 function extractFileCandidates(text) {
   const out = [];
@@ -79,6 +80,20 @@ function extractFileCandidates(text) {
   for (const match of text.matchAll(UNQUOTED_FILE_RE)) {
     if (quotedSpans.some(([start, end]) => match.index >= start && match.index < end)) continue;
     add(match[0], match.index);
+  }
+  return out;
+}
+
+function trimUrl(raw) {
+  while (/[),.;:!?]$/.test(raw)) raw = raw.slice(0, -1);
+  return raw;
+}
+
+function extractUrlCandidates(text) {
+  const out = [];
+  for (const match of text.matchAll(URL_RE)) {
+    const raw = trimUrl(match[0]);
+    if (raw) out.push({ raw, index: match.index });
   }
   return out;
 }
@@ -258,6 +273,12 @@ class PywebviewTransport {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
+  async readFileText(path) {
+    const result = await this.api.read_file(this.sessionId, path);
+    const bytes = base64ToBytes(result.data);
+    return new TextDecoder().decode(bytes);
   }
 
   async sendTextMessage(text, agentSettings) {
@@ -569,7 +590,22 @@ class BrowserTransport {
 
   async openFile(info, download = false) {
     const url = fileUrlFor(info, download);
-    if (url) window.open(url, "_blank");
+    if (!url) return;
+    if (download) {
+      const iframe = document.createElement("iframe");
+      iframe.style.display = "none";
+      iframe.src = url;
+      document.body.appendChild(iframe);
+      setTimeout(() => iframe.remove(), 60000);
+    } else {
+      window.open(url, "_blank");
+    }
+  }
+
+  async readFileText(path) {
+    const url = fileUrlFor({ url: this.basePath + `/api/file?session_id=${encodeURIComponent(this.sessionId)}&path=${encodeURIComponent(path)}` });
+    const resp = await fetch(url);
+    return resp.text();
   }
 
   async sendTextMessage(text, agentSettings) {
@@ -791,6 +827,9 @@ class TerminalTab {
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.serialize);
     this.term.open(this.host);
+    this.term.registerLinkProvider({
+      provideLinks: (line, callback) => callback(this.provideUrlLinks(line)),
+    });
     this.term.registerLinkProvider({
       provideLinks: (line, callback) => callback(this.provideFileLinks(line)),
     });
@@ -1034,9 +1073,9 @@ class TerminalTab {
     this.fileScanTail = plain.slice(-500);
     const now = Date.now();
     for (const item of extractFileCandidates(plain)) {
-      const last = this.checkedFileCandidates.get(item.raw);
-      if (last && now - last < FILE_CHECK_TTL_MS) continue;
-      this.checkedFileCandidates.set(item.raw, now);
+      if (this.resolvedFiles.has(item.raw)) continue;
+      const lastFail = this.checkedFileCandidates.get(item.raw);
+      if (lastFail && now - lastFail < FILE_CHECK_FAIL_TTL_MS) continue;
       this.pendingFileCandidates.add(item.raw);
     }
     if (this.pendingFileCandidates.size && !this.fileResolveTimer) {
@@ -1051,8 +1090,14 @@ class TerminalTab {
     if (!paths.length || this.closed) return;
     try {
       const result = await this.transport.resolveFiles(paths);
+      const resolved = new Set();
       for (const info of result.files || []) {
         this.resolvedFiles.set(info.raw, info);
+        resolved.add(info.raw);
+      }
+      const now = Date.now();
+      for (const path of paths) {
+        if (!resolved.has(path)) this.checkedFileCandidates.set(path, now);
       }
       if (result.files?.length) this.term.refresh(0, this.term.rows - 1);
     } catch (err) {
@@ -1077,15 +1122,34 @@ class TerminalTab {
           },
           activate: () => this.openResolvedFile(info, false),
           hover: event => this.showFilePreview(info, event),
-          leave: () => this.hideFilePreview(),
+          leave: () => this.scheduleFilePreviewDismiss(),
         };
       })
       .filter(Boolean);
   }
 
+  provideUrlLinks(line) {
+    const buffer = this.term.buffer.active;
+    const bufLine = buffer.getLine(line - 1);
+    if (!bufLine) return [];
+    const text = bufLine.translateToString(false);
+    return extractUrlCandidates(text).map(item => ({
+      text: item.raw,
+      range: {
+        start: { x: item.index + 1, y: line },
+        end: { x: item.index + item.raw.length, y: line },
+      },
+      activate: () => window.open(item.raw, "_blank", "noopener"),
+    }));
+  }
+
   openResolvedFile(info, download) {
     this.hideFilePreview();
-    this.transport.openFile(info, download).catch(err => this.manager.showToast(String(err)));
+    if ((info.is_image || info.is_previewable) && !download) {
+      this.manager.openFileViewer(info, this);
+    } else {
+      this.transport.openFile(info, download).catch(err => this.manager.showToast(String(err)));
+    }
   }
 
   showFilePreview(info, event) {
@@ -1098,6 +1162,10 @@ class TerminalTab {
 
   hideFilePreview() {
     this.manager.hideFileTooltip();
+  }
+
+  scheduleFilePreviewDismiss() {
+    this.manager.scheduleFileTooltipDismiss();
   }
 
   updateRoleIndicator() {
@@ -1496,10 +1564,21 @@ class TabManager {
     if (this.showToast) this.showToast(event.text, false, true);
   }
 
+  copyFilePath(info) {
+    const path = info.path || info.raw || "";
+    if (!path) return;
+    Promise.resolve(copyToClipboard(path))
+      .then(() => this.showToast?.("Path copied"))
+      .catch(() => this.showToast?.("Failed to copy path"))
+      .finally(() => requestAnimationFrame(() => this.activeTab?.focus()));
+  }
+
   showFileTooltip(info, event, tab) {
     this.hideFileTooltip();
     const el = document.createElement("div");
     el.id = "file-tooltip";
+    el.addEventListener("mouseenter", () => this.cancelFileTooltipDismiss());
+    el.addEventListener("mouseleave", () => this.scheduleFileTooltipDismiss());
     const title = document.createElement("div");
     title.className = "file-tooltip-title";
     title.textContent = info.name || info.raw || info.path;
@@ -1510,19 +1589,36 @@ class TabManager {
     el.appendChild(meta);
     if (info.is_image) {
       const img = document.createElement("img");
-      img.src = info.preview_url || fileUrlFor(info);
+      if (info.preview_url) {
+        img.src = info.preview_url;
+      } else {
+        const url = fileUrlFor(info);
+        if (url) {
+          fetch(url).then(r => r.blob()).then(blob => {
+            img.src = URL.createObjectURL(blob);
+          }).catch(() => {});
+        }
+      }
       img.alt = info.name || "image preview";
       el.appendChild(img);
     }
     const actions = document.createElement("div");
     actions.className = "file-tooltip-actions";
+    const copyPath = document.createElement("button");
+    copyPath.type = "button";
+    copyPath.textContent = "Copy Path";
+    copyPath.addEventListener("click", e => {
+      e.stopPropagation();
+      this.copyFilePath(info);
+    });
+    actions.appendChild(copyPath);
     const open = document.createElement("button");
     open.type = "button";
     const canDownload = !!info.download_url;
-    open.textContent = info.is_image || !canDownload ? "Open" : "Download";
+    open.textContent = info.is_previewable || !canDownload ? "Open" : "Download";
     open.addEventListener("click", e => {
       e.stopPropagation();
-      tab.openResolvedFile(info, !info.is_image && canDownload);
+      tab.openResolvedFile(info, !info.is_previewable && canDownload);
     });
     actions.appendChild(open);
     if (info.is_image && canDownload) {
@@ -1546,8 +1642,21 @@ class TabManager {
   }
 
   hideFileTooltip() {
+    this.cancelFileTooltipDismiss();
     this.fileTooltip?.remove();
     this.fileTooltip = null;
+  }
+
+  scheduleFileTooltipDismiss() {
+    this.cancelFileTooltipDismiss();
+    this.fileTooltipDismissTimer = setTimeout(() => this.hideFileTooltip(), 300);
+  }
+
+  cancelFileTooltipDismiss() {
+    if (this.fileTooltipDismissTimer) {
+      clearTimeout(this.fileTooltipDismissTimer);
+      this.fileTooltipDismissTimer = null;
+    }
   }
 
   formatBytes(size) {
@@ -1560,6 +1669,63 @@ class TabManager {
       unit++;
     }
     return `${value.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  }
+
+  openFileViewer(info, tab) {
+    this.hideFileTooltip();
+    const modal = document.getElementById("file-viewer-modal");
+    const title = document.getElementById("file-viewer-title");
+    const body = document.getElementById("file-viewer-body");
+    const downloadBtn = document.getElementById("file-viewer-download");
+    title.textContent = `${info.name || info.raw} — ${info.mime || "file"} · ${this.formatBytes(info.size || 0)}`;
+    body.innerHTML = "";
+    if (info.is_image) {
+      const img = document.createElement("img");
+      if (info.preview_url) {
+        img.src = info.preview_url;
+      } else {
+        const url = fileUrlFor(info);
+        if (url) {
+          fetch(url).then(r => r.blob()).then(blob => {
+            img.src = URL.createObjectURL(blob);
+          }).catch(() => { img.alt = "Failed to load image"; });
+        }
+      }
+      img.alt = info.name || "image";
+      body.appendChild(img);
+    } else {
+      const pre = document.createElement("pre");
+      pre.className = "file-viewer-text";
+      pre.textContent = "Loading...";
+      body.appendChild(pre);
+      this._loadFileText(info, pre);
+    }
+    this._fileViewerInfo = info;
+    this._fileViewerTab = tab;
+    const canDownload = !!info.download_url;
+    downloadBtn.style.display = canDownload ? "" : "none";
+    modal.classList.add("active");
+  }
+
+  async _loadFileText(info, pre) {
+    try {
+      const url = fileUrlFor(info);
+      if (!url) { pre.textContent = "No URL available"; return; }
+      const resp = await fetch(url);
+      const text = await resp.text();
+      pre.textContent = text;
+    } catch (err) {
+      pre.textContent = `Failed to load: ${err}`;
+    }
+  }
+
+  closeFileViewer() {
+    const modal = document.getElementById("file-viewer-modal");
+    modal.classList.remove("active");
+    const body = document.getElementById("file-viewer-body");
+    body.innerHTML = "";
+    this._fileViewerInfo = null;
+    this._fileViewerTab = null;
   }
 
   async closeTab(id) {
@@ -1744,7 +1910,8 @@ function init(baseTransport, config) {
       || textInputModal.classList.contains("active")
       || pasteEditorModal.classList.contains("active")
       || settingsModal.classList.contains("active")
-      || sessionsModal.classList.contains("active");
+      || sessionsModal.classList.contains("active")
+      || document.getElementById("file-viewer-modal")?.classList.contains("active");
   }
 
   document.addEventListener("keydown", () => dismissToast(), { capture: true });
@@ -2871,7 +3038,43 @@ function init(baseTransport, config) {
   fileInput.multiple = true;
   fileInput.style.display = "none";
   document.body.appendChild(fileInput);
-  spUpload.addEventListener("click", () => { fileInput.value = ""; fileInput.click(); });
+  let uploadLongPress = null;
+  let uploadLongPressFired = false;
+  function openUploadLink() {
+    if (!uploadLinkUrl) { showToast("No Upload Link URL configured"); return; }
+    const tab = currentTab();
+    if (!tab || !tab.transport.sessionId) { showToast("No active session"); return; }
+    window.open(uploadLinkUrl + encodeURIComponent(tab.transport.sessionId), "_blank", "noopener");
+  }
+  spUpload.addEventListener("pointerdown", () => {
+    uploadLongPressFired = false;
+    uploadLongPress = setTimeout(() => {
+      uploadLongPress = null;
+      uploadLongPressFired = true;
+      openUploadLink();
+    }, 500);
+  });
+  spUpload.addEventListener("pointerup", () => {
+    if (uploadLongPress !== null) { clearTimeout(uploadLongPress); uploadLongPress = null; }
+  });
+  spUpload.addEventListener("pointercancel", () => {
+    if (uploadLongPress !== null) { clearTimeout(uploadLongPress); uploadLongPress = null; }
+  });
+  spUpload.addEventListener("pointermove", e => {
+    if (uploadLongPress && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
+      clearTimeout(uploadLongPress); uploadLongPress = null;
+    }
+  });
+  spUpload.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (uploadLongPress !== null) { clearTimeout(uploadLongPress); uploadLongPress = null; }
+    uploadLongPressFired = true;
+    openUploadLink();
+  });
+  spUpload.addEventListener("click", () => {
+    if (uploadLongPressFired) return;
+    fileInput.value = ""; fileInput.click();
+  });
   fileInput.addEventListener("change", () => {
     const tab = currentTab();
     if (!tab || !fileInput.files.length) return;
@@ -3190,7 +3393,42 @@ function init(baseTransport, config) {
     if (window.pywebview) {
       spSessions.style.display = "none";
     }
-    spSessions.addEventListener("click", () => openSessionPicker());
+    let sessionsLongPress = null;
+    let sessionsLongPressFired = false;
+    function copySessionId() {
+      const tab = currentTab();
+      if (!tab || !tab.transport.sessionId) { showToast("No active session"); return; }
+      navigator.clipboard.writeText(tab.transport.sessionId).then(() => showToast("Session ID copied")).catch(() => showToast("Failed to copy"));
+    }
+    spSessions.addEventListener("pointerdown", () => {
+      sessionsLongPressFired = false;
+      sessionsLongPress = setTimeout(() => {
+        sessionsLongPress = null;
+        sessionsLongPressFired = true;
+        copySessionId();
+      }, 500);
+    });
+    spSessions.addEventListener("pointerup", () => {
+      if (sessionsLongPress !== null) { clearTimeout(sessionsLongPress); sessionsLongPress = null; }
+    });
+    spSessions.addEventListener("pointercancel", () => {
+      if (sessionsLongPress !== null) { clearTimeout(sessionsLongPress); sessionsLongPress = null; }
+    });
+    spSessions.addEventListener("pointermove", e => {
+      if (sessionsLongPress && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
+        clearTimeout(sessionsLongPress); sessionsLongPress = null;
+      }
+    });
+    spSessions.addEventListener("contextmenu", e => {
+      e.preventDefault();
+      if (sessionsLongPress !== null) { clearTimeout(sessionsLongPress); sessionsLongPress = null; }
+      sessionsLongPressFired = true;
+      copySessionId();
+    });
+    spSessions.addEventListener("click", () => {
+      if (sessionsLongPressFired) return;
+      openSessionPicker();
+    });
   }
   if (sessionsTakeoverAll) {
     sessionsTakeoverAll.addEventListener("click", async () => {
@@ -3549,9 +3787,11 @@ function init(baseTransport, config) {
   const settingsGoogle = document.getElementById("settings-google");
   const settingsGroq = document.getElementById("settings-groq");
   const settingsInworld = document.getElementById("settings-inworld");
+  const settingsUploadLink = document.getElementById("settings-upload-link");
   const settingsSave = document.getElementById("settings-save");
   const settingsClose = document.getElementById("settings-close");
   const settingsStatus = document.getElementById("settings-status");
+  let uploadLinkUrl = "";
 
   function renderSettingsStatus(settings) {
     const missing = [];
@@ -3571,6 +3811,8 @@ function init(baseTransport, config) {
     settingsGoogle.value = settings.GOOGLE_API_KEY?.value || "";
     settingsGroq.value = settings.GROQ_API_KEY?.value || "";
     settingsInworld.value = settings.INWORLD_API_KEY?.value || "";
+    settingsUploadLink.value = settings.UPLOAD_LINK_URL?.value || "";
+    uploadLinkUrl = settings.UPLOAD_LINK_URL?.value || "";
     renderSettingsStatus(settings);
   }
 
@@ -3602,7 +3844,9 @@ function init(baseTransport, config) {
         GOOGLE_API_KEY: settingsGoogle.value,
         GROQ_API_KEY: settingsGroq.value,
         INWORLD_API_KEY: settingsInworld.value,
+        UPLOAD_LINK_URL: settingsUploadLink.value,
       });
+      uploadLinkUrl = settingsUploadLink.value;
       renderSettingsStatus(result.settings);
       showToast("Settings saved");
     } catch (err) {
@@ -3611,7 +3855,34 @@ function init(baseTransport, config) {
     }
   }
 
+  baseTransport.getSettings().then(s => { uploadLinkUrl = s.UPLOAD_LINK_URL?.value || ""; }).catch(() => {});
   spSettings.addEventListener("click", () => openSettings());
+
+  const fileViewerModal = document.getElementById("file-viewer-modal");
+  const fileViewerClose = document.getElementById("file-viewer-close");
+  const fileViewerDownload = document.getElementById("file-viewer-download");
+  const fileViewerCopyPath = document.getElementById("file-viewer-copy-path");
+  fileViewerClose.addEventListener("click", () => manager.closeFileViewer());
+  fileViewerModal.addEventListener("click", e => {
+    if (e.target === fileViewerModal) manager.closeFileViewer();
+  });
+  fileViewerCopyPath.addEventListener("click", () => {
+    const info = manager._fileViewerInfo;
+    if (info) manager.copyFilePath(info);
+  });
+  fileViewerDownload.addEventListener("click", () => {
+    const info = manager._fileViewerInfo;
+    const tab = manager._fileViewerTab;
+    if (info && tab) tab.openResolvedFile(info, true);
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && fileViewerModal.classList.contains("active")) {
+      e.preventDefault();
+      e.stopPropagation();
+      manager.closeFileViewer();
+    }
+  }, { capture: true });
+
   settingsSave.addEventListener("click", () => saveSettings());
   settingsClose.addEventListener("click", () => closeSettings());
   settingsModal.addEventListener("click", e => { if (e.target === settingsModal) closeSettings(); });
