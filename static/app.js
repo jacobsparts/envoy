@@ -843,6 +843,14 @@ class TerminalTab {
         return false;
       }
       if (e.ctrlKey && e.shiftKey && e.key === "V") return false;
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "ArrowLeft" && e.type === "keydown") {
+        this.transport.write("\x1bb").catch(err => this.handleWriteError(err));
+        return false;
+      }
+      if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === "ArrowRight" && e.type === "keydown") {
+        this.transport.write("\x1bf").catch(err => this.handleWriteError(err));
+        return false;
+      }
       return true;
     });
     this.updateScrollbackClass();
