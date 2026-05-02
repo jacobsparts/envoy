@@ -4354,7 +4354,9 @@ function init(baseTransport, config) {
         if (!active || !active.classList?.contains("xterm-helper-textarea")) {
           keyboardVisible = false;
           setTerminalInputActive(false);
-          baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+          if (!hasActiveModal()) {
+            baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+          }
           performLayoutRefresh();
         }
       }, 0);
