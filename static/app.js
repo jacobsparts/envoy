@@ -110,6 +110,15 @@ function stripTerminalControls(text) {
     .replace(/\r/g, "\n");
 }
 
+function formatAgentCommand(action) {
+  if (typeof action === "string") return action;
+  if (!action || typeof action !== "object") return String(action ?? "");
+  if (action.type === "command") return action.command || "";
+  if (action.type === "keypress") return (action.keys || []).join(" ");
+  if (action.type === "wait") return `wait ${action.seconds || 0}s`;
+  return JSON.stringify(action);
+}
+
 function waitForPywebview() {
   if (window.pywebview && window.pywebview.api) {
     return Promise.resolve(window.pywebview.api);
@@ -1571,7 +1580,7 @@ class TabManager {
       html += `<div class="voice-log-time">${entry.time}</div>`;
       if (entry.userMessage) html += `<div class="voice-log-you">${entry.userMessage}</div>`;
       if (entry.commands && entry.commands.length) {
-        html += entry.commands.map(command => `<div class="voice-log-cmd">$ ${command}</div>`).join("");
+        html += entry.commands.map(command => `<div class="voice-log-cmd">$ ${formatAgentCommand(command)}</div>`).join("");
       }
       if (entry.response) html += `<div class="voice-log-agent">${entry.response}</div>`;
       return html + "</div>";
