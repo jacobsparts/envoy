@@ -874,12 +874,28 @@ class Session:
                 result.append(cwd)
         return result
 
+    def _relative_file_path(self, path: str) -> str:
+        path = os.path.realpath(path)
+        candidates = []
+        for cwd in self._cwd_candidates():
+            try:
+                rel = os.path.relpath(path, cwd)
+            except ValueError:
+                continue
+            if rel == ".":
+                continue
+            candidates.append(rel)
+        if not candidates:
+            return os.path.basename(path)
+        return min(candidates, key=lambda rel: (rel.startswith(".."), len(rel), rel))
+
     def _file_info(self, raw: str, path: str) -> dict[str, object]:
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         is_image = mime.startswith("image/")
         info = {
             "raw": raw,
             "path": path,
+            "relative_path": self._relative_file_path(path),
             "name": os.path.basename(path),
             "mime": mime,
             "size": os.path.getsize(path),

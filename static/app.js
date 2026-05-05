@@ -1596,7 +1596,7 @@ class TabManager {
   }
 
   copyFilePath(info) {
-    const path = info.path || info.raw || "";
+    const path = info.relative_path || info.raw || info.path || "";
     if (!path) return;
     Promise.resolve(copyToClipboard(path))
       .then(() => this.showToast?.("Path copied"))
