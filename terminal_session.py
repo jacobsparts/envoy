@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import json
-import os
+
+
+def _loads_action_json(action_json: str) -> dict[str, object]:
+    try:
+        return json.loads(action_json)
+    except json.JSONDecodeError:
+        return json.loads(action_json.replace("\\x", "\\\\x").replace("\\U", "\\\\U"))
+
 
 
 def get_terminal_context(session) -> str:
@@ -43,9 +50,9 @@ class SessionTerminal:
     def get_terminal_state(self) -> dict[str, object]:
         return self._session.get_terminal_state()
 
-    def execute_action(self, action_json: str = "JSON object with one action: command, wait, or keypress") -> dict[str, object]:
+    def execute_action(self, action_json: str = 'JSON object with exactly one action: {"type":"input","input":"ls -la\\\\r","expect_prompt":"$"} or {"type":"wait"}. For input, ordinary text is UTF-8 encoded and backslash escapes are decoded: \\\\r Enter, \\\\x03 Ctrl-C, \\\\x04 Ctrl-D, \\\\x15 Ctrl-U, \\\\x7f Backspace, \\\\t Tab, \\\\x1b[A arrow up. wait_for_settle is optional and defaults to 0.75 seconds for input actions; set it to a number of seconds to override or false to return immediately. expect_prompt is an optional string expected to appear in the prompt, e.g. "$" for bash, ">>>" for Python.'):
         if isinstance(action_json, str):
-            action = json.loads(action_json)
+            action = _loads_action_json(action_json)
         else:
             action = action_json
         result = self._session.execute_terminal_action(action)

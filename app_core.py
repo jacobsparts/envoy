@@ -80,6 +80,7 @@ SCROLLBACK_BUFFER_SIZE = 100_000
 SESSION_TIMEOUT = 60 * 60 * 24
 TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
+DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
 
 
 def _login_env() -> dict[str, str]:
@@ -683,23 +684,92 @@ class Session:
         with self._lock:
             return self._terminal_state_locked()
 
-    def _wait_for_state(self, *, seconds: float = 0.0, wait_for_settle: bool = False,
-                        expect_prompt: bool = False, timeout: float = 30.0) -> tuple[dict[str, object], bool, int]:
+    def _prompt_matches_locked(self, expected_prompt: object, state: dict[str, object]) -> bool:
+        if expected_prompt is None or expected_prompt is False or expected_prompt == "":
+            return True
+        if expected_prompt is True:
+            return bool(state["prompt_visible"])
+        expected = str(expected_prompt)
+        lines = self._render_pyte_screen(self._pyte_screen)
+        last_nonempty = next((line for line in reversed(lines) if line.strip()), "")
+        if expected in last_nonempty:
+            return True
+        if expected in {"$", "#", "$ or #", "# or $"}:
+            return bool(state["prompt_visible"]) and state["prompt_kind"] in {"shell", "shell_like"}
+        return False
+
+    def _decode_terminal_input(self, value: str) -> bytes:
+        data = bytearray()
+        i = 0
+        named = {
+            "n": b"\n",
+            "r": b"\r",
+            "t": b"\t",
+            "b": b"\b",
+            "f": b"\f",
+            "v": b"\v",
+            "a": b"\a",
+            "\\": b"\\",
+            '"': b'"',
+            "'": b"'",
+        }
+        while i < len(value):
+            ch = value[i]
+            if ch != "\\":
+                data.extend(ch.encode("utf-8"))
+                i += 1
+                continue
+            if i + 1 >= len(value):
+                raise ValueError("Trailing backslash in input")
+            esc = value[i + 1]
+            if esc in named:
+                data.extend(named[esc])
+                i += 2
+            elif esc == "x":
+                hex_digits = value[i + 2:i + 4]
+                if len(hex_digits) != 2 or not re.fullmatch(r"[0-9a-fA-F]{2}", hex_digits):
+                    raise ValueError("Invalid \\xHH escape in input")
+                data.append(int(hex_digits, 16))
+                i += 4
+            elif esc == "u":
+                hex_digits = value[i + 2:i + 6]
+                if len(hex_digits) != 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", hex_digits):
+                    raise ValueError("Invalid \\uHHHH escape in input")
+                data.extend(chr(int(hex_digits, 16)).encode("utf-8"))
+                i += 6
+            elif esc == "U":
+                hex_digits = value[i + 2:i + 10]
+                if len(hex_digits) != 8 or not re.fullmatch(r"[0-9a-fA-F]{8}", hex_digits):
+                    raise ValueError("Invalid \\UHHHHHHHH escape in input")
+                data.extend(chr(int(hex_digits, 16)).encode("utf-8"))
+                i += 10
+            else:
+                raise ValueError(f"Unsupported escape: \\{esc}")
+        return bytes(data)
+
+    def _wait_for_state(self, *, seconds: float = 0.0, wait_for_settle: object = DEFAULT_WAIT_FOR_SETTLE,
+                        expect_prompt: object = None, timeout: float = 30.0) -> tuple[dict[str, object], bool, int]:
         start = time.monotonic()
         minimum_deadline = start + max(0.0, seconds)
         deadline = start + max(0.0, timeout)
+        if wait_for_settle is False or wait_for_settle is None:
+            settle_seconds = None
+        elif wait_for_settle is True:
+            settle_seconds = DEFAULT_WAIT_FOR_SETTLE
+        else:
+            settle_seconds = max(0.0, float(wait_for_settle))
         with self._lock:
             while True:
                 now = time.monotonic()
                 state = self._terminal_state_locked()
                 minimum_elapsed = now >= minimum_deadline
-                if minimum_elapsed:
-                    if expect_prompt and state["prompt_visible"]:
-                        return state, False, int((now - start) * 1000)
-                    if wait_for_settle and state["settled"] and (not expect_prompt or state["prompt_visible"]):
-                        return state, False, int((now - start) * 1000)
-                    if not expect_prompt and not wait_for_settle:
-                        return state, False, int((now - start) * 1000)
+                output_quiet = (
+                    settle_seconds is None
+                    or float(state["last_output_ms_ago"]) >= settle_seconds * 1000
+                )
+                prompt_matched = self._prompt_matches_locked(expect_prompt, state)
+                if minimum_elapsed and output_quiet and prompt_matched:
+                    return state, False, int((now - start) * 1000)
                 if now >= deadline:
                     return state, True, int((now - start) * 1000)
                 next_wake = min(deadline, now + TERMINAL_POLL_SECONDS)
@@ -709,8 +779,8 @@ class Session:
 
     def execute_terminal_action(self, action: dict[str, object]) -> dict[str, object]:
         action_type = str(action.get("type") or "").strip()
-        wait_for_settle = bool(action.get("wait_for_settle", False))
-        expect_prompt = bool(action.get("expect_prompt", False))
+        wait_for_settle = action.get("wait_for_settle", DEFAULT_WAIT_FOR_SETTLE)
+        expect_prompt = action.get("expect_prompt")
         timeout = float(action.get("timeout", 30) or 30)
 
         if not action_type:
@@ -719,30 +789,23 @@ class Session:
             return {"type": f"{action_type}_result", "ok": False, "error": "session_not_alive", "state": self.get_terminal_state()}
 
         initial_state = self.get_terminal_state()
-        if action_type == "command":
-            command = str(action.get("command") or "")
-            if not command:
-                return {"type": "command_result", "ok": False, "error": "invalid_command", "state": initial_state}
-            if (
-                initial_state["busy"]
-                or not initial_state["prompt_visible"]
-                or initial_state["input_mode"] != "shell"
-            ):
-                return {
-                    "type": "command_result",
-                    "ok": False,
-                    "error": "not_input_safe",
-                    "message": "Terminal is not in a confirmed shell prompt state",
-                    "state": initial_state,
-                }
-            self.write((command + "\n").encode("utf-8"))
+        if action_type == "input":
+            if "input" not in action or not isinstance(action.get("input"), str):
+                return {"type": "input_result", "ok": False, "error": "invalid_input", "message": "Input action requires an input string", "state": initial_state}
+            try:
+                data = self._decode_terminal_input(str(action["input"]))
+            except ValueError as exc:
+                return {"type": "input_result", "ok": False, "error": "invalid_escape", "message": str(exc), "state": initial_state}
+            if len(data) > 65536:
+                return {"type": "input_result", "ok": False, "error": "input_too_large", "message": "Input exceeds 65536 bytes", "state": initial_state}
+            self.write(data)
             state, timed_out, duration_ms = self._wait_for_state(
                 wait_for_settle=wait_for_settle,
                 expect_prompt=expect_prompt,
                 timeout=timeout,
             )
             return {
-                "type": "command_result",
+                "type": "input_result",
                 "ok": not timed_out,
                 "timed_out": timed_out,
                 "prompt_seen": bool(state["prompt_visible"]),
@@ -767,42 +830,6 @@ class Session:
                 "duration_ms": duration_ms,
                 "prompt_seen": bool(state["prompt_visible"]),
                 "settled": bool(state["settled"]),
-                "output_excerpt": state["screen_excerpt"],
-                "state": state,
-            }
-
-        if action_type == "keypress":
-            keys = action.get("keys")
-            if not isinstance(keys, list) or not keys:
-                return {"type": "keypress_result", "ok": False, "error": "invalid_keys", "state": initial_state}
-            key_map = {
-                "ENTER": b"\r",
-                "TAB": b"\t",
-                "ESC": b"\x1b",
-                "CTRL-C": b"\x03",
-                "CTRL-D": b"\x04",
-                "ARROW_UP": b"\x1b[A",
-                "ARROW_DOWN": b"\x1b[B",
-                "ARROW_RIGHT": b"\x1b[C",
-                "ARROW_LEFT": b"\x1b[D",
-            }
-            payload = bytearray()
-            for key in keys:
-                token = str(key)
-                payload.extend(key_map.get(token, token.encode("utf-8")))
-            self.write(bytes(payload))
-            state, timed_out, duration_ms = self._wait_for_state(
-                wait_for_settle=wait_for_settle,
-                expect_prompt=expect_prompt,
-                timeout=timeout,
-            )
-            return {
-                "type": "keypress_result",
-                "ok": not timed_out,
-                "timed_out": timed_out,
-                "prompt_seen": bool(state["prompt_visible"]),
-                "settled": bool(state["settled"]),
-                "duration_ms": duration_ms,
                 "output_excerpt": state["screen_excerpt"],
                 "state": state,
             }

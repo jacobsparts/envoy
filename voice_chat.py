@@ -66,33 +66,43 @@ at a shell prompt, in a Python REPL, inside a debugger, inside a custom CLI \
 app, or in another interactive program. Treat the current mode as unknown \
 until the terminal state or visible output gives clear evidence.
 
+You must control the terminal through one structured action at a time \
+using the execute_action tool. The action JSON must contain exactly one \
+object with a type of input or wait.
+
+Use input actions to send terminal input in any mode: shell, Python REPL, \
+debugger, pager, menu, or other interactive program. The input field is a \
+string containing ordinary text plus backslash escapes decoded before being \
+written to the terminal. Include \\r to press Enter. Use \\x03 for Ctrl-C, \
+\\x04 for Ctrl-D, \\x15 for Ctrl-U, \\x7f for Backspace, \\t for Tab, and \
+\\x1b[A / \\x1b[B / \\x1b[C / \\x1b[D for arrow keys.
+
+Example bash command:
+{"type":"input","input":"ls -la\\r","expect_prompt":"$","timeout":30}
+
+wait_for_settle is optional and defaults to 0.75 seconds for input actions. \
+Set wait_for_settle to a number of seconds to override how long terminal \
+output must be quiet before the action returns, or false to return without \
+waiting for output to settle.
+
+expect_prompt is optional. When present, it must be a string that appears in \
+the expected prompt. Use "$" or "#" for typical bash prompts, ">>>" for a \
+Python prompt, "(Pdb)" for pdb, or omit it when no prompt is expected.
+
+Use wait actions when you only want to wait for output settling or for a \
+prompt to appear.
+
+Always call get_terminal_state before deciding what input to send if the \
+mode is not already obvious from the latest tool result.
+
 Never claim a command succeeded unless you can verify it from the \
 terminal output. If you cannot see the result, say so.
 
 Keep responses brief and conversational -- they will be spoken aloud. \
 Do not use markdown formatting.
 
-You must control the terminal through one structured action at a time \
-using the execute_action tool. The action JSON must contain exactly one \
-object with a type of command, wait, or keypress.
-
-Always call get_terminal_state before deciding whether to send input if the \
-mode is not already obvious from the latest tool result.
-
-Use command actions only when the terminal state indicates an actual shell \
-prompt, not merely any prompt-looking line.
-Use wait actions to wait for prompt return or output settling.
-Use keypress actions for interactive programs, REPLs, debuggers, menus, \
-pagers, or interrupts like CTRL-C.
-
-Prefer wait_for_settle=true and expect_prompt=true for ordinary shell commands.
-Set expect_prompt=false when intentionally entering an interactive program.
-
-If the terminal state says input_mode is not shell, do not send shell \
-commands. Either use keypress, wait, or explain that the session is not \
-currently at a shell prompt.
-
-Your final text response will be spoken aloud to the user."""
+Your final text response will be spoken aloud to the user.
+"""
 
 
 class CancelledError(Exception):
@@ -143,7 +153,7 @@ class VoiceChatAgent(Agent):
         return self._terminal.get_terminal_state()
 
     @Agent.tool
-    def execute_action(self, action_json: str = "JSON object with exactly one action: command, wait, or keypress"):
+    def execute_action(self, action_json: str = 'JSON object with exactly one action: {"type":"input","input":"ls -la\\\\r","expect_prompt":"$"} or {"type":"wait"}. For input, ordinary text is UTF-8 encoded and backslash escapes are decoded: \\\\r Enter, \\\\x03 Ctrl-C, \\\\x04 Ctrl-D, \\\\x15 Ctrl-U, \\\\x7f Backspace, \\\\t Tab, \\\\x1b[A arrow up. wait_for_settle is optional and defaults to 0.75 seconds for input actions; set it to a number of seconds to override or false to return immediately. expect_prompt is an optional string expected to appear in the prompt, e.g. "$" for bash, ">>>" for Python.'):
         """Execute one structured terminal action and return a structured result."""
         self._check_cancelled()
         return self._terminal.execute_action(action_json)
