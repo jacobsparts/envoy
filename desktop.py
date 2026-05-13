@@ -15,6 +15,37 @@ import webview
 from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, build_title, desktop_inherited_env, render_html
 
 
+def enable_qt_context_menu_without_debug() -> None:
+    try:
+        from webview.platforms import qt
+    except Exception:
+        return
+    original_init = qt.BrowserView.__init__
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        try:
+            self.webview.setContextMenuPolicy(qt.QtCore.Qt.DefaultContextMenu)
+        except Exception:
+            pass
+
+    qt.BrowserView.__init__ = patched_init
+    webview_class = getattr(qt.BrowserView, "WebView", None)
+    if not webview_class:
+        return
+    original_context_menu = webview_class.contextMenuEvent
+
+    def patched_context_menu(self, event):
+        original_context_menu(self, event)
+        menu = getattr(self, "context_menu", None)
+        if menu:
+            for action in menu.actions():
+                if action.text() == "Inspect Element":
+                    menu.removeAction(action)
+
+    webview_class.contextMenuEvent = patched_context_menu
+
+
 class DesktopApi:
     def __init__(self, path: str):
         self.path = path
@@ -172,8 +203,9 @@ def main() -> None:
     api.window = window
     window.events.closed += force_shutdown
     icon_path = os.path.join(os.path.dirname(__file__), "static", "icon-512.png")
+    enable_qt_context_menu_without_debug()
     try:
-        webview.start(gui="qt", icon=icon_path, debug=True)
+        webview.start(gui="qt", icon=icon_path)
     finally:
         api.shutdown()
         cleanup_html()
