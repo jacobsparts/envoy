@@ -118,6 +118,16 @@ function formatAgentCommand(action) {
   if (action.type === "wait") return `wait ${action.seconds || 0}s`;
   return JSON.stringify(action);
 }
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[ch]);
+}
+
 
 function waitForPywebview() {
   if (window.pywebview && window.pywebview.api) {
@@ -1561,6 +1571,24 @@ class TabManager {
     this.elements.disconnectClose.disabled = false;
   }
 
+  formatAgentLogText(tab = this.activeTab) {
+    if (!tab) return "";
+    const lines = [];
+    const addEntry = entry => {
+      if (entry.time) lines.push(`[${entry.time}]`);
+      if (entry.userMessage) lines.push(`You: ${entry.userMessage}`);
+      if (entry.commands && entry.commands.length) {
+        for (const command of entry.commands) lines.push(`$ ${formatAgentCommand(command)}`);
+      }
+      if (entry.kind) lines.push(`${entry.kind}: ${entry.text || ""}`);
+      if (entry.response) lines.push(`Agent: ${entry.response}`);
+      lines.push("");
+    };
+    for (const event of tab.liveAgentEvents || []) addEntry(event);
+    for (const entry of tab.agentLog || []) addEntry(entry);
+    return lines.join("\n").trim();
+  }
+
   renderAgentLog() {
     const entries = this.activeTab ? this.activeTab.agentLog : [];
     const liveEvents = this.activeTab ? this.activeTab.liveAgentEvents : [];
@@ -1570,19 +1598,19 @@ class TabManager {
     }
     const liveHtml = liveEvents.map(event => {
       let html = '<div class="voice-log-entry live">';
-      html += `<div class="voice-log-time">${event.time}</div>`;
-      if (event.kind === "status") html += `<div class="voice-log-agent">${event.text}</div>`;
-      if (event.kind === "message") html += `<div class="voice-log-agent">${event.text}</div>`;
+      html += `<div class="voice-log-time">${escapeHtml(event.time)}</div>`;
+      if (event.kind === "status") html += `<div class="voice-log-agent">${escapeHtml(event.text)}</div>`;
+      if (event.kind === "message") html += `<div class="voice-log-agent">${escapeHtml(event.text)}</div>`;
       return html + "</div>";
     }).join("");
     const entryHtml = entries.map(entry => {
       let html = '<div class="voice-log-entry">';
-      html += `<div class="voice-log-time">${entry.time}</div>`;
-      if (entry.userMessage) html += `<div class="voice-log-you">${entry.userMessage}</div>`;
+      html += `<div class="voice-log-time">${escapeHtml(entry.time)}</div>`;
+      if (entry.userMessage) html += `<div class="voice-log-you">${escapeHtml(entry.userMessage)}</div>`;
       if (entry.commands && entry.commands.length) {
-        html += entry.commands.map(command => `<div class="voice-log-cmd">$ ${formatAgentCommand(command)}</div>`).join("");
+        html += entry.commands.map(command => `<div class="voice-log-cmd">$ ${escapeHtml(formatAgentCommand(command))}</div>`).join("");
       }
-      if (entry.response) html += `<div class="voice-log-agent">${entry.response}</div>`;
+      if (entry.response) html += `<div class="voice-log-agent">${escapeHtml(entry.response)}</div>`;
       return html + "</div>";
     }).join("");
     this.elements.agentLog.innerHTML = liveHtml + entryHtml;
@@ -1861,6 +1889,7 @@ function init(baseTransport, config) {
   const overlay = document.getElementById("drop-overlay");
   const agentLogModal = document.getElementById("voice-log-modal");
   const agentLogEntries = document.getElementById("voice-log-entries");
+  const agentLogCopy = document.getElementById("voice-log-copy");
   const mobileInputBar = document.getElementById("mobile-input-bar");
   const textInputModal = document.getElementById("text-input-modal");
   const pasteEditorModal = document.getElementById("paste-editor-modal");
@@ -3124,6 +3153,17 @@ function init(baseTransport, config) {
     manager.renderAgentLog();
     agentLogModal.classList.add("active");
   });
+  agentLogCopy?.addEventListener("click", e => {
+    e.stopPropagation();
+    const text = manager.formatAgentLogText();
+    if (!text) {
+      showToast("No agent log entries");
+      return;
+    }
+    Promise.resolve(copyToClipboard(text))
+      .then(() => showToast("Agent log copied"))
+      .catch(() => showToast("Failed to copy agent log"));
+  });
   disconnectReconnect.addEventListener("click", () => {
     const tab = currentTab();
     if (!tab || !tab.canReconnect()) return;
@@ -3559,7 +3599,7 @@ function init(baseTransport, config) {
   textInputSend.addEventListener("click", sendTextMessage);
   textInputClose.addEventListener("click", closeTextInput);
   textInputArea.addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
       e.preventDefault();
       sendTextMessage();
     }

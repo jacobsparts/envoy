@@ -748,7 +748,8 @@ class Session:
         return bytes(data)
 
     def _wait_for_state(self, *, seconds: float = 0.0, wait_for_settle: object = DEFAULT_WAIT_FOR_SETTLE,
-                        expect_prompt: object = None, timeout: float = 30.0) -> tuple[dict[str, object], bool, int]:
+                        expect_prompt: object = None, timeout: float = 30.0, after_output_at: float | None = None) -> tuple[dict[str, object], bool, int]:
+
         start = time.monotonic()
         minimum_deadline = start + max(0.0, seconds)
         deadline = start + max(0.0, timeout)
@@ -763,13 +764,21 @@ class Session:
                 now = time.monotonic()
                 state = self._terminal_state_locked()
                 minimum_elapsed = now >= minimum_deadline
+                saw_post_input_output = after_output_at is None or self._last_output_at >= after_output_at
                 output_quiet = (
                     settle_seconds is None
                     or float(state["last_output_ms_ago"]) >= settle_seconds * 1000
                 )
                 prompt_matched = self._prompt_matches_locked(expect_prompt, state)
-                if minimum_elapsed and output_quiet and prompt_matched:
+                # For terminal input without Enter (typing into an editor, REPL line, or
+                # partially composing a shell command), no new prompt is expected.  Waiting
+                # for a confirmed prompt here makes the voice/text agent report that it can
+                # see the terminal but cannot input.
+                prompt_required = not (expect_prompt is None or expect_prompt is False or expect_prompt == "")
+                output_observed_or_not_required = saw_post_input_output or not prompt_required
+                if minimum_elapsed and output_observed_or_not_required and output_quiet and prompt_matched:
                     return state, False, int((now - start) * 1000)
+
                 if now >= deadline:
                     return state, True, int((now - start) * 1000)
                 next_wake = min(deadline, now + TERMINAL_POLL_SECONDS)
@@ -798,11 +807,13 @@ class Session:
                 return {"type": "input_result", "ok": False, "error": "invalid_escape", "message": str(exc), "state": initial_state}
             if len(data) > 65536:
                 return {"type": "input_result", "ok": False, "error": "input_too_large", "message": "Input exceeds 65536 bytes", "state": initial_state}
+            input_started_at = time.monotonic()
             self.write(data)
             state, timed_out, duration_ms = self._wait_for_state(
                 wait_for_settle=wait_for_settle,
                 expect_prompt=expect_prompt,
                 timeout=timeout,
+                after_output_at=input_started_at,
             )
             return {
                 "type": "input_result",

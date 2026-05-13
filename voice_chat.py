@@ -85,9 +85,12 @@ Set wait_for_settle to a number of seconds to override how long terminal \
 output must be quiet before the action returns, or false to return without \
 waiting for output to settle.
 
-expect_prompt is optional. When present, it must be a string that appears in \
-the expected prompt. Use "$" or "#" for typical bash prompts, ">>>" for a \
-Python prompt, "(Pdb)" for pdb, or omit it when no prompt is expected.
+expect_prompt is optional. Only include it when you specifically need to \
+wait for a known prompt after pressing Enter. Do not include expect_prompt \
+for ordinary typing, for input inside an editor or REPL whose prompt is not \
+certain, or when sending text without Enter. Use "$" or "#" for typical bash \
+prompts, ">>>" for a Python prompt, "(Pdb)" for pdb, or omit it when no \
+prompt is expected.
 
 Use wait actions when you only want to wait for output settling or for a \
 prompt to appear.
