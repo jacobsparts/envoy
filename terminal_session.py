@@ -39,19 +39,16 @@ class SessionTerminal:
     def get_terminal_state(self) -> dict[str, object]:
         return self._session.get_terminal_state()
 
-    def execute_action(self, type: str = 'Action type: "input" or "wait".',
-                       input: str = r'Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.',
-                       wait_for_settle: float = 'Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.',
-                       expect_prompt: str = 'Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.',
-                       timeout: float = 'Optional maximum seconds to wait.'):
+    def execute_action(self, type: str, input: str = "", wait_for_settle: float = None,
+                       expect_prompt: str = "", timeout: float = None):
         action = {"type": type}
         if input:
             action["input"] = input
-        if wait_for_settle != "":
+        if wait_for_settle is not None:
             action["wait_for_settle"] = wait_for_settle
         if expect_prompt:
             action["expect_prompt"] = expect_prompt
-        if timeout != "":
+        if timeout is not None:
             action["timeout"] = timeout
         result = self._session.execute_terminal_action(action)
         self.commands.append(action)

@@ -5,7 +5,7 @@ and user through a *terminal* interface object that must provide:
 
   - get_terminal_context() -> str
   - get_terminal_state() -> dict
-  - execute_action(action_json: str) -> dict
+  - execute_action(type: str, input: str = "", wait_for_settle=None, expect_prompt: str = "", timeout=None) -> dict
   - send_message(text: str)   # text is spoken to the user as audio
 """
 
@@ -67,8 +67,7 @@ app, or in another interactive program. Treat the current mode as unknown \
 until the terminal state or visible output gives clear evidence.
 
 You must control the terminal through one structured action at a time \
-using the execute_action tool. The action JSON must contain exactly one \
-object with a type of input or wait.
+using the execute_action tool. Set the type parameter to input or wait.
 
 Use input actions to send terminal input in any mode: shell, Python REPL, \
 debugger, pager, menu, or other interactive program. The input field is a \
@@ -78,7 +77,7 @@ written to the terminal. Include \\r to press Enter. Use \\x03 for Ctrl-C, \
 \\x1b[A / \\x1b[B / \\x1b[C / \\x1b[D for arrow keys.
 
 Example bash command:
-{"type":"input","input":"ls -la\\r","expect_prompt":"$","timeout":30}
+execute_action(type="input", input="ls -la\\r", expect_prompt="$", timeout=30)
 
 wait_for_settle is optional and defaults to 0.75 seconds for input actions. \
 Set wait_for_settle to a number of seconds to override how long terminal \
@@ -157,12 +156,19 @@ class VoiceChatAgent(Agent):
 
     @Agent.tool
     def execute_action(self,
-                       type: str = 'Action type: "input" or "wait".',
-                       input: str = r'Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.',
-                       wait_for_settle: float = 'Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.',
-                       expect_prompt: str = 'Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.',
-                       timeout: float = 'Optional maximum seconds to wait.'):
-        """Execute one terminal action and return a structured result."""
+                       type: str,
+                       input: str = "",
+                       wait_for_settle: float = None,
+                       expect_prompt: str = "",
+                       timeout: float = None):
+        """Execute one terminal action and return a structured result.
+
+        type: "input" or "wait".
+        input: Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.
+        wait_for_settle: Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.
+        expect_prompt: Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.
+        timeout: Optional maximum seconds to wait.
+        """
         self._check_cancelled()
         return self._terminal.execute_action(type, input, wait_for_settle, expect_prompt, timeout)
 
