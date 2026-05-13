@@ -156,10 +156,15 @@ class VoiceChatAgent(Agent):
         return self._terminal.get_terminal_state()
 
     @Agent.tool
-    def execute_action(self, action_json: str = 'JSON object with exactly one action: {"type":"input","input":"ls -la\\\\r","expect_prompt":"$"} or {"type":"wait"}. For input, ordinary text is UTF-8 encoded and backslash escapes are decoded: \\\\r Enter, \\\\x03 Ctrl-C, \\\\x04 Ctrl-D, \\\\x15 Ctrl-U, \\\\x7f Backspace, \\\\t Tab, \\\\x1b[A arrow up. wait_for_settle is optional and defaults to 0.75 seconds for input actions; set it to a number of seconds to override or false to return immediately. expect_prompt is an optional string expected to appear in the prompt, e.g. "$" for bash, ">>>" for Python.'):
-        """Execute one structured terminal action and return a structured result."""
+    def execute_action(self,
+                       type: str = 'Action type: "input" or "wait".',
+                       input: str = r'Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.',
+                       wait_for_settle: float = 'Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.',
+                       expect_prompt: str = 'Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.',
+                       timeout: float = 'Optional maximum seconds to wait.'):
+        """Execute one terminal action and return a structured result."""
         self._check_cancelled()
-        return self._terminal.execute_action(action_json)
+        return self._terminal.execute_action(type, input, wait_for_settle, expect_prompt, timeout)
 
 
 

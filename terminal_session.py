@@ -2,17 +2,6 @@
 
 from __future__ import annotations
 
-import json
-
-
-def _loads_action_json(action_json: str) -> dict[str, object]:
-    try:
-        return json.loads(action_json)
-    except json.JSONDecodeError:
-        return json.loads(action_json.replace("\\x", "\\\\x").replace("\\U", "\\\\U"))
-
-
-
 def get_terminal_context(session) -> str:
     """Return new terminal content since last call, rendered via pyte.
 
@@ -50,11 +39,20 @@ class SessionTerminal:
     def get_terminal_state(self) -> dict[str, object]:
         return self._session.get_terminal_state()
 
-    def execute_action(self, action_json: str = 'JSON object with exactly one action: {"type":"input","input":"ls -la\\\\r","expect_prompt":"$"} or {"type":"wait"}. For input, ordinary text is UTF-8 encoded and backslash escapes are decoded: \\\\r Enter, \\\\x03 Ctrl-C, \\\\x04 Ctrl-D, \\\\x15 Ctrl-U, \\\\x7f Backspace, \\\\t Tab, \\\\x1b[A arrow up. wait_for_settle is optional and defaults to 0.75 seconds for input actions; set it to a number of seconds to override or false to return immediately. expect_prompt is an optional string expected to appear in the prompt, e.g. "$" for bash, ">>>" for Python.'):
-        if isinstance(action_json, str):
-            action = _loads_action_json(action_json)
-        else:
-            action = action_json
+    def execute_action(self, type: str = 'Action type: "input" or "wait".',
+                       input: str = r'Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.',
+                       wait_for_settle: float = 'Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.',
+                       expect_prompt: str = 'Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.',
+                       timeout: float = 'Optional maximum seconds to wait.'):
+        action = {"type": type}
+        if input:
+            action["input"] = input
+        if wait_for_settle != "":
+            action["wait_for_settle"] = wait_for_settle
+        if expect_prompt:
+            action["expect_prompt"] = expect_prompt
+        if timeout != "":
+            action["timeout"] = timeout
         result = self._session.execute_terminal_action(action)
         self.commands.append(action)
         return result
