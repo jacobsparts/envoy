@@ -110,12 +110,33 @@ function stripTerminalControls(text) {
     .replace(/\r/g, "\n");
 }
 
+function formatAgentInput(input) {
+  return String(input ?? "")
+    .replace(/\r/g, "")
+    .replace(/\x03/g, "^C")
+    .replace(/\x04/g, "^D")
+    .replace(/\x15/g, "^U")
+    .replace(/\x7f/g, "^?")
+    .replace(/\t/g, "\\t")
+    .replace(/\x1b\[A/g, "↑")
+    .replace(/\x1b\[B/g, "↓")
+    .replace(/\x1b\[C/g, "→")
+    .replace(/\x1b\[D/g, "←");
+}
+
 function formatAgentCommand(action) {
-  if (typeof action === "string") return action;
+  if (typeof action === "string") {
+    try {
+      return formatAgentCommand(JSON.parse(action));
+    } catch {
+      return action;
+    }
+  }
   if (!action || typeof action !== "object") return String(action ?? "");
+  if (action.type === "input") return formatAgentInput(action.input || "");
   if (action.type === "command") return action.command || "";
   if (action.type === "keypress") return (action.keys || []).join(" ");
-  if (action.type === "wait") return `wait ${action.seconds || 0}s`;
+  if (action.type === "wait") return `wait ${action.seconds || action.wait_for_settle || 0}s`;
   return JSON.stringify(action);
 }
 function escapeHtml(value) {
@@ -1889,7 +1910,6 @@ function init(baseTransport, config) {
   const overlay = document.getElementById("drop-overlay");
   const agentLogModal = document.getElementById("voice-log-modal");
   const agentLogEntries = document.getElementById("voice-log-entries");
-  const agentLogCopy = document.getElementById("voice-log-copy");
   const mobileInputBar = document.getElementById("mobile-input-bar");
   const textInputModal = document.getElementById("text-input-modal");
   const pasteEditorModal = document.getElementById("paste-editor-modal");
@@ -3152,17 +3172,6 @@ function init(baseTransport, config) {
   spLog.addEventListener("click", () => {
     manager.renderAgentLog();
     agentLogModal.classList.add("active");
-  });
-  agentLogCopy?.addEventListener("click", e => {
-    e.stopPropagation();
-    const text = manager.formatAgentLogText();
-    if (!text) {
-      showToast("No agent log entries");
-      return;
-    }
-    Promise.resolve(copyToClipboard(text))
-      .then(() => showToast("Agent log copied"))
-      .catch(() => showToast("Failed to copy agent log"));
   });
   disconnectReconnect.addEventListener("click", () => {
     const tab = currentTab();

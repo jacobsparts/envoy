@@ -581,28 +581,18 @@ input, textarea, #select-overlay, #select-overlay *, #voice-log-content, #voice-
 #voice-log-entries {
   overflow-y: auto; flex: 1;
 }
-#voice-log-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
-}
 #voice-log-content h2 {
-  margin: 0;
+  margin: 0 0 14px 0;
   color: #fff; font-size: 16px;
-}
-#voice-log-copy {
-  background: #1a3a5c;
-  color: #9cf;
-  border: 1px solid #4af;
-  border-radius: 4px;
-  padding: 4px 12px;
-  font: 12px 'Source Code Pro', monospace;
-  cursor: pointer;
 }
 .voice-log-entry { margin-bottom: 16px; }
 .voice-log-time { color: #666; font-size: 12px; }
+.voice-log-you,
+.voice-log-agent,
+.voice-log-cmd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .voice-log-you { color: #4af; }
 .voice-log-agent { color: #ccc; }
 .voice-log-cmd { color: #fa0; }
