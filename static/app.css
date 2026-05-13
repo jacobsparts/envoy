@@ -545,7 +545,8 @@ input, textarea, #select-overlay, #select-overlay *, #voice-log-content, #voice-
 
 #sp-mic.recording, #sp-dict.recording { filter: drop-shadow(0 0 8px #f44); }
 #sp-mic.processing, #sp-dict.processing { filter: drop-shadow(0 0 6px #4af); animation: sp-glow 1.5s ease-in-out infinite; }
-#sp-mic.cancelling {
+#sp-mic.cancelling,
+#sp-cancel.audio-playing {
   filter: drop-shadow(0 0 8px #f44);
   animation: sp-cancel-glow 0.8s ease-in-out infinite;
 }

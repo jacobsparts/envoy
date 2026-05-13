@@ -270,7 +270,7 @@ class PywebviewTransport {
   }
 
   async write(data) {
-    if (!this.sessionId) return;
+    if (!this.sessionId || window.__envoyInputBlocked) return;
     const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
     if (transformed == null) return;
     if (transformed instanceof Uint8Array) {
@@ -281,7 +281,7 @@ class PywebviewTransport {
   }
 
   async writeBytes(bytes) {
-    if (!this.sessionId) return;
+    if (!this.sessionId || window.__envoyInputBlocked) return;
     await this.api.write(this.sessionId, bytesToBase64(bytes));
   }
 
@@ -537,14 +537,14 @@ class BrowserTransport {
   }
 
   write(data) {
-    if (!this.sessionId) return Promise.resolve();
+    if (!this.sessionId || window.__envoyInputBlocked) return Promise.resolve();
     const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
     if (transformed == null) return Promise.resolve();
     return this._enqueueWrite(transformed);
   }
 
   writeBytes(bytes) {
-    if (!this.sessionId) return Promise.resolve();
+    if (!this.sessionId || window.__envoyInputBlocked) return Promise.resolve();
     return this._enqueueWrite(bytes);
   }
 
@@ -1002,7 +1002,7 @@ class TerminalTab {
     });
 
     this.term.onData(data => {
-      if (!this.disconnected && !this._suppressInput) {
+      if (!this.disconnected && !this._suppressInput && !window.__envoyInputBlocked) {
         this.hasInput = true;
         this.transport.write(data).catch(err => this.handleWriteError(err));
       }
@@ -2174,13 +2174,13 @@ function init(baseTransport, config) {
 
   function writeSequenceToCurrentTab(sequence) {
     const tab = currentTab();
-    if (!tab || tab.disconnected) return Promise.resolve();
+    if (!tab || tab.disconnected || window.__envoyInputBlocked) return Promise.resolve();
     return tab.transport.write(sequence).catch(err => tab.handleWriteError(err));
   }
 
   function writeBytesToCurrentTab(bytes) {
     const tab = currentTab();
-    if (!tab || tab.disconnected) return Promise.resolve();
+    if (!tab || tab.disconnected || window.__envoyInputBlocked) return Promise.resolve();
     return tab.transport.writeBytes(bytes).catch(err => tab.handleWriteError(err));
   }
 
@@ -3200,14 +3200,31 @@ function init(baseTransport, config) {
   let voiceMode = null;
   let voiceCancelPending = false;
   let voiceShouldRestoreTerminalFocus = false;
+  let voiceAudio = null;
+  let voiceAudioObjectUrl = "";
 
   function cancelVoiceAgent() {
     currentTab()?.transport.cancelAgent().catch(() => {});
   }
 
   function updateVoiceControls() {
+    const audioPlaying = !!voiceAudio;
     spMic.classList.toggle("cancelling", voiceCancelPending && voiceMode === "agent");
-    spCancel.disabled = voiceCancelPending || (!voiceRecorder && !voiceAbort);
+    spCancel.classList.toggle("audio-playing", audioPlaying);
+    spCancel.disabled = voiceCancelPending || (!voiceRecorder && !voiceAbort && !audioPlaying);
+  }
+
+  function stopVoiceAudio() {
+    if (voiceAudio) {
+      voiceAudio.pause();
+      voiceAudio.src = "";
+      voiceAudio = null;
+    }
+    if (voiceAudioObjectUrl) {
+      URL.revokeObjectURL(voiceAudioObjectUrl);
+      voiceAudioObjectUrl = "";
+    }
+    window.__envoyInputBlocked = false;
   }
 
   function voiceReset() {
@@ -3215,6 +3232,7 @@ function init(baseTransport, config) {
       voiceStream.getTracks().forEach(track => track.stop());
       voiceStream = null;
     }
+    stopVoiceAudio();
     const restoreTerminalFocus = voiceShouldRestoreTerminalFocus;
     voiceRecorder = null;
     voiceCancelled = false;
@@ -3228,9 +3246,28 @@ function init(baseTransport, config) {
     if (restoreTerminalFocus) focusCurrent();
   }
 
+  function playAgentAudio(audioB64) {
+    if (!audioB64) return false;
+    stopVoiceAudio();
+    const audio = new Audio("data:audio/wav;base64," + audioB64);
+    voiceAudio = audio;
+    window.__envoyInputBlocked = true;
+    updateVoiceControls();
+    const finish = () => {
+      if (voiceAudio !== audio) return;
+      voiceAudio = null;
+      window.__envoyInputBlocked = false;
+      voiceReset();
+    };
+    audio.addEventListener("ended", finish, { once: true });
+    audio.addEventListener("error", finish, { once: true });
+    audio.play().catch(() => finish());
+    return true;
+  }
+
   function startVoiceRecording(mode) {
     const tab = currentTab();
-    if (!tab || voiceRecorder) return;
+    if (!tab || voiceRecorder || voiceAudio) return;
     voiceShouldRestoreTerminalFocus = keyboardVisible && terminalInputActive;
     if (!navigator.mediaDevices || !window.MediaRecorder) {
       showToast("Voice not supported");
@@ -3266,12 +3303,13 @@ function init(baseTransport, config) {
           ? tab.transport.transcribeAudio(blob, mime)
           : tab.transport.sendVoiceMessage(blob, mime, getAgentSettings());
         request.then(data => {
-          voiceReset();
           if (data.error) {
+            voiceReset();
             showToast(data.error, false, !!data.turn_limit_reached);
             return;
           }
           if (mode === "dict") {
+            voiceReset();
             if (data.text) {
               tab.transport.write(data.text).then(() => {
                 if (manager.activeTab === tab) {
@@ -3285,10 +3323,11 @@ function init(baseTransport, config) {
           }
           tab.addAgentLog(data.response, data.commands);
           manager.renderAgentLog();
-          if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
           const msg = data.speech || data.response;
+          const isPlayingAudio = playAgentAudio(data.audio);
           if (msg) showToast(msg, false, true);
           else dismissToast();
+          if (!isPlayingAudio) voiceReset();
         }).catch(err => {
           if (controller.signal.aborted) {
             voiceReset();
@@ -3343,6 +3382,12 @@ function init(baseTransport, config) {
   });
 
   function requestVoiceCancel() {
+    if (voiceAudio) {
+      voiceReset();
+      dismissToast();
+      showToast("Cancelled");
+      return true;
+    }
     if (voiceCancelPending) {
       return false;
     }
@@ -3580,7 +3625,7 @@ function init(baseTransport, config) {
       }
       tab.addAgentLog(data.response, data.commands, text);
       manager.renderAgentLog();
-      if (data.audio) new Audio("data:audio/wav;base64," + data.audio).play().catch(() => {});
+      const isPlayingAudio = playAgentAudio(data.audio);
       const msg = data.speech || data.response;
       if (msg) showToast(msg, false, true);
       else dismissToast();

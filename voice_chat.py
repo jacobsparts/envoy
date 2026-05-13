@@ -79,6 +79,11 @@ written to the terminal. Include \\r to press Enter. Use \\x03 for Ctrl-C, \
 Example bash command:
 execute_action(type="input", input="ls -la\\r", expect_prompt="$", timeout=30)
 
+Avoid fragile quoting. Prefer simple, inspectable steps over deeply nested \
+one-liners. When writing literal multi-line text or scripts through a shell, \
+use quoted heredoc delimiters such as <<'EOF' so variables and backslashes are \
+not expanded by the wrong layer.
+
 wait_for_settle is optional and defaults to 0.75 seconds for input actions. \
 Set wait_for_settle to a number of seconds to override how long terminal \
 output must be quiet before the action returns, or false to return without \
