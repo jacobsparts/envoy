@@ -265,6 +265,7 @@ class Session:
         self._pyte_stream = pyte.Stream(self._pyte_screen)
         self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
+        self.agent_lock = threading.Lock()
         self.clients: dict[str, ClientState] = {}
         self._push_callbacks: dict[str, Callable[[dict[str, object]], None]] = {}
         self.last_seen: float = time.monotonic()
@@ -1228,6 +1229,8 @@ class EnvoyService:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
+        if not session.agent_lock.acquire(blocking=False):
+            return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
@@ -1253,12 +1256,15 @@ class EnvoyService:
             return {"response": "", "speech": "", "commands": []}
         finally:
             session.voice_cancel = None
+            session.agent_lock.release()
 
     def send_voice_message(self, session_id: str, audio_b64: str, mime_type: str,
                            agent_settings: dict | None = None) -> dict[str, object]:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
+        if not session.agent_lock.acquire(blocking=False):
+            return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
@@ -1284,6 +1290,7 @@ class EnvoyService:
             return {"response": "", "speech": "", "commands": []}
         finally:
             session.voice_cancel = None
+            session.agent_lock.release()
 
     def transcribe_audio(self, audio_b64: str, mime_type: str) -> dict[str, str]:
         return {"text": transcribe_audio(self._decode(audio_b64), mime_type)}

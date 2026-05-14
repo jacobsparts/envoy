@@ -75,20 +75,15 @@ class Agent:
 
             function_calls = [part["functionCall"] for part in parts if "functionCall" in part]
             if function_calls:
-                call = function_calls[0]
-                result = self._dispatch_tool(call)
-                response_parts: list[dict[str, Any]] = [
-                    {
-                        "functionResponse": {
-                            "name": call["name"],
-                            "response": {"result": result},
-                        }
-                    }
-                ]
-                if len(function_calls) > 1:
+                response_parts: list[dict[str, Any]] = []
+                for call in function_calls:
+                    result = self._dispatch_tool(call)
                     response_parts.append(
                         {
-                            "text": "Only the first tool call in a model turn was executed. Re-evaluate terminal state before issuing another action."
+                            "functionResponse": {
+                                "name": call["name"],
+                                "response": {"result": result},
+                            }
                         }
                     )
                 self._contents.append({"role": "user", "parts": response_parts})
