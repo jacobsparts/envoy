@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import collections
 import copy
+import hashlib
+import json
 import mimetypes
 import socket
 import fcntl
@@ -81,6 +83,7 @@ SESSION_TIMEOUT = 60 * 60 * 24
 TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
 DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
+AGENT_DUPLICATE_REQUEST_WINDOW_SECONDS = 15.0
 
 
 def _login_env() -> dict[str, str]:
@@ -271,6 +274,7 @@ class Session:
         self.last_seen: float = time.monotonic()
         self._last_output_at: float = self.last_seen
         self._last_input_at: float = self.last_seen
+        self._last_agent_request: tuple[str, float] | None = None
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
@@ -808,11 +812,20 @@ class Session:
                 return {"type": "input_result", "ok": False, "error": "invalid_escape", "message": str(exc), "state": initial_state}
             if len(data) > 65536:
                 return {"type": "input_result", "ok": False, "error": "input_too_large", "message": "Input exceeds 65536 bytes", "state": initial_state}
-            input_started_at = time.monotonic()
+            now = time.monotonic()
+            input_started_at = now
+            effective_expect_prompt = expect_prompt
+            if (
+                effective_expect_prompt in (None, False, "")
+                and data.rstrip().endswith((b"\r", b"\n"))
+                and initial_state.get("prompt_visible")
+                and initial_state.get("prompt_kind") in {"shell", "shell_like"}
+            ):
+                effective_expect_prompt = True
             self.write(data)
             state, timed_out, duration_ms = self._wait_for_state(
                 wait_for_settle=wait_for_settle,
-                expect_prompt=expect_prompt,
+                expect_prompt=effective_expect_prompt,
                 timeout=timeout,
                 after_output_at=input_started_at,
             )
@@ -1045,6 +1058,11 @@ class EnvoyService:
     def _decode(self, payload: str) -> bytes:
         return base64.b64decode(payload.encode("ascii"))
 
+    def _agent_request_key(self, kind: str, payload: bytes, agent_settings: dict | None) -> str:
+        settings = json.dumps(agent_settings or {}, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(payload).hexdigest()
+        return f"{kind}:{digest}:{settings}"
+
     def _new_session_id(self) -> str:
         return secrets.token_hex(4)
 
@@ -1229,14 +1247,26 @@ class EnvoyService:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
+        settings = agent_settings or {}
+        request_key = self._agent_request_key("text", text.encode("utf-8"), settings)
+        now = time.monotonic()
+        with session._lock:
+            if (
+                session._last_agent_request
+                and session._last_agent_request[0] == request_key
+                and now - session._last_agent_request[1] <= AGENT_DUPLICATE_REQUEST_WINDOW_SECONDS
+            ):
+                return {"error": "Duplicate agent request ignored.", "response": "", "speech": "", "commands": []}
         if not session.agent_lock.acquire(blocking=False):
             return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
+        with session._lock:
+            session._last_agent_request = (request_key, now)
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
             iface = SessionTerminal(session)
             reply = process_text_message(text, iface, cancel,
-                                         agent_settings=agent_settings or {})
+                                         agent_settings=settings)
             speech = "\n".join(iface.messages) or reply
             if speech:
                 session.push_agent_event("status", "Generating audio...")
@@ -1263,14 +1293,27 @@ class EnvoyService:
         session = self._get_session(session_id)
         if not session.alive:
             raise ValueError("No active session")
+        settings = agent_settings or {}
+        audio = self._decode(audio_b64)
+        request_key = self._agent_request_key("voice", mime_type.encode("utf-8") + b"\0" + audio, settings)
+        now = time.monotonic()
+        with session._lock:
+            if (
+                session._last_agent_request
+                and session._last_agent_request[0] == request_key
+                and now - session._last_agent_request[1] <= AGENT_DUPLICATE_REQUEST_WINDOW_SECONDS
+            ):
+                return {"error": "Duplicate agent request ignored.", "response": "", "speech": "", "commands": []}
         if not session.agent_lock.acquire(blocking=False):
             return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
+        with session._lock:
+            session._last_agent_request = (request_key, now)
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
             iface = SessionTerminal(session)
-            reply = process_voice_message(self._decode(audio_b64), mime_type, iface, cancel,
-                                          agent_settings=agent_settings or {})
+            reply = process_voice_message(audio, mime_type, iface, cancel,
+                                          agent_settings=settings)
             speech = "\n".join(iface.messages) or reply
             if speech:
                 session.push_agent_event("status", "Generating audio...")

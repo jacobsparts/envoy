@@ -3608,16 +3608,20 @@ function init(baseTransport, config) {
   }
 
   function sendTextMessage() {
+    if (textAbort) return;
     const tab = currentTab();
     const text = textInputArea.value.trim();
     if (!tab || !text) return;
     closeTextInput();
+    textInputArea.value = "";
+    textInputSend.disabled = true;
     spText.classList.add("processing");
     showToast("Thinking...", true);
     const controller = new AbortController();
     textAbort = controller;
     tab.transport.sendTextMessage(text, getAgentSettings()).then(data => {
       spText.classList.remove("processing");
+      textInputSend.disabled = false;
       textAbort = null;
       if (data.error) {
         showToast(data.error, false, !!data.turn_limit_reached);
@@ -3631,6 +3635,7 @@ function init(baseTransport, config) {
       else dismissToast();
     }).catch(err => {
       spText.classList.remove("processing");
+      textInputSend.disabled = false;
       textAbort = null;
       if (controller.signal.aborted) { dismissToast(); return; }
       showToast(String(err.message || err));
@@ -3643,6 +3648,7 @@ function init(baseTransport, config) {
       cancelVoiceAgent();
       textAbort.abort();
       textAbort = null;
+      textInputSend.disabled = false;
       spText.classList.remove("processing");
       showToast("Cancelled");
     } else {
