@@ -1559,16 +1559,13 @@ class TabManager {
   activateTab(id) {
     const tab = this.getTabById(id);
     if (!tab) return;
+    const switchingTabs = this.activeTab && this.activeTab !== tab;
+    if (switchingTabs && typeof this.onBeforeTabSwitch === "function") {
+      this.onBeforeTabSwitch(this.activeTab, tab);
+    }
     if (this.activeTab) this.activeTab.hide();
     this.activeTab = tab;
     tab.show();
-    const selOv = this.elements.selectOverlay || document.getElementById("select-overlay");
-    if (selOv?.classList.contains("active")) {
-      selOv.classList.remove("active");
-      selOv.innerHTML = "";
-      selOv.style.height = "";
-      for (const x of this.elements.stack.querySelectorAll(".xterm.select-mode")) x.classList.remove("select-mode");
-    }
     this.updateDisconnectOverlay();
     this.renderAgentLog();
     this.syncHash();
@@ -3050,6 +3047,10 @@ function init(baseTransport, config) {
       updateFindButtonState();
     }
   }
+
+  manager.onBeforeTabSwitch = () => {
+    if (selectOverlay.classList.contains("active")) exitSelectMode();
+  };
 
   function triggerFind() {
     if (findQuery) {
