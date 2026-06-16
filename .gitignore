@@ -21,5 +21,5 @@ __pycache__/
 # Aliases (user-specific)
 aliases.conf
 
-# Claude Code
 CLAUDE.md
+AGENTS.md

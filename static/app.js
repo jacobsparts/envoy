@@ -417,6 +417,9 @@ class BrowserTransport {
   }
 
   async connect(existingSessionId, mode = "takeover") {
+    if (this.sessionId && this.clientId) {
+      BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
+    }
     const result = await this.requestJson("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -425,6 +428,7 @@ class BrowserTransport {
     this.sessionId = result.sid;
     this.clientId = result.client_id || "";
     this.role = result.role || "lead";
+    this.closed = false;
     return result;
   }
 
@@ -490,6 +494,7 @@ class BrowserTransport {
     const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
     if (result.evicted) {
       this.closed = true;
+      BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
       onDisconnect({ kind: "evicted" });
       return;
     }
@@ -829,6 +834,10 @@ async function loadTransport() {
   return new BrowserTransport();
 }
 
+function isScrollbarTarget(target) {
+  return !!target?.closest?.(".xterm-scrollable-element > .scrollbar, .xterm-scrollable-element .scrollbar, .xterm-scrollable-element > .scrollbar > .slider, .xterm-scrollable-element .scrollbar .slider");
+}
+
 class TerminalTab {
   constructor(manager, transport, index) {
     this.manager = manager;
@@ -837,6 +846,7 @@ class TerminalTab {
     this.title = `Tab ${index}`;
     this.role = "lead";
     this.ptySize = null;
+    this.lastSentSize = null;
     this.disconnected = false;
     this.disconnectInfo = null;
     this.closed = false;
@@ -850,6 +860,9 @@ class TerminalTab {
     this.fileScanTail = "";
     this.fileResolveTimer = null;
     this.pendingFileCandidates = new Set();
+
+    this.userScrolledAwayFromBottom = false;
+    this.lastUserScrollAt = 0;
 
     this.pane = document.createElement("div");
     this.pane.className = "terminal-pane";
@@ -1008,6 +1021,18 @@ class TerminalTab {
       }
     });
     this.term.onRender(() => this.updateScrollbackClass());
+    this.term.onScroll(() => {
+      const buffer = this.term.buffer.active;
+      const atBottom = buffer.viewportY >= buffer.baseY;
+      this.userScrolledAwayFromBottom = !atBottom;
+      if (!atBottom) this.lastUserScrollAt = performance.now();
+    });
+    this.host.addEventListener("wheel", () => this.markUserScrollIntent(), { passive: true, capture: true });
+    this.host.addEventListener("touchstart", () => this.markUserScrollIntent(), { passive: true, capture: true });
+    this.host.addEventListener("pointerdown", e => {
+      if (isScrollbarTarget(e.target)) this.markUserScrollIntent();
+    }, { passive: true, capture: true });
+
     this.lastMeasuredSize = { width: 0, height: 0 };
     this.resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
       if (this.manager.activeTab !== this) return;
@@ -1034,6 +1059,7 @@ class TerminalTab {
     this.isNew = !existingSessionId;
     this.role = result.role || "lead";
     this.ptySize = (result.cols && result.rows) ? { cols: result.cols, rows: result.rows } : null;
+    this.lastSentSize = this.ptySize ? { ...this.ptySize } : null;
     this.button.dataset.sid = result.sid;
     this.updateRoleIndicator();
     this.updateTitle(result.custom_title || result.sid || this.title);
@@ -1093,6 +1119,7 @@ class TerminalTab {
     this.updateScrollbackClass();
     this.transport.onResize = (cols, rows) => {
       this.ptySize = { cols, rows };
+      this.lastSentSize = { cols, rows };
       if (this.role === "follow") {
         this.fitFollower();
       } else {
@@ -1181,7 +1208,7 @@ class TerminalTab {
             start: { x: item.index + 1, y: line },
             end: { x: item.index + item.raw.length, y: line },
           },
-          activate: () => this.openResolvedFile(info, false),
+          activate: () => {},
           hover: event => this.showFilePreview(info, event),
           leave: () => this.scheduleFilePreviewDismiss(),
         };
@@ -1258,21 +1285,39 @@ class TerminalTab {
   }
 
   scheduleActivationResize() {
-    this.fitTerminal();
+    this.markActivated();
+    this.fitTerminal({ preserveScroll: true });
     if (this._activationResizeTimer) {
       clearTimeout(this._activationResizeTimer);
     }
     this._activationResizeTimer = setTimeout(() => {
       this._activationResizeTimer = null;
       if (this.manager.activeTab === this && !this.closed) {
-        this.fitTerminal();
+        this.fitTerminal({ preserveScroll: true });
       }
     }, 1000);
   }
 
-  fitTerminal() {
+  markActivated() {
+    this.activatedAt = performance.now();
+  }
+
+  markUserScrollIntent() {
+    this.lastUserScrollAt = performance.now();
+    this.userScrolledAwayFromBottom = true;
+  }
+
+  shouldKeepPinnedToBottom() {
+    const buffer = this.term?.buffer?.active;
+    if (!buffer) return true;
+    if (performance.now() - (this.lastUserScrollAt || 0) < 1500) return false;
+    return buffer.viewportY >= buffer.baseY;
+  }
+
+  fitTerminal({ preserveScroll = false } = {}) {
     if (this.restoring) return;
     if (!this.host.offsetWidth || !this.host.offsetHeight) return;
+    const shouldPinToBottom = !preserveScroll && this.shouldKeepPinnedToBottom();
     try {
       this.term._core?._charSizeService?.measure();
     } catch {}
@@ -1283,12 +1328,24 @@ class TerminalTab {
       this.fit.fit();
       try { this.term.resize(this.term.cols, this.term.rows); } catch {}
     }
-    this.term.scrollToBottom();
+    if (shouldPinToBottom) this.term.scrollToBottom();
     this.updateScrollbackClass();
-    if (!this.disconnected) {
-      this.transport.resize(this.term.cols, this.term.rows).catch(err => this.handleWriteError(err));
-    }
+    this.sendResizeIfChanged();
   }
+
+  sendResizeIfChanged() {
+    if (this.disconnected) return;
+    const cols = this.term.cols;
+    const rows = this.term.rows;
+    if (!cols || !rows) return;
+    if (this.lastSentSize && this.lastSentSize.cols === cols && this.lastSentSize.rows === rows) return;
+    this.lastSentSize = { cols, rows };
+    this.transport.resize(cols, rows).catch(err => {
+      this.lastSentSize = null;
+      this.handleWriteError(err);
+    });
+  }
+
 
   fitFollower() {
     const baseFontSize = parseInt(localStorage.getItem("envoy-font-size")) || 17;
@@ -1545,7 +1602,18 @@ class TabManager {
     this.elements.stack.appendChild(tab.pane);
     this.elements.tabs.appendChild(tab.button);
     this.updateTabBar();
-    await tab.connect(sessionId, mode);
+    try {
+      await tab.connect(sessionId, mode);
+    } catch (err) {
+      this.tabs = this.tabs.filter(item => item !== tab);
+      tab.closed = true;
+      tab.resizeObserver?.disconnect();
+      tab.pane.remove();
+      tab.button.remove();
+      this.updateTabBar();
+      this.saveTabState();
+      throw err;
+    }
     if (activate || !this.activeTab) this.activateTab(tab.id);
     this.syncHash();
     this.saveTabState();
@@ -1641,8 +1709,17 @@ class TabManager {
     if (this.showToast) this.showToast(event.text, false, true);
   }
 
+  copyFileName(info) {
+    const name = info.name || "";
+    if (!name) return;
+    Promise.resolve(copyToClipboard(name))
+      .then(() => this.showToast?.("Filename copied"))
+      .catch(() => this.showToast?.("Failed to copy filename"))
+      .finally(() => requestAnimationFrame(() => this.activeTab?.focus()));
+  }
+
   copyFilePath(info) {
-    const path = info.relative_path || info.raw || info.path || "";
+    const path = info.path || "";
     if (!path) return;
     Promise.resolve(copyToClipboard(path))
       .then(() => this.showToast?.("Path copied"))
@@ -1677,10 +1754,20 @@ class TabManager {
         }
       }
       img.alt = info.name || "image preview";
+      img.addEventListener("load", () => this.positionFileTooltip(el, event), { once: true });
+      img.addEventListener("error", () => this.positionFileTooltip(el, event), { once: true });
       el.appendChild(img);
     }
     const actions = document.createElement("div");
     actions.className = "file-tooltip-actions";
+    const copyName = document.createElement("button");
+    copyName.type = "button";
+    copyName.textContent = "Copy Name";
+    copyName.addEventListener("click", e => {
+      e.stopPropagation();
+      this.copyFileName(info);
+    });
+    actions.appendChild(copyName);
     const copyPath = document.createElement("button");
     copyPath.type = "button";
     copyPath.textContent = "Copy Path";
@@ -1710,12 +1797,30 @@ class TabManager {
     }
     el.appendChild(actions);
     document.body.appendChild(el);
+    this.positionFileTooltip(el, event);
+    this.fileTooltip = el;
+  }
+
+  positionFileTooltip(el, event) {
+    const gap = 12;
+    const margin = 8;
     const rect = el.getBoundingClientRect();
-    const x = Math.min(window.innerWidth - rect.width - 8, Math.max(8, event.clientX + 12));
-    const y = Math.min(window.innerHeight - rect.height - 8, Math.max(8, event.clientY + 12));
+    const viewportLeft = 0;
+    const viewportTop = 0;
+    const viewportRight = window.innerWidth;
+    const viewportBottom = window.innerHeight;
+    let x = event.clientX + gap;
+    if (x + rect.width + margin > viewportRight) {
+      x = event.clientX - rect.width - gap;
+    }
+    x = Math.min(viewportRight - rect.width - margin, Math.max(viewportLeft + margin, x));
+    let y = event.clientY + gap;
+    if (y + rect.height + margin > viewportBottom) {
+      y = event.clientY - rect.height - gap;
+    }
+    y = Math.min(viewportBottom - rect.height - margin, Math.max(viewportTop + margin, y));
     el.style.left = `${x}px`;
     el.style.top = `${y}px`;
-    this.fileTooltip = el;
   }
 
   hideFileTooltip() {
@@ -2515,9 +2620,6 @@ function init(baseTransport, config) {
     scrollVelocity = 0;
   }
 
-  function isScrollbarTarget(target) {
-    return !!target?.closest?.(".xterm-scrollable-element > .scrollbar, .xterm-scrollable-element .scrollbar, .xterm-scrollable-element > .scrollbar > .slider, .xterm-scrollable-element .scrollbar .slider");
-  }
 
   function stopScrollbarDrag() {
     scrollbarDrag = null;
@@ -2580,9 +2682,11 @@ function init(baseTransport, config) {
       const cellHeight = getCellHeight();
       const lines = Math.trunc(scrollAccum / cellHeight);
       if (lines !== 0) {
+        currentTab()?.markUserScrollIntent();
         activeTerm.scrollLines(lines);
         scrollAccum -= lines * cellHeight;
       }
+
       scrollVelocity *= Math.pow(0.95, dt / 16.6667);
       if (Math.abs(scrollVelocity) < 0.02) {
         stopScrollMomentum();
@@ -2665,6 +2769,7 @@ function init(baseTransport, config) {
       const y = e.touches[0].clientY;
       const now = performance.now();
       const delta = scrollLastY - y;
+      if (Math.abs(delta) > 0) currentTab()?.markUserScrollIntent();
       scrollAccum += delta;
       const cellHeight = getCellHeight();
       const lines = Math.trunc(scrollAccum / cellHeight);
@@ -2678,6 +2783,7 @@ function init(baseTransport, config) {
       scrollLastY = y;
       scrollLastTime = now;
     }
+
   }, { passive: true, capture: true });
 
   document.addEventListener("touchend", e => {
@@ -3310,15 +3416,21 @@ function init(baseTransport, config) {
             return;
           }
           if (mode === "dict") {
-            voiceReset();
+            const finishDictation = () => voiceReset();
             if (data.text) {
               tab.transport.write(data.text).then(() => {
-                if (manager.activeTab === tab) {
+                if (manager.activeTab === tab && tab.shouldKeepPinnedToBottom()) {
                   tab.term.scrollToBottom();
-                  requestAnimationFrame(() => tab.term.scrollToBottom());
-                  setTimeout(() => tab.term.scrollToBottom(), 50);
+                  requestAnimationFrame(() => {
+                    if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
+                  });
+                  setTimeout(() => {
+                    if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
+                  }, 50);
                 }
-              }).catch(() => tab.markDisconnected());
+              }).catch(() => tab.markDisconnected()).finally(finishDictation);
+            } else {
+              finishDictation();
             }
             return;
           }
@@ -3459,7 +3571,7 @@ function init(baseTransport, config) {
         item.innerHTML =
           `<div class="session-item-id">${s.title || s.sid}</div>` +
           `<div class="session-item-cmd">${s.cmd.join(" ")}</div>` +
-          `<div class="session-item-status ${s.attached ? "attached" : "detached"}">${status} &mdash; ${s.path}</div>`;
+          `<div class="session-item-status ${s.attached ? "attached" : "detached"}">pid ${s.pid} &mdash; ${status} &mdash; ${s.path}</div>`;
         if (!isActive && !isOpen) {
           const actions = document.createElement("div");
           actions.className = "session-item-actions";
@@ -3993,10 +4105,15 @@ function init(baseTransport, config) {
   const fileViewerModal = document.getElementById("file-viewer-modal");
   const fileViewerClose = document.getElementById("file-viewer-close");
   const fileViewerDownload = document.getElementById("file-viewer-download");
+  const fileViewerCopyName = document.getElementById("file-viewer-copy-name");
   const fileViewerCopyPath = document.getElementById("file-viewer-copy-path");
   fileViewerClose.addEventListener("click", () => manager.closeFileViewer());
   fileViewerModal.addEventListener("click", e => {
     if (e.target === fileViewerModal) manager.closeFileViewer();
+  });
+  fileViewerCopyName.addEventListener("click", () => {
+    const info = manager._fileViewerInfo;
+    if (info) manager.copyFileName(info);
   });
   fileViewerCopyPath.addEventListener("click", () => {
     const info = manager._fileViewerInfo;
@@ -4574,7 +4691,7 @@ function init(baseTransport, config) {
     manager.resumeActiveReads();
     manager.reconnectDisconnectedTabs();
     updateMobileInputBar();
-    manager.activeTab?.fitTerminal();
+    manager.activeTab?.fitTerminal({ preserveScroll: true });
   };
 
   document.addEventListener("visibilitychange", () => {

@@ -633,20 +633,32 @@ class Session:
         excerpt = lines[-max_lines:]
         return "\n".join(excerpt)
 
+    def _cursor_line_locked(self, lines: list[str]) -> str:
+        row = len(self._pyte_screen.history.top) + self._pyte_screen.cursor.y
+        if 0 <= row < len(lines):
+            return lines[row]
+        return ""
+
+    def _cursor_at_line_end_locked(self, line: str) -> bool:
+        col = self._pyte_screen.cursor.x
+        return not line[col:].strip()
+
     def _detect_prompt_locked(self, lines: list[str]) -> tuple[bool, str, str]:
-        for line in reversed(lines[-3:]):
-            if self._prompt_sentinel in line:
-                return True, "high", "shell"
-        last_nonempty = next((line for line in reversed(lines) if line.strip()), "")
-        if not last_nonempty:
+        cursor_line = self._cursor_line_locked(lines)
+        if not self._cursor_at_line_end_locked(cursor_line):
             return False, "low", "unknown"
-        if re.match(r"^(>>>|\.\.\.|In \[\d+\]:) ?$", last_nonempty):
+        if self._prompt_sentinel in cursor_line:
+            return True, "high", "shell"
+        stripped = cursor_line.strip()
+        if not stripped:
+            return False, "low", "unknown"
+        if re.match(r"^(>>>|\.\.\.|In \[\d+\]:) ?$", stripped):
             return True, "high", "python_repl"
-        if re.match(r"^\((Pdb|gdb)\) ?$", last_nonempty):
+        if re.match(r"^\((Pdb|gdb)\) ?$", stripped):
             return True, "high", "debugger"
-        if re.match(r"^.{0,200}[#$%>] ?$", last_nonempty):
+        if re.match(r"^.{0,200}[#$%>] ?$", stripped):
             return True, "medium", "shell_like"
-        if re.match(r"^\(.+\) .{0,200}[#$] ?$", last_nonempty):
+        if re.match(r"^\(.+\) .{0,200}[#$] ?$", stripped):
             return True, "medium", "shell_like"
         return False, "low", "unknown"
 
@@ -1231,7 +1243,8 @@ class EnvoyService:
         session = self._get_session(session_id)
         raw = path
         info = session.resolved_files.get(raw)
-        if not info or info.get("path") != path:
+        info_path = str(info["path"]) if info and info.get("path") == path else ""
+        if not info_path or not os.path.isfile(info_path):
             if os.path.isfile(path):
                 info = session._file_info(raw, os.path.realpath(path))
             else:
@@ -1239,8 +1252,12 @@ class EnvoyService:
                 if not resolved:
                     raise ValueError("File not found")
                 info = resolved
-        with open(str(info["path"]), "rb") as handle:
-            return info, handle.read()
+            info_path = str(info["path"])
+        try:
+            with open(info_path, "rb") as handle:
+                return info, handle.read()
+        except OSError as exc:
+            raise ValueError("File not found") from exc
 
     def send_text_message(self, session_id: str, text: str,
                           agent_settings: dict | None = None) -> dict[str, object]:
@@ -1358,6 +1375,7 @@ class EnvoyService:
                 "path": s.path,
                 "cmd": s.cmd,
                 "cwd": s.cwd,
+                "pid": s.proc.pid,
                 "attached": s._timeout is None,
                 "clients": len(s.clients),
             })
