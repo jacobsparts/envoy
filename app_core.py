@@ -18,6 +18,7 @@ import secrets
 import shlex
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -79,6 +80,7 @@ def render_html(mode: str, web_prefix: str = "") -> str:
 UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
+MAX_CLIENT_OUTPUT_BUFFER = 4 * 1024 * 1024
 SESSION_TIMEOUT = 60 * 60 * 24
 TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
@@ -217,7 +219,8 @@ class ClientState:
 
 class Session:
     def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
-                 login: bool = False, extra_env: dict[str, str] | None = None):
+                 login: bool = False, extra_env: dict[str, str] | None = None,
+                 output_callback: Callable[[bytes], None] | None = None):
         self.sid = sid
         self.path = path
         self.cmd = list(cmd)
@@ -278,6 +281,7 @@ class Session:
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
         self._timeout: threading.Timer | None = None
+        self._output_callback = output_callback
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name=f"pty-{sid}")
         self._reader.start()
 
@@ -348,8 +352,14 @@ class Session:
         self.scrollback.append(data)
         self.scrollback_bytes += len(data)
         self._trim_scrollback_locked()
-        for cs in self.clients.values():
+        evicted_clients = []
+        for client_id, cs in list(self.clients.items()):
             cs.output.extend(data)
+            if len(cs.output) > MAX_CLIENT_OUTPUT_BUFFER:
+                evicted_clients.append(client_id)
+        for client_id in evicted_clients:
+            self.clients.pop(client_id, None)
+            self._push_callbacks.pop(client_id, None)
         try:
             self._pyte_stream.feed(data.decode("utf-8", errors="replace"))
         except Exception:
@@ -474,6 +484,11 @@ class Session:
                     self._pending_ready.notify_all()
                     deliveries = self._collect_push_payloads_locked()
                 self._dispatch_push_payloads(deliveries)
+                if self._output_callback is not None:
+                    try:
+                        self._output_callback(data)
+                    except Exception:
+                        pass
         finally:
             rc = self.proc.wait()
             self.exit_code = rc
@@ -492,6 +507,11 @@ class Session:
                 self._pending_ready.notify_all()
                 deliveries = self._collect_push_payloads_locked()
             self._dispatch_push_payloads(deliveries)
+            if self._output_callback is not None:
+                try:
+                    self._output_callback(self.exit_message)
+                except Exception:
+                    pass
             self.cancel_timeout()
             try:
                 os.close(self.master)
@@ -1046,9 +1066,275 @@ class Session:
 CLIENT_STALE_SECONDS = 30
 
 
+
+class WorkerSession:
+    def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
+                 login: bool = False, extra_env: dict[str, str] | None = None):
+        self.sid = sid
+        self.path = path
+        self.cmd = list(cmd)
+        self.cwd = cwd
+        self.title = ""
+        self.clients: dict[str, ClientState] = {}
+        self._push_callbacks: dict[str, Callable[[dict[str, object]], None]] = {}
+        self.last_seen: float = time.monotonic()
+        self._last_output_at: float = self.last_seen
+        self._last_input_at: float = self.last_seen
+        self._last_agent_request: tuple[str, float] | None = None
+        self._pyte_known_lines: list[str] = []
+        self._lock = threading.Lock()
+        self._pending_ready = threading.Condition(self._lock)
+        self._timeout: threading.Timer | None = None
+        self.voice_cancel: threading.Event | None = None
+        self.agent_lock = threading.Lock()
+        self.alive = True
+        self.exit_code: int | None = None
+        self._control_lock = threading.Lock()
+        self._control_ready = threading.Condition()
+        self._pending_control: dict[int, dict[str, object] | None] = {}
+        self._next_control_id = 1
+
+        control_parent, control_child = socket.socketpair()
+        input_r, input_w = os.pipe()
+        output_r, output_w = os.pipe()
+        config = {
+            "sid": sid,
+            "path": path,
+            "cmd": self.cmd,
+            "cwd": cwd,
+            "login": login,
+            "extra_env": extra_env or {},
+        }
+        config_b64 = base64.b64encode(json.dumps(config).encode("utf-8")).decode("ascii")
+        worker = str(APP_DIR / "pty_worker.py")
+        self.proc = subprocess.Popen(
+            [sys.executable, worker, str(control_child.fileno()), str(input_r), str(output_w), config_b64, str(os.getpid())],
+            pass_fds=[control_child.fileno(), input_r, output_w],
+            cwd=str(APP_DIR),
+        )
+        control_child.close()
+        os.close(input_r)
+        os.close(output_w)
+        self._control_sock = control_parent
+        self._input_fd = input_w
+        self._output_fd = output_r
+        self._control_reader = threading.Thread(target=self._control_loop, daemon=True, name=f"worker-control-{sid}")
+        self._output_reader = threading.Thread(target=self._output_loop, daemon=True, name=f"worker-output-{sid}")
+        self._control_reader.start()
+        self._output_reader.start()
+
+    def _drain_client_locked(self, client_id: str) -> dict[str, object] | None:
+        return Session._drain_client_locked(self, client_id)
+
+    def _collect_push_payloads_locked(self) -> list[tuple[Callable[[dict[str, object]], None], dict[str, object]]]:
+        return Session._collect_push_payloads_locked(self)
+
+    def _dispatch_push_payloads(self, deliveries: list[tuple[Callable[[dict[str, object]], None], dict[str, object]]]) -> None:
+        return Session._dispatch_push_payloads(self, deliveries)
+
+    def register_push(self, client_id: str, callback: Callable[[dict[str, object]], None]) -> dict[str, object] | None:
+        return Session.register_push(self, client_id, callback)
+
+    def unregister_push(self, client_id: str, callback: Callable[[dict[str, object]], None] | None = None) -> None:
+        return Session.unregister_push(self, client_id, callback)
+
+    def add_client(self, client_id: str, role: str) -> ClientState:
+        return Session.add_client(self, client_id, role)
+
+    def remove_client(self, client_id: str) -> str | None:
+        return Session.remove_client(self, client_id)
+
+    def get_lead_client(self) -> ClientState | None:
+        return Session.get_lead_client(self)
+
+    def wait_for_client(self, client_id: str, timeout: float) -> tuple[bytes, list[dict[str, str]], bool, tuple[int, int] | None]:
+        return Session.wait_for_client(self, client_id, timeout)
+
+    def push_agent_event(self, kind: str, text: str) -> None:
+        return Session.push_agent_event(self, kind, text)
+
+    def start_timeout(self) -> None:
+        return Session.start_timeout(self)
+
+    def cancel_timeout(self) -> None:
+        return Session.cancel_timeout(self)
+
+    def _timeout_expired(self) -> None:
+        self._timeout = None
+        if self.alive:
+            self.proc.terminate()
+
+    def _append_output(self, data: bytes) -> None:
+        self._last_output_at = time.monotonic()
+        evicted_clients = []
+        for client_id, cs in list(self.clients.items()):
+            cs.output.extend(data)
+            if len(cs.output) > MAX_CLIENT_OUTPUT_BUFFER:
+                evicted_clients.append(client_id)
+        for client_id in evicted_clients:
+            self.clients.pop(client_id, None)
+            self._push_callbacks.pop(client_id, None)
+
+    def _output_loop(self) -> None:
+        try:
+            while True:
+                try:
+                    data = os.read(self._output_fd, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                with self._lock:
+                    self._append_output(data)
+                    self._pending_ready.notify_all()
+                    deliveries = self._collect_push_payloads_locked()
+                self._dispatch_push_payloads(deliveries)
+        finally:
+            with self._lock:
+                self.alive = False
+                self._pending_ready.notify_all()
+                deliveries = self._collect_push_payloads_locked()
+            self._dispatch_push_payloads(deliveries)
+
+    def _control_loop(self) -> None:
+        try:
+            reader = self._control_sock.makefile("rb", buffering=0)
+            for raw in reader:
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    continue
+                req_id = msg.get("id")
+                if req_id is not None:
+                    with self._control_ready:
+                        self._pending_control[int(req_id)] = msg
+                        self._control_ready.notify_all()
+                if msg.get("type") == "exit":
+                    with self._lock:
+                        self.alive = False
+                        self.exit_code = msg.get("exit_code")
+                        self._pending_ready.notify_all()
+        finally:
+            with self._control_ready:
+                for req_id in list(self._pending_control):
+                    if self._pending_control[req_id] is None:
+                        self._pending_control[req_id] = {"ok": False, "error": "worker disconnected"}
+                self._control_ready.notify_all()
+
+    def _call_control(self, msg: dict[str, object], timeout: float = 30.0) -> dict[str, object]:
+        with self._control_lock:
+            with self._control_ready:
+                req_id = self._next_control_id
+                self._next_control_id += 1
+                self._pending_control[req_id] = None
+            msg = dict(msg)
+            msg["id"] = req_id
+            data = json.dumps(msg, separators=(",", ":")).encode("utf-8") + b"\n"
+            self._control_sock.sendall(data)
+        deadline = time.monotonic() + timeout
+        with self._control_ready:
+            while self._pending_control.get(req_id) is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._pending_control.pop(req_id, None)
+                    raise TimeoutError("worker control request timed out")
+                self._control_ready.wait(remaining)
+            resp = self._pending_control.pop(req_id)
+        assert resp is not None
+        if not resp.get("ok", False):
+            raise ValueError(str(resp.get("error") or "worker control request failed"))
+        return resp
+
+    def write(self, data: bytes) -> None:
+        if self.alive:
+            with self._lock:
+                self._last_input_at = time.monotonic()
+            os.write(self._input_fd, data)
+
+    def resize(self, cols: int, rows: int) -> None:
+        self._call_control({"type": "resize", "cols": cols, "rows": rows}, timeout=5)
+
+    def snapshot_response(self, role: str) -> dict[str, object]:
+        resp = self._call_control({"type": "snapshot", "role": role, "title": build_title(self.path)}, timeout=30)
+        if self.title:
+            resp["custom_title"] = self.title
+        return {k: v for k, v in resp.items() if k not in {"ok", "type", "id"}}
+
+    def get_scrollback(self) -> bytes:
+        resp = self.snapshot_response("lead")
+        return base64.b64decode(str(resp.get("output") or "").encode("ascii"))
+
+    def get_archived_text(self) -> str:
+        return str(self.snapshot_response("lead").get("archive_text") or "")
+
+    def get_reconnect_debug(self) -> dict[str, object]:
+        value = self.snapshot_response("lead").get("reconnect_debug") or {}
+        return value if isinstance(value, dict) else {}
+
+    def get_terminal_state(self) -> dict[str, object]:
+        resp = self._call_control({"type": "terminal_state"}, timeout=30)
+        state = resp.get("state") or {}
+        return state if isinstance(state, dict) else {}
+
+    def get_terminal_lines(self) -> list[str]:
+        resp = self._call_control({"type": "terminal_lines"}, timeout=30)
+        lines = resp.get("lines") or []
+        return [str(line) for line in lines] if isinstance(lines, list) else []
+
+    def execute_terminal_action(self, action: dict[str, object]) -> dict[str, object]:
+        resp = self._call_control({"type": "execute_action", "action": action}, timeout=float(action.get("timeout", 30) or 30) + 5)
+        result = resp.get("result") or {}
+        return result if isinstance(result, dict) else {}
+
+    def save_upload(self, name: str, content: bytes) -> str:
+        resp = self._call_control({
+            "type": "save_upload",
+            "name": name,
+            "data": base64.b64encode(content).decode("ascii"),
+        }, timeout=30)
+        return str(resp.get("path") or "")
+
+    def resolve_files(self, paths: list[str]) -> list[dict[str, object]]:
+        resp = self._call_control({"type": "resolve_files", "paths": paths}, timeout=30)
+        files = resp.get("files") or []
+        return files if isinstance(files, list) else []
+
+    def resolve_file(self, path: str) -> dict[str, object] | None:
+        resp = self._call_control({"type": "resolve_file", "path": path}, timeout=30)
+        info = resp.get("info")
+        return info if isinstance(info, dict) else None
+
+    def cleanup(self) -> None:
+        self.cancel_timeout()
+        cancel = self.voice_cancel
+        if cancel:
+            cancel.set()
+        with self._lock:
+            self._push_callbacks.clear()
+        try:
+            self._call_control({"type": "close"}, timeout=1)
+        except Exception:
+            pass
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        for fd in (self._input_fd, self._output_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            self._control_sock.close()
+        except OSError:
+            pass
+
+
 class EnvoyService:
     def __init__(self, extra_env: dict[str, str] | None = None):
-        self._sessions: dict[str, Session] = {}
+        self._sessions: dict[str, WorkerSession] = {}
         self._extra_env = dict(extra_env) if extra_env else None
         self._lock = threading.Lock()
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True, name="session-reaper")
@@ -1078,19 +1364,21 @@ class EnvoyService:
     def _new_session_id(self) -> str:
         return secrets.token_hex(4)
 
-    def _get_session(self, session_id: str) -> Session:
+    def _get_session(self, session_id: str) -> WorkerSession:
         with self._lock:
             session = self._sessions.get(session_id)
         if not session:
             raise ValueError("No active session")
         return session
 
-    def _new_session(self, path: str) -> Session:
+    def _new_session(self, path: str) -> WorkerSession:
         cmd, cwd, login = resolve_cli(path)
-        session = Session(self._new_session_id(), path, cmd, cwd, login=login, extra_env=self._extra_env)
         with self._lock:
-            while session.sid in self._sessions:
-                session.sid = self._new_session_id()
+            sid = self._new_session_id()
+            while sid in self._sessions:
+                sid = self._new_session_id()
+        session = WorkerSession(sid, path, cmd, cwd, login=login, extra_env=self._extra_env)
+        with self._lock:
             self._sessions[session.sid] = session
         return session
 
@@ -1132,40 +1420,16 @@ class EnvoyService:
                     session.add_client(client_id, "lead")
                 session._pending_ready.notify_all()
             role = session.clients[client_id].role
-            resp = {
-                "sid": session.sid,
-                "client_id": client_id,
-                "role": role,
-                "cols": session._pyte_screen.columns,
-                "rows": session._pyte_screen.lines,
-                "title": build_title(session.path),
-                "archive_text": session.get_archived_text(),
-                "reconnect_debug": session.get_reconnect_debug(),
-                "output": self._encode(session.get_scrollback()),
-                "alive": session.alive,
-                "exit_code": session.exit_code,
-            }
-            if session.title:
-                resp["custom_title"] = session.title
+            resp = session.snapshot_response(role)
+            resp["client_id"] = client_id
             return resp
 
         session = self._new_session(path)
         client_id = secrets.token_hex(8)
         with session._lock:
             session.add_client(client_id, "lead")
-        resp = {
-            "sid": session.sid,
-            "client_id": client_id,
-            "role": "lead",
-            "title": build_title(session.path),
-            "archive_text": session.get_archived_text(),
-            "reconnect_debug": session.get_reconnect_debug(),
-            "output": self._encode(session.get_scrollback()),
-            "alive": session.alive,
-            "exit_code": session.exit_code,
-        }
-        if session.title:
-            resp["custom_title"] = session.title
+        resp = session.snapshot_response("lead")
+        resp["client_id"] = client_id
         return resp
 
     def read(self, session_id: str, client_id: str = "", wait_timeout: float = 0.0) -> dict[str, object]:
@@ -1241,21 +1505,13 @@ class EnvoyService:
 
     def read_file(self, session_id: str, path: str) -> tuple[dict[str, object], bytes]:
         session = self._get_session(session_id)
-        raw = path
-        info = session.resolved_files.get(raw)
-        info_path = str(info["path"]) if info and info.get("path") == path else ""
-        if not info_path or not os.path.isfile(info_path):
-            if os.path.isfile(path):
-                info = session._file_info(raw, os.path.realpath(path))
-            else:
-                resolved = session.resolve_file(path)
-                if not resolved:
-                    raise ValueError("File not found")
-                info = resolved
-            info_path = str(info["path"])
+        resolved = session.resolve_file(path)
+        if not resolved:
+            raise ValueError("File not found")
+        info_path = str(resolved["path"])
         try:
             with open(info_path, "rb") as handle:
-                return info, handle.read()
+                return resolved, handle.read()
         except OSError as exc:
             raise ValueError("File not found") from exc
 
@@ -1386,6 +1642,10 @@ class EnvoyService:
             session = self._sessions.get(session_id)
         if session:
             session.title = title
+            try:
+                session._call_control({"type": "rename", "title": title}, timeout=5)
+            except Exception:
+                pass
         return {"ok": True}
 
     def close_session(self, session_id: str) -> dict[str, bool]:

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3.11
 """Desktop entrypoint for envoy using pywebview."""
 
 from __future__ import annotations

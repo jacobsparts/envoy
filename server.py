@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.11
 """Web entrypoint for envoy."""
 
 from __future__ import annotations
