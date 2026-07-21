@@ -14,6 +14,7 @@ import os
 import pty
 import re
 import resource
+import signal
 import secrets
 import shlex
 import struct
@@ -86,6 +87,37 @@ TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
 DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
 AGENT_DUPLICATE_REQUEST_WINDOW_SECONDS = 15.0
+LIVE_PYTE_HISTORY_LINES = 1000
+ARCHIVE_HISTORY_LINES = 200000
+ARCHIVE_PYTE_HISTORY_LINES = 1000
+
+
+def _parse_size(value: str, default: int) -> int:
+    text = (value or "").strip().lower()
+    if not text:
+        return default
+    multipliers = {
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+    }
+    match = re.fullmatch(r"(\d+)([a-z]*)", text)
+    if not match:
+        return default
+    number, suffix = match.groups()
+    return int(number) * multipliers.get(suffix, 1)
+
+
+SESSION_MEM_LIMIT = _parse_size(os.environ.get("ENVOY_SESSION_MEMORY_MAX", "4G"), 4 * 1024 ** 3)
+
+
+def apply_session_resource_limits() -> None:
+    if SESSION_MEM_LIMIT <= 0:
+        return
+    resource.setrlimit(resource.RLIMIT_AS, (SESSION_MEM_LIMIT, SESSION_MEM_LIMIT))
 
 
 def _login_env() -> dict[str, str]:
@@ -217,6 +249,29 @@ class ClientState:
         self.pending_resize: tuple[int, int] | None = None
 
 
+class FlatteningHistoryScreen(pyte.HistoryScreen):
+    def __init__(self, columns: int, lines: int, history: int,
+                 on_evict: Callable[[object, int], None],
+                 on_clear: Callable[[], None]):
+        self._on_evict = on_evict
+        self._on_clear = on_clear
+        super().__init__(columns, lines, history=history)
+
+    def index(self) -> None:
+        bottom = self.margins.bottom if self.margins else self.lines - 1
+        if (
+            self.cursor.y == bottom
+            and self.history.top.maxlen
+            and len(self.history.top) == self.history.top.maxlen
+        ):
+            self._on_evict(self.history.top[0], self.columns)
+        super().index()
+
+    def _reset_history(self) -> None:
+        super()._reset_history()
+        self._on_clear()
+
+
 class Session:
     def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
                  login: bool = False, extra_env: dict[str, str] | None = None,
@@ -250,14 +305,20 @@ class Session:
             shell_name = os.path.basename(cmd[0])
             popen_kwargs["executable"] = cmd[0]
             cmd = [f"-{shell_name}"] + cmd[1:]
-        _SESSION_MEM_LIMIT = 4 * 1024 * 1024 * 1024  # 4 GB
-        def _limit_mem():
-            resource.setrlimit(resource.RLIMIT_RSS, (_SESSION_MEM_LIMIT, _SESSION_MEM_LIMIT))
-        self.proc = subprocess.Popen(cmd, **popen_kwargs, preexec_fn=_limit_mem)
+        self.proc = subprocess.Popen(cmd, **popen_kwargs, preexec_fn=apply_session_resource_limits)
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
-        self._archive_pyte_screen = pyte.HistoryScreen(80, 24, history=200000)
+        self._archive_lines: collections.deque[str] = collections.deque(
+            maxlen=ARCHIVE_HISTORY_LINES - ARCHIVE_PYTE_HISTORY_LINES
+        )
+        self._archive_pyte_screen = FlatteningHistoryScreen(
+            80,
+            24,
+            history=ARCHIVE_PYTE_HISTORY_LINES,
+            on_evict=self._flatten_archive_line,
+            on_clear=self._archive_lines.clear,
+        )
         self._archive_pyte_stream = pyte.Stream(self._archive_pyte_screen)
         self._last_archive_cut = {"kind": "init", "bytes": 0}
         self._archive_total_bytes = 0
@@ -267,7 +328,7 @@ class Session:
         self.exit_message = b""
         self.exit_code: int | None = None
         # pyte virtual terminal for agent context
-        self._pyte_screen = pyte.HistoryScreen(80, 24, history=50000)
+        self._pyte_screen = pyte.HistoryScreen(80, 24, history=LIVE_PYTE_HISTORY_LINES)
         self._pyte_stream = pyte.Stream(self._pyte_screen)
         self._pyte_known_lines: list[str] = []
         self.voice_cancel: threading.Event | None = None
@@ -364,6 +425,13 @@ class Session:
             self._pyte_stream.feed(data.decode("utf-8", errors="replace"))
         except Exception:
             pass
+
+    def _flatten_archive_line(self, line: object, columns: int) -> None:
+        rendered = "".join(
+            line[i].data if i in line else " "
+            for i in range(columns)
+        )
+        self._archive_lines.append(rendered.rstrip())
 
     def _feed_archive(self, data: bytes, cut_kind: str = "unknown") -> None:
         if not data:
@@ -537,15 +605,23 @@ class Session:
             lines.pop()
         return lines
 
+    def _archived_lines_locked(self) -> list[str]:
+        lines = [*self._archive_lines, *self._render_pyte_screen(self._archive_pyte_screen)]
+        while lines and not lines[-1]:
+            lines.pop()
+        return lines
+
     def get_archived_text(self) -> str:
         with self._lock:
-            return "\n".join(self._render_pyte_screen(self._archive_pyte_screen))
+            return "\n".join(self._archived_lines_locked())
 
     def get_reconnect_debug(self) -> dict[str, object]:
         with self._lock:
-            archive_lines = self._render_pyte_screen(self._archive_pyte_screen)
+            archive_lines = self._archived_lines_locked()
             return {
                 "archive_lines": len(archive_lines),
+                "archive_flattened_lines": len(self._archive_lines),
+                "archive_pyte_lines": len(self._render_pyte_screen(self._archive_pyte_screen)),
                 "archive_bytes": self._archive_total_bytes,
                 "recent_bytes": self.scrollback_bytes,
                 "recent_chunks": len(self.scrollback),
@@ -1038,24 +1114,61 @@ class Session:
             timer.cancel()
             self._timeout = None
 
+    def _terminate_process_tree(self, timeout: float = 2.0) -> None:
+        try:
+            pgid = os.getpgid(self.proc.pid)
+        except OSError:
+            pgid = None
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            except OSError:
+                self.proc.terminate()
+        else:
+            self.proc.terminate()
+        try:
+            self.proc.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
+            except OSError:
+                self.proc.kill()
+        else:
+            self.proc.kill()
+
     def _timeout_expired(self) -> None:
         self._timeout = None
         if self.alive:
-            self.proc.terminate()
+            try:
+                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+            except OSError:
+                self.proc.terminate()
+
+    def _notify_push_callbacks_closed(self) -> None:
+        with self._lock:
+            callbacks = list(self._push_callbacks.values())
+            self._push_callbacks.clear()
+            self.alive = False
+            self._pending_ready.notify_all()
+            payload = {"output": b"", "events": [], "alive": False, "exit_code": self.exit_code}
+            deliveries = [(callback, payload) for callback in callbacks]
+        self._dispatch_push_payloads(deliveries)
 
     def cleanup(self) -> None:
         self.cancel_timeout()
         cancel = self.voice_cancel
         if cancel:
             cancel.set()
-        with self._lock:
-            self._push_callbacks.clear()
-        if self.alive:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        self._notify_push_callbacks_closed()
+        if self.proc.poll() is None:
+            self._terminate_process_tree()
         for path in self.session_files:
             try:
                 os.remove(path)
@@ -1163,6 +1276,9 @@ class WorkerSession:
         self._timeout = None
         if self.alive:
             self.proc.terminate()
+    def _notify_push_callbacks_closed(self) -> None:
+        return Session._notify_push_callbacks_closed(self)
+
 
     def _append_output(self, data: bytes) -> None:
         self._last_output_at = time.monotonic()
@@ -1309,8 +1425,7 @@ class WorkerSession:
         cancel = self.voice_cancel
         if cancel:
             cancel.set()
-        with self._lock:
-            self._push_callbacks.clear()
+        self._notify_push_callbacks_closed()
         try:
             self._call_control({"type": "close"}, timeout=1)
         except Exception:
@@ -1343,12 +1458,23 @@ class EnvoyService:
     def _reap_loop(self) -> None:
         while True:
             time.sleep(CLIENT_STALE_SECONDS)
-            now = time.monotonic()
-            with self._lock:
-                sessions = list(self._sessions.values())
-            for s in sessions:
-                if s.alive and not s.clients and s._timeout is None and now - s.last_seen >= CLIENT_STALE_SECONDS:
-                    s.start_timeout()
+            self._reap_sessions()
+
+    def _reap_sessions(self) -> None:
+        now = time.monotonic()
+        dead = []
+        detached = []
+        with self._lock:
+            for sid, session in list(self._sessions.items()):
+                if not session.alive:
+                    self._sessions.pop(sid, None)
+                    dead.append(session)
+                elif not session.clients and session._timeout is None and now - session.last_seen >= CLIENT_STALE_SECONDS:
+                    detached.append(session)
+        for session in dead:
+            session.cleanup()
+        for session in detached:
+            session.start_timeout()
 
     def _encode(self, payload: bytes) -> str:
         return base64.b64encode(payload).decode("ascii")
@@ -1650,9 +1776,12 @@ class EnvoyService:
 
     def close_session(self, session_id: str) -> dict[str, bool]:
         with self._lock:
-            session = self._sessions.pop(session_id, None)
+            session = self._sessions.get(session_id)
         if session:
             session.cleanup()
+            with self._lock:
+                if self._sessions.get(session_id) is session:
+                    self._sessions.pop(session_id, None)
         return {"ok": True}
 
     def mark_detached(self, session_id: str, client_id: str = "") -> None:

@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 
-from app_core import Session
+from app_core import Session, apply_session_resource_limits
 
 
 def _start_parent_watchdog(parent_pid: int) -> None:
@@ -39,6 +39,7 @@ def main() -> None:
     if len(sys.argv) != 6:
         raise SystemExit("usage: pty_worker.py CONTROL_FD INPUT_FD OUTPUT_FD CONFIG_B64 PARENT_PID")
     _start_parent_watchdog(int(sys.argv[5]))
+    apply_session_resource_limits()
 
     control_fd = int(sys.argv[1])
     input_fd = int(sys.argv[2])
@@ -86,6 +87,10 @@ def main() -> None:
             pass
         try:
             os.close(output_fd)
+        except OSError:
+            pass
+        try:
+            control_sock.shutdown(socket.SHUT_RD)
         except OSError:
             pass
 
