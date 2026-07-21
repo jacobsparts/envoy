@@ -309,6 +309,8 @@ class Session:
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
+        self._output_total_bytes = 0
+        self._archive_resize_events: collections.deque[tuple[int, int, int]] = collections.deque()
         self._archive_lines: collections.deque[str] = collections.deque(
             maxlen=ARCHIVE_HISTORY_LINES - ARCHIVE_PYTE_HISTORY_LINES
         )
@@ -412,6 +414,7 @@ class Session:
         self._last_output_at = time.monotonic()
         self.scrollback.append(data)
         self.scrollback_bytes += len(data)
+        self._output_total_bytes += len(data)
         self._trim_scrollback_locked()
         evicted_clients = []
         for client_id, cs in list(self.clients.items()):
@@ -433,15 +436,37 @@ class Session:
         )
         self._archive_lines.append(rendered.rstrip())
 
+    def _apply_archive_resizes_locked(self) -> None:
+        while (
+            self._archive_resize_events
+            and self._archive_resize_events[0][0] <= self._archive_total_bytes
+        ):
+            _, cols, rows = self._archive_resize_events.popleft()
+            self._archive_pyte_screen.resize(rows, cols)
+
     def _feed_archive(self, data: bytes, cut_kind: str = "unknown") -> None:
         if not data:
+            self._apply_archive_resizes_locked()
             return
-        self._archive_total_bytes += len(data)
         self._last_archive_cut = {"kind": cut_kind, "bytes": len(data)}
-        try:
-            self._archive_pyte_stream.feed(data.decode("utf-8", errors="replace"))
-        except Exception:
-            pass
+        offset = 0
+        while offset < len(data):
+            self._apply_archive_resizes_locked()
+            end = len(data)
+            if self._archive_resize_events:
+                resize_at = self._archive_resize_events[0][0]
+                end = min(end, offset + max(0, resize_at - self._archive_total_bytes))
+            if end == offset:
+                self._apply_archive_resizes_locked()
+                continue
+            chunk = data[offset:end]
+            try:
+                self._archive_pyte_stream.feed(chunk.decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            self._archive_total_bytes += len(chunk)
+            offset = end
+        self._apply_archive_resizes_locked()
 
     def _ansi_safe_cut(self, data: bytes, overflow: int) -> tuple[int, str]:
         if not data:
@@ -625,6 +650,9 @@ class Session:
                 "archive_bytes": self._archive_total_bytes,
                 "recent_bytes": self.scrollback_bytes,
                 "recent_chunks": len(self.scrollback),
+                "pending_archive_resizes": len(self._archive_resize_events),
+                "archive_cols": self._archive_pyte_screen.columns,
+                "archive_rows": self._archive_pyte_screen.lines,
                 "last_archive_cut": dict(self._last_archive_cut),
                 "live_lines": len(self._render_pyte_screen(self._pyte_screen)),
                 "cols": self._pyte_screen.columns,
@@ -975,12 +1003,20 @@ class Session:
         }
 
     def resize(self, cols: int, rows: int) -> None:
-        if self.alive:
-            winsize = struct.pack("HHHH", rows, cols, 0, 0)
-            fcntl.ioctl(self.master, termios.TIOCSWINSZ, winsize)
         with self._lock:
+            if self.alive:
+                winsize = struct.pack("HHHH", rows, cols, 0, 0)
+                fcntl.ioctl(self.master, termios.TIOCSWINSZ, winsize)
             self._pyte_screen.resize(rows, cols)
-            self._archive_pyte_screen.resize(rows, cols)
+            event = (self._output_total_bytes, cols, rows)
+            if (
+                self._archive_resize_events
+                and self._archive_resize_events[-1][0] == self._output_total_bytes
+            ):
+                self._archive_resize_events[-1] = event
+            else:
+                self._archive_resize_events.append(event)
+            self._apply_archive_resizes_locked()
 
     def save_upload(self, name: str, content: bytes) -> str:
         os.makedirs(UPLOAD_DIR, exist_ok=True)
