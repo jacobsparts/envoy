@@ -968,6 +968,11 @@ class TerminalTab {
       this.manager._dragTab = this;
       this.button.classList.add("dragging");
       e.dataTransfer.effectAllowed = "move";
+      if (!window.pywebview && this.transport.sessionId) {
+        const transfer = this.manager.beginTabTransfer(this);
+        e.dataTransfer.setData("application/x-envoy-tab", JSON.stringify(transfer));
+        e.dataTransfer.setData("text/plain", this.transport.sessionId);
+      }
     });
     this.button.addEventListener("dragend", () => {
       this.button.classList.remove("dragging");
@@ -975,9 +980,11 @@ class TerminalTab {
       for (const el of this.manager.elements.tabs.children) {
         el.classList.remove("drag-over-left", "drag-over-right");
       }
+      this.manager.finishTabDrag(this);
     });
     this.button.addEventListener("dragover", e => {
-      if (!this.manager._dragTab || this.manager._dragTab === this) return;
+      const crossWindow = Array.from(e.dataTransfer?.types || []).includes("application/x-envoy-tab");
+      if ((!this.manager._dragTab && !crossWindow) || this.manager._dragTab === this) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       const rect = this.button.getBoundingClientRect();
@@ -990,13 +997,22 @@ class TerminalTab {
     });
     this.button.addEventListener("drop", e => {
       e.preventDefault();
+      e.stopPropagation();
       this.button.classList.remove("drag-over-left", "drag-over-right");
       const from = this.manager._dragTab;
-      if (!from || from === this) return;
       const rect = this.button.getBoundingClientRect();
       const mid = rect.left + rect.width / 2;
       const before = e.clientX < mid;
-      this.manager.moveTab(from, this, before);
+      if (from && from !== this) {
+        this.manager.moveTab(from, this, before);
+        return;
+      }
+      this.manager.acceptTabDrop(e, this, before);
+    });
+    this.button.addEventListener("contextmenu", e => {
+      if (window.pywebview || !this.transport.sessionId || this.manager.tabs.length <= 1) return;
+      e.preventDefault();
+      this.manager.popOutTab(this);
     });
     const commitTitle = () => {
       this.button.classList.remove("editing");
@@ -1502,6 +1518,17 @@ class TerminalTab {
     this.host.classList.toggle("has-scrollback", hasScrollback);
   }
 
+  async detachForTransfer() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this._activationResizeTimer) clearTimeout(this._activationResizeTimer);
+    if (this._autoReconnectTimer) clearTimeout(this._autoReconnectTimer);
+    this.resizeObserver?.disconnect();
+    this.pane.remove();
+    this.button.remove();
+    await this.transport.detach().catch(err => console.error(err));
+  }
+
   async close() {
     if (this.closed) return;
     this.closed = true;
@@ -1542,6 +1569,11 @@ class TabManager {
     this.nextIndex = 1;
     this.elements = elements;
     this._dragTab = null;
+    const existingWindowId = window.name.startsWith("envoy-window:") ? window.name.slice(13) : "";
+    this.windowId = existingWindowId || crypto.randomUUID();
+    window.name = `envoy-window:${this.windowId}`;
+    this.stateKey = `envoy-tab-state:${this.windowId}`;
+    this.pendingTransfers = new Map();
     this.ttsAudio = null;
     this.ttsAudioFinish = null;
     this.ttsCurrentItem = null;
@@ -1552,6 +1584,12 @@ class TabManager {
       this._bc.onmessage = e => {
         if (e.data?.type === "claim-query") {
           this._bc.postMessage({ type: "claim-reply", sids: this.tabs.map(t => t.transport.sessionId).filter(Boolean) });
+        } else if (e.data?.type === "transfer-attached" && e.data.sourceWindowId === this.windowId) {
+          const pending = this.pendingTransfers.get(e.data.transferId);
+          if (pending) {
+            pending.attached = true;
+            if (this._dragTab !== pending.tab) this.finishTabTransfer(e.data.transferId);
+          }
         }
       };
     }
@@ -1575,6 +1613,71 @@ class TabManager {
     });
   }
 
+  beginTabTransfer(tab) {
+    for (const [transferId, pending] of this.pendingTransfers) {
+      if (pending.tab === tab) this.pendingTransfers.delete(transferId);
+    }
+    const transferId = crypto.randomUUID();
+    this.pendingTransfers.set(transferId, { tab, attached: false });
+    setTimeout(() => this.pendingTransfers.delete(transferId), 30000);
+    return {
+      transferId,
+      sourceWindowId: this.windowId,
+      sessionId: tab.transport.sessionId,
+      title: tab.title,
+    };
+  }
+
+  finishTabTransfer(transferId) {
+    const pending = this.pendingTransfers.get(transferId);
+    if (!pending?.attached) return;
+    this.pendingTransfers.delete(transferId);
+    setTimeout(() => {
+      this.detachTransferredTab(pending.tab).catch(err => console.error(err));
+    }, 0);
+  }
+
+  finishTabDrag(tab) {
+    for (const [transferId, pending] of this.pendingTransfers) {
+      if (pending.tab === tab && pending.attached) this.finishTabTransfer(transferId);
+    }
+  }
+
+  async acceptTabTransfer(transfer) {
+    if (!transfer?.sessionId || transfer.sourceWindowId === this.windowId) return null;
+    if (this.tabs.some(tab => tab.transport.sessionId === transfer.sessionId)) return null;
+    const tab = await this.createTab({ activate: true, sessionId: transfer.sessionId, mode: "takeover" });
+    if (transfer.title) tab.updateTitle(transfer.title);
+    this._bc?.postMessage({
+      type: "transfer-attached",
+      transferId: transfer.transferId,
+      sourceWindowId: transfer.sourceWindowId,
+    });
+    return tab;
+  }
+
+  acceptTabDrop(event, target = null, before = false) {
+    const raw = event.dataTransfer?.getData("application/x-envoy-tab");
+    if (!raw) return;
+    let transfer;
+    try { transfer = JSON.parse(raw); } catch { return; }
+    this.acceptTabTransfer(transfer).then(tab => {
+      if (tab && target) this.moveTab(tab, target, before);
+    }).catch(err => this.showToast?.(String(err), true));
+  }
+
+  popOutTab(tab) {
+    const transfer = this.beginTabTransfer(tab);
+    const url = new URL(window.location.href);
+    url.searchParams.set("transfer", JSON.stringify(transfer));
+    url.hash = tab.transport.sessionId;
+    const popup = window.open(url, "_blank", `width=${window.outerWidth},height=${window.outerHeight}`);
+    if (!popup) {
+      this.pendingTransfers.delete(transfer.transferId);
+      this.showToast?.("Popup blocked", true);
+    }
+  }
+
   moveTab(from, to, before) {
     const fromIdx = this.tabs.indexOf(from);
     if (fromIdx < 0) return;
@@ -1596,15 +1699,15 @@ class TabManager {
     const sids = this.tabs.map(t => t.transport.sessionId).filter(Boolean);
     const active = this.activeTab?.transport.sessionId || "";
     if (sids.length) {
-      localStorage.setItem("envoy-tab-state", JSON.stringify({ tabs: sids, active }));
+      localStorage.setItem(this.stateKey, JSON.stringify({ tabs: sids, active }));
     } else {
-      localStorage.removeItem("envoy-tab-state");
+      localStorage.removeItem(this.stateKey);
     }
   }
 
-  static loadTabState() {
+  loadTabState() {
     try {
-      const raw = localStorage.getItem("envoy-tab-state");
+      const raw = localStorage.getItem(this.stateKey) || localStorage.getItem("envoy-tab-state");
       if (!raw) return null;
       const state = JSON.parse(raw);
       if (Array.isArray(state.tabs) && state.tabs.length) return state;
@@ -1788,9 +1891,7 @@ class TabManager {
     const ttsButton = document.getElementById("sp-tts");
     if (ttsButton) {
       ttsButton.classList.toggle("sp-active", !!tab.ttsContinuous);
-      ttsButton.title = tab.ttsContinuous
-        ? "Reading new output (right-click to stop)"
-        : "Read selection (right-click: read new output)";
+      ttsButton.title = "TTS";
     }
     this.updateDisconnectOverlay();
     this.renderAgentLog();
@@ -2068,6 +2169,28 @@ class TabManager {
     this._fileViewerTab = null;
   }
 
+  async detachTransferredTab(tab) {
+    if (!this.tabs.includes(tab)) return;
+    const wasActive = this.activeTab === tab;
+    const tabIndex = this.tabs.indexOf(tab);
+    this.stopSpeechForTab(tab);
+    this.tabs = this.tabs.filter(item => item !== tab);
+    if (wasActive) this.activeTab = null;
+    await tab.detachForTransfer();
+    this.updateTabBar();
+    if (this.tabs.length && wasActive) {
+      this.activateTab(this.tabs[Math.min(tabIndex, this.tabs.length - 1)].id);
+    } else if (!this.tabs.length) {
+      this.updateDisconnectOverlay();
+      localStorage.removeItem(this.stateKey);
+      this.syncHash();
+      window.close();
+      return;
+    }
+    this.saveTabState();
+    this.syncHash();
+  }
+
   async closeTab(id) {
     const tab = this.getTabById(id);
     if (!tab) return;
@@ -2088,7 +2211,7 @@ class TabManager {
         await this.baseTransport.closeApp();
         return;
       }
-      localStorage.removeItem("envoy-tab-state");
+      localStorage.removeItem(this.stateKey);
       window.close();
       if (this.onLastTabClosed) this.onLastTabClosed();
       return;
@@ -2270,6 +2393,21 @@ function init(baseTransport, config) {
   });
   manager.showToast = showToast;
   manager.dismissToast = dismissToast;
+  if (!window.pywebview) {
+    const eventHasEnvoyTab = e => Array.from(e.dataTransfer?.types || []).includes("application/x-envoy-tab");
+    document.addEventListener("dragover", e => {
+      if (!eventHasEnvoyTab(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+    });
+    document.addEventListener("drop", e => {
+      if (!eventHasEnvoyTab(e)) return;
+      e.preventDefault();
+      overlay.classList.remove("active");
+      dragCount = 0;
+      manager.acceptTabDrop(e);
+    });
+  }
   window.__envoyTransformWriteData = data => transformMobileTerminalInput(data);
 
   function currentTab() {
@@ -4441,12 +4579,54 @@ function init(baseTransport, config) {
   });
 
   let savedTtsSelection = "";
+  let ttsLongPressTimer = null;
+  let ttsLongPressFired = false;
+
+  function toggleContinuousTts() {
+    savedTtsSelection = "";
+    const tab = currentTab();
+    if (!tab) return;
+    tab.ttsContinuous = !tab.ttsContinuous;
+    spTts.classList.toggle("sp-active", tab.ttsContinuous);
+    spTts.title = "TTS";
+    if (!tab.ttsContinuous) manager.stopSpeechForTab(tab);
+    showToast(tab.ttsContinuous ? "Continuous TTS on" : "Continuous TTS off");
+  }
+
   spTts.addEventListener("pointerdown", () => {
     savedTtsSelection = selectOverlay.classList.contains("active")
       ? String(window.getSelection() || "")
       : (currentTab()?.term.getSelection() || "");
+    ttsLongPressFired = false;
+    ttsLongPressTimer = setTimeout(() => {
+      ttsLongPressTimer = null;
+      ttsLongPressFired = true;
+      toggleContinuousTts();
+    }, 500);
+  });
+  spTts.addEventListener("pointerup", () => {
+    if (ttsLongPressTimer !== null) {
+      clearTimeout(ttsLongPressTimer);
+      ttsLongPressTimer = null;
+    }
+  });
+  spTts.addEventListener("pointercancel", () => {
+    if (ttsLongPressTimer !== null) {
+      clearTimeout(ttsLongPressTimer);
+      ttsLongPressTimer = null;
+    }
+  });
+  spTts.addEventListener("pointermove", e => {
+    if (ttsLongPressTimer && (Math.abs(e.movementX) > 5 || Math.abs(e.movementY) > 5)) {
+      clearTimeout(ttsLongPressTimer);
+      ttsLongPressTimer = null;
+    }
   });
   spTts.addEventListener("click", () => {
+    if (ttsLongPressFired) {
+      ttsLongPressFired = false;
+      return;
+    }
     const text = savedTtsSelection || (selectOverlay.classList.contains("active")
       ? String(window.getSelection() || "")
       : (currentTab()?.term.getSelection() || ""));
@@ -4455,16 +4635,13 @@ function init(baseTransport, config) {
   });
   spTts.addEventListener("contextmenu", e => {
     e.preventDefault();
-    savedTtsSelection = "";
-    const tab = currentTab();
-    if (!tab) return;
-    tab.ttsContinuous = !tab.ttsContinuous;
-    spTts.classList.toggle("sp-active", tab.ttsContinuous);
-    spTts.title = tab.ttsContinuous
-      ? "Reading new output (right-click to stop)"
-      : "Read selection (right-click: read new output)";
-    if (!tab.ttsContinuous) manager.stopSpeechForTab(tab);
-    showToast(tab.ttsContinuous ? "Continuous TTS on" : "Continuous TTS off");
+    if (ttsLongPressTimer !== null) {
+      clearTimeout(ttsLongPressTimer);
+      ttsLongPressTimer = null;
+    }
+    if (ttsLongPressFired) return;
+    ttsLongPressFired = true;
+    toggleContinuousTts();
   });
 
   spSel.addEventListener("click", () => {
@@ -4909,8 +5086,18 @@ function init(baseTransport, config) {
   window.addEventListener("online", recoverConnections);
   window.addEventListener("pageshow", recoverConnections);
 
-  const saved = window.matchMedia('(display-mode: standalone)').matches ? TabManager.loadTabState() : null;
+  const saved = window.matchMedia('(display-mode: standalone)').matches ? manager.loadTabState() : null;
   const hashSid = window.location.hash.slice(1);
+  let incomingTransfer = null;
+  try {
+    const encoded = new URLSearchParams(window.location.search).get("transfer");
+    if (encoded) incomingTransfer = JSON.parse(encoded);
+  } catch {}
+  if (incomingTransfer) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("transfer");
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }
 
   async function createFreshSessionAfterMissingHash(sid) {
     showToast(`Session not found: ${sid}`);
@@ -4928,6 +5115,15 @@ function init(baseTransport, config) {
   }
 
   (async () => {
+    if (incomingTransfer) {
+      try {
+        await manager.acceptTabTransfer(incomingTransfer);
+        performLayoutRefresh();
+        return;
+      } catch (err) {
+        showToast(String(err), true);
+      }
+    }
     const claimed = await manager.getClaimedSids();
     if (saved) {
       for (const sid of saved.tabs) {

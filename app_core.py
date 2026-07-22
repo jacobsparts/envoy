@@ -1306,6 +1306,7 @@ class WorkerSession:
         self.exit_code: int | None = None
         self._control_lock = threading.Lock()
         self._control_ready = threading.Condition()
+        self._exit_status_ready = threading.Event()
         self._pending_control: dict[int, dict[str, object] | None] = {}
         self._next_control_id = 1
 
@@ -1408,6 +1409,10 @@ class WorkerSession:
                     deliveries = self._collect_push_payloads_locked()
                 self._dispatch_push_payloads(deliveries)
         finally:
+            # The worker sends the child's exit code over the control socket
+            # before closing the output pipe. Wait for that message so clients
+            # do not briefly observe alive=False with exit_code=None.
+            self._exit_status_ready.wait()
             with self._lock:
                 self.alive = False
                 self._pending_ready.notify_all()
@@ -1432,7 +1437,9 @@ class WorkerSession:
                         self.alive = False
                         self.exit_code = msg.get("exit_code")
                         self._pending_ready.notify_all()
+                    self._exit_status_ready.set()
         finally:
+            self._exit_status_ready.set()
             with self._control_ready:
                 for req_id in list(self._pending_control):
                     if self._pending_control[req_id] is None:
