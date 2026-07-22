@@ -255,19 +255,80 @@ class FlatteningHistoryScreen(pyte.HistoryScreen):
                  on_clear: Callable[[], None]):
         self._on_evict = on_evict
         self._on_clear = on_clear
+        self._redraw_pending_home = False
+        self._redraw_active = False
+        self._redraw_added = 0
+        self._redraw_evicted: collections.deque[object] = collections.deque()
         super().__init__(columns, lines, history=history)
+
+    def _commit_redraw_history(self) -> None:
+        while self._redraw_evicted:
+            self._on_evict(self._redraw_evicted.popleft(), self.columns)
+        self._redraw_active = False
+        self._redraw_added = 0
+
+    def discard_pending_redraw_history(self) -> None:
+        for _ in range(min(self._redraw_added, len(self.history.top))):
+            self.history.top.pop()
+        while self._redraw_evicted:
+            self.history.top.appendleft(self._redraw_evicted.pop())
+        self._redraw_active = False
+        self._redraw_added = 0
+
+    def committed_history(self) -> list[object]:
+        retained = list(self.history.top)
+        if self._redraw_added:
+            retained = retained[:-min(self._redraw_added, len(retained))]
+        return [*self._redraw_evicted, *retained]
+
+    def erase_in_display(self, how: int = 0, *args: object, **kwargs: object) -> None:
+        if how in (2, 3):
+            self.discard_pending_redraw_history()
+            self._redraw_pending_home = True
+        else:
+            self._redraw_pending_home = False
+            self._commit_redraw_history()
+        super().erase_in_display(how, *args, **kwargs)
+
+    def cursor_position(self, line: int | None = None, column: int | None = None) -> None:
+        if self._redraw_pending_home and (line in (None, 0, 1)) and (column in (None, 0, 1)):
+            self._redraw_pending_home = False
+            self._redraw_active = True
+            self._redraw_added = 0
+            self._redraw_evicted.clear()
+        elif self._redraw_pending_home:
+            self._redraw_pending_home = False
+            self._commit_redraw_history()
+        super().cursor_position(line, column)
+
+    def resize(self, lines: int | None = None, columns: int | None = None) -> None:
+        self.discard_pending_redraw_history()
+        self._redraw_pending_home = False
+        super().resize(lines, columns)
 
     def index(self) -> None:
         bottom = self.margins.bottom if self.margins else self.lines - 1
-        if (
-            self.cursor.y == bottom
-            and self.history.top.maxlen
-            and len(self.history.top) == self.history.top.maxlen
-        ):
+        if self.cursor.y != bottom:
+            super().index()
+            return
+        if self._redraw_active and self._redraw_added >= max(self.lines * 2, 1):
+            self._commit_redraw_history()
+        if self._redraw_active:
+            if self.history.top.maxlen and len(self.history.top) == self.history.top.maxlen:
+                self._redraw_evicted.append(self.history.top.popleft())
+            self.history.top.append(self.buffer[self.margins.top if self.margins else 0])
+            self._redraw_added += 1
+            pyte.Screen.index(self)
+            return
+        if self.history.top.maxlen and len(self.history.top) == self.history.top.maxlen:
             self._on_evict(self.history.top[0], self.columns)
         super().index()
 
     def _reset_history(self) -> None:
+        self._redraw_pending_home = False
+        self._redraw_active = False
+        self._redraw_added = 0
+        self._redraw_evicted.clear()
         super()._reset_history()
         self._on_clear()
 
@@ -617,7 +678,12 @@ class Session:
 
     def _render_pyte_screen(self, screen: pyte.HistoryScreen) -> list[str]:
         lines = []
-        for hist_line in screen.history.top:
+        history = (
+            screen.committed_history()
+            if isinstance(screen, FlatteningHistoryScreen)
+            else screen.history.top
+        )
+        for hist_line in history:
             cols = screen.columns
             rendered = "".join(
                 hist_line[i].data if i in hist_line else " "
@@ -1676,6 +1742,9 @@ class EnvoyService:
                 return resolved, handle.read()
         except OSError as exc:
             raise ValueError("File not found") from exc
+
+    def synthesize_text(self, text: str) -> dict[str, str | None]:
+        return {"audio": synthesize_speech(text[:12000])}
 
     def send_text_message(self, session_id: str, text: str,
                           agent_settings: dict | None = None) -> dict[str, object]:

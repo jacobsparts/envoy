@@ -321,6 +321,10 @@ class PywebviewTransport {
     return new TextDecoder().decode(bytes);
   }
 
+  async synthesizeText(text) {
+    return this.api.synthesize_text(text);
+  }
+
   async sendTextMessage(text, agentSettings) {
     return this.api.send_text_message(this.sessionId, text, agentSettings || {});
   }
@@ -651,6 +655,14 @@ class BrowserTransport {
     const url = fileUrlFor({ url: this.basePath + `/api/file?session_id=${encodeURIComponent(this.sessionId)}&path=${encodeURIComponent(path)}` });
     const resp = await fetch(url);
     return resp.text();
+  }
+
+  async synthesizeText(text) {
+    return this.requestJson("/api/tts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
   }
 
   async sendTextMessage(text, agentSettings) {
@@ -1017,6 +1029,7 @@ class TerminalTab {
     this.term.onData(data => {
       if (!this.disconnected && !this._suppressInput && !window.__envoyInputBlocked) {
         this.hasInput = true;
+        this.manager.recordTtsInput(this, data);
         this.transport.write(data).catch(err => this.handleWriteError(err));
       }
     });
@@ -1149,6 +1162,8 @@ class TerminalTab {
   writeTerminalData(data) {
     this.term.write(data);
     this.scanTerminalBytes(data);
+    this.ttsDecoder = this.ttsDecoder || new TextDecoder();
+    this.manager.queueTtsOutput(this, this.ttsDecoder.decode(data, { stream: true }));
   }
 
   scanTerminalBytes(bytes) {
@@ -1315,7 +1330,8 @@ class TerminalTab {
   }
 
   fitTerminal({ preserveScroll = false } = {}) {
-    if (this.restoring) return;
+    if (this.restoring || document.hidden) return;
+    if (this.manager.activeTab !== this) return;
     if (!this.host.offsetWidth || !this.host.offsetHeight) return;
     const shouldPinToBottom = !preserveScroll && this.shouldKeepPinnedToBottom();
     try {
@@ -1334,10 +1350,18 @@ class TerminalTab {
   }
 
   sendResizeIfChanged() {
-    if (this.disconnected) return;
+    if (this.disconnected || document.hidden) return;
+    if (this.manager.activeTab !== this) return;
     const cols = this.term.cols;
     const rows = this.term.rows;
     if (!cols || !rows) return;
+    if (
+      this.lastSentSize
+      && performance.now() - (this.activatedAt || 0) < 500
+      && (cols < this.lastSentSize.cols || rows < this.lastSentSize.rows)
+    ) {
+      return;
+    }
     if (this.lastSentSize && this.lastSentSize.cols === cols && this.lastSentSize.rows === rows) return;
     this.lastSentSize = { cols, rows };
     this.transport.resize(cols, rows).catch(err => {
@@ -1518,6 +1542,11 @@ class TabManager {
     this.nextIndex = 1;
     this.elements = elements;
     this._dragTab = null;
+    this.ttsAudio = null;
+    this.ttsAudioFinish = null;
+    this.ttsCurrentItem = null;
+    this.ttsQueue = [];
+    this.ttsPlaying = false;
     this._bc = typeof BroadcastChannel === "function" ? new BroadcastChannel("envoy-tabs") : null;
     if (this._bc) {
       this._bc.onmessage = e => {
@@ -1596,6 +1625,128 @@ class TabManager {
     }
   }
 
+  recordTtsInput(tab, data) {
+    if (!tab.ttsContinuous) return;
+    tab.ttsEcho = tab.ttsEcho || "";
+    for (const char of data) {
+      if (char === "\x7f" || char === "\b") tab.ttsEcho = tab.ttsEcho.slice(0, -1);
+      else if (char === "\r") tab.ttsEcho += "\n";
+      else if (char === "\t" || char >= " ") tab.ttsEcho += char;
+    }
+    tab.ttsEcho = tab.ttsEcho.slice(-2000);
+  }
+
+  queueTtsOutput(tab, rawText) {
+    if (!tab.ttsContinuous) return;
+    let text = stripTerminalControls(rawText).replace(/\n+/g, "\n");
+    let echo = tab.ttsEcho || "";
+    if (echo) {
+      let filtered = "";
+      let match = tab.ttsEchoMatch || "";
+      for (const char of text) {
+        if (char === echo[match.length]) {
+          match += char;
+          if (match.length === echo.length) {
+            match = "";
+            echo = "";
+          }
+        } else {
+          filtered += match + char;
+          match = "";
+        }
+      }
+      tab.ttsEcho = echo;
+      tab.ttsEchoMatch = match;
+      text = filtered;
+    }
+    text = text.replace(/[ \t]+\n/g, "\n");
+    if (!text.trim()) return;
+    tab.ttsBuffer = (tab.ttsBuffer || "") + text;
+    clearTimeout(tab.ttsTimer);
+    const ready = tab.ttsBuffer.match(/^([\s\S]*?(?:[.!?](?:\s|$)|\n))/);
+    if (ready && ready[1].trim().length >= 20) {
+      const chunk = ready[1].trim();
+      tab.ttsBuffer = tab.ttsBuffer.slice(ready[1].length);
+      this.enqueueSpeech(tab, chunk);
+    }
+    tab.ttsTimer = setTimeout(() => {
+      const chunk = (tab.ttsBuffer || "").trim();
+      tab.ttsBuffer = "";
+      if (chunk) this.enqueueSpeech(tab, chunk);
+    }, 900);
+  }
+
+  enqueueSpeech(tab, text) {
+    if (!text || !tab.ttsContinuous) return;
+    this.ttsQueue.push({ tab, text: text.slice(0, 4000) });
+    this.playNextSpeech();
+  }
+
+  async speakText(text) {
+    const clean = String(text || "").trim();
+    if (!clean) throw new Error("Select text to read");
+    const tab = this.activeTab;
+    if (!tab) throw new Error("No active terminal");
+    const result = await tab.transport.synthesizeText(clean.slice(0, 12000));
+    if (!result.audio) throw new Error("Speech synthesis returned no audio");
+    this.ttsQueue.push({ tab: null, audio: result.audio });
+    this.playNextSpeech();
+  }
+
+  async playNextSpeech() {
+    if (this.ttsPlaying || !this.ttsQueue.length) return;
+    const item = this.ttsQueue.shift();
+    if (item.tab && !item.tab.ttsContinuous) {
+      this.playNextSpeech();
+      return;
+    }
+    this.ttsPlaying = true;
+    this.ttsCurrentItem = item;
+    try {
+      const audioData = item.audio || (await item.tab.transport.synthesizeText(item.text)).audio;
+      if (item.tab && !item.tab.ttsContinuous) return;
+      if (!audioData) throw new Error("Speech synthesis returned no audio");
+      await new Promise((resolve, reject) => {
+        const audio = new Audio(`data:audio/wav;base64,${audioData}`);
+        let settled = false;
+        const finish = error => {
+          if (settled) return;
+          settled = true;
+          audio.onended = null;
+          audio.onerror = null;
+          this.ttsAudioFinish = null;
+          if (error) reject(error);
+          else resolve();
+        };
+        this.ttsAudio = audio;
+        this.ttsAudioFinish = () => finish();
+        audio.onended = () => finish();
+        audio.onerror = () => finish(new Error("Unable to play speech audio"));
+        audio.play().catch(finish);
+      });
+    } catch (err) {
+      showToast("TTS: " + (err.message || err), true);
+    } finally {
+      this.ttsAudio = null;
+      this.ttsAudioFinish = null;
+      this.ttsCurrentItem = null;
+      this.ttsPlaying = false;
+      this.playNextSpeech();
+    }
+  }
+
+  stopSpeechForTab(tab) {
+    this.ttsQueue = this.ttsQueue.filter(item => item.tab !== tab);
+    clearTimeout(tab.ttsTimer);
+    tab.ttsBuffer = "";
+    tab.ttsEcho = "";
+    tab.ttsEchoMatch = "";
+    if (this.ttsAudio && this.ttsCurrentItem?.tab === tab) {
+      this.ttsAudio.pause();
+      this.ttsAudioFinish?.();
+    }
+  }
+
   async createTab({ activate = true, sessionId = "", mode = "takeover" } = {}) {
     const tab = new TerminalTab(this, this.baseTransport.clone(), this.nextIndex++);
     this.tabs.push(tab);
@@ -1634,6 +1785,13 @@ class TabManager {
     if (this.activeTab) this.activeTab.hide();
     this.activeTab = tab;
     tab.show();
+    const ttsButton = document.getElementById("sp-tts");
+    if (ttsButton) {
+      ttsButton.classList.toggle("sp-active", !!tab.ttsContinuous);
+      ttsButton.title = tab.ttsContinuous
+        ? "Reading new output (right-click to stop)"
+        : "Read selection (right-click: read new output)";
+    }
     this.updateDisconnectOverlay();
     this.renderAgentLog();
     this.syncHash();
@@ -1914,6 +2072,7 @@ class TabManager {
     const tab = this.getTabById(id);
     if (!tab) return;
     const wasActive = this.activeTab === tab;
+    this.stopSpeechForTab(tab);
     const tabIndex = this.tabs.indexOf(tab);
     const remaining = this.tabs.filter(item => item !== tab);
     this.tabs = remaining;
@@ -2429,6 +2588,7 @@ function init(baseTransport, config) {
   const spText = document.getElementById("sp-text");
   const spPaste = document.getElementById("sp-paste");
   const spSel = document.getElementById("sp-sel");
+  const spTts = document.getElementById("sp-tts");
   const spFs = document.getElementById("sp-fs");
   const spUpload = document.getElementById("sp-upload");
 
@@ -4280,6 +4440,33 @@ function init(baseTransport, config) {
     scheduleFullscreenLayoutRefresh();
   });
 
+  let savedTtsSelection = "";
+  spTts.addEventListener("pointerdown", () => {
+    savedTtsSelection = selectOverlay.classList.contains("active")
+      ? String(window.getSelection() || "")
+      : (currentTab()?.term.getSelection() || "");
+  });
+  spTts.addEventListener("click", () => {
+    const text = savedTtsSelection || (selectOverlay.classList.contains("active")
+      ? String(window.getSelection() || "")
+      : (currentTab()?.term.getSelection() || ""));
+    savedTtsSelection = "";
+    manager.speakText(text).catch(err => showToast("TTS: " + (err.message || err), true));
+  });
+  spTts.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    savedTtsSelection = "";
+    const tab = currentTab();
+    if (!tab) return;
+    tab.ttsContinuous = !tab.ttsContinuous;
+    spTts.classList.toggle("sp-active", tab.ttsContinuous);
+    spTts.title = tab.ttsContinuous
+      ? "Reading new output (right-click to stop)"
+      : "Read selection (right-click: read new output)";
+    if (!tab.ttsContinuous) manager.stopSpeechForTab(tab);
+    showToast(tab.ttsContinuous ? "Continuous TTS on" : "Continuous TTS off");
+  });
+
   spSel.addEventListener("click", () => {
     if (selectOverlay.classList.contains("active")) exitSelectMode();
     else enterSelectMode();
@@ -4687,11 +4874,28 @@ function init(baseTransport, config) {
     openSessionPicker();
   });
 
+  let recoveryResizeTimer = null;
   const recoverConnections = () => {
     manager.resumeActiveReads();
     manager.reconnectDisconnectedTabs();
     updateMobileInputBar();
-    manager.activeTab?.fitTerminal({ preserveScroll: true });
+    const tab = manager.activeTab;
+    if (!tab) return;
+    tab.markActivated();
+    if (recoveryResizeTimer) clearTimeout(recoveryResizeTimer);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!document.hidden && manager.activeTab === tab) {
+          tab.fitTerminal({ preserveScroll: true });
+        }
+      });
+    });
+    recoveryResizeTimer = setTimeout(() => {
+      recoveryResizeTimer = null;
+      if (!document.hidden && manager.activeTab === tab) {
+        tab.fitTerminal({ preserveScroll: true });
+      }
+    }, 500);
   };
 
   document.addEventListener("visibilitychange", () => {

@@ -114,6 +114,9 @@ class DesktopApi:
         info, body = self._service.read_file(session_id, path)
         return {**info, "data": self._service._encode(body)}
 
+    def synthesize_text(self, text: str) -> dict[str, str | None]:
+        return self._service.synthesize_text(text)
+
     def send_text_message(self, session_id: str, text: str,
                           agent_settings: dict | None = None) -> dict[str, object]:
         return self._service.send_text_message(session_id, text, agent_settings)

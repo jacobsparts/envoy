@@ -380,6 +380,12 @@ def make_handler():
                     json_response(self, 200, result)
                     return
 
+                if parsed.path == f"{WEB_PREFIX}/api/tts":
+                    body = read_json_body(self)
+                    result = service.synthesize_text(str(body.get("text") or ""))
+                    json_response(self, 200, result)
+                    return
+
                 if parsed.path == f"{WEB_PREFIX}/api/text":
                     body = read_json_body(self)
                     agent_settings = {
