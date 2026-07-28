@@ -150,15 +150,6 @@ function escapeHtml(value) {
 }
 
 
-function waitForPywebview() {
-  if (window.pywebview && window.pywebview.api) {
-    return Promise.resolve(window.pywebview.api);
-  }
-  return new Promise(resolve => {
-    window.addEventListener("pywebviewready", () => resolve(window.pywebview.api), { once: true });
-  });
-}
-
 function getEnvoyPath() {
   const prefix = "/envoy";
   const pathname = window.location.pathname || "/";
@@ -167,209 +158,6 @@ function getEnvoyPath() {
   }
   const trimmed = pathname.slice(prefix.length);
   return trimmed || "/";
-}
-
-class PywebviewTransport {
-  constructor(api = null) {
-    this.api = api;
-    this.sessionId = "";
-    this.clientId = "";
-    this.closed = false;
-    this._pushCallbackName = "";
-    this._streamCallbacks = null;
-    this._paused = false;
-  }
-
-  async init() {
-    this.api = this.api || await waitForPywebview();
-    return this.api.get_config();
-  }
-
-  clone() {
-    return new PywebviewTransport(this.api);
-  }
-
-  async getSettings() {
-    return this.api.get_settings();
-  }
-
-  async saveSettings(values) {
-    return this.api.save_settings(values);
-  }
-
-  async connect(existingSessionId) {
-    const result = await this.api.connect(existingSessionId || "");
-    this.sessionId = result.sid;
-    this.clientId = result.client_id || "";
-    this.closed = false;
-    return result;
-  }
-
-  startReading(onData, onDisconnect, onEvents, onPromoted) {
-    this.stopReading();
-    if (!this.sessionId || !this.clientId) return;
-    this.closed = false;
-    this._paused = false;
-    this._streamCallbacks = { onData, onDisconnect, onEvents, onPromoted };
-    this._pushCallbackName = `__envoyPush_${this.clientId}`;
-    const isActive = () => !this.closed && !!this.sessionId && window[this._pushCallbackName];
-    window[this._pushCallbackName] = (jsonStr) => {
-      if (!isActive()) return;
-      const result = JSON.parse(jsonStr);
-      if (result.evicted) {
-        this.closed = true;
-        delete window[this._pushCallbackName];
-        onDisconnect({ kind: "evicted" });
-        return;
-      }
-      const chunk = base64ToBytes(result.output);
-      if (chunk.length) onData(chunk);
-      if (result.events && result.events.length) onEvents(result.events);
-      if (result.promoted) {
-        if (onPromoted) onPromoted();
-      }
-      if (result.resize && this.onResize) {
-        this.onResize(result.resize.cols, result.resize.rows);
-      }
-      if (!result.alive) {
-        this.closed = true;
-        delete window[this._pushCallbackName];
-        onDisconnect({ kind: "exit", exitCode: result.exit_code });
-      }
-    };
-    this.api.start_push(this.sessionId, this.clientId).catch(err => {
-      if (!isActive()) return;
-      this.closed = true;
-      delete window[this._pushCallbackName];
-      onDisconnect({ kind: "error", error: err });
-    });
-  }
-
-  stopReading() {
-    this.closed = true;
-    const callbackName = this._pushCallbackName;
-    if (callbackName) {
-      delete window[callbackName];
-      this._pushCallbackName = "";
-    }
-    if (this.sessionId && this.clientId) {
-      this.api.stop_push(this.sessionId, this.clientId).catch(() => {});
-    }
-  }
-
-  pauseStream() {
-    this._paused = true;
-    this.stopReading();
-  }
-
-  resumeReading() {
-    if (!this._paused || !this._streamCallbacks || !this.sessionId || !this.clientId) return;
-    this._paused = false;
-    const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
-    this.startReading(onData, onDisconnect, onEvents, onPromoted);
-  }
-
-  async write(data) {
-    if (!this.sessionId || window.__envoyInputBlocked) return;
-    const transformed = window.__envoyTransformWriteData ? window.__envoyTransformWriteData(data) : data;
-    if (transformed == null) return;
-    if (transformed instanceof Uint8Array) {
-      await this.api.write(this.sessionId, bytesToBase64(transformed));
-      return;
-    }
-    await this.api.write(this.sessionId, stringToBase64(transformed));
-  }
-
-  async writeBytes(bytes) {
-    if (!this.sessionId || window.__envoyInputBlocked) return;
-    await this.api.write(this.sessionId, bytesToBase64(bytes));
-  }
-
-  async resize(cols, rows) {
-    if (!this.sessionId) return;
-    await this.api.resize(this.sessionId, cols, rows, this.clientId);
-  }
-
-  async uploadFile(name, b64data) {
-    if (!this.sessionId) return;
-    await this.api.upload_file(this.sessionId, name, b64data);
-  }
-
-  async resolveFiles(paths) {
-    if (!this.sessionId || !paths.length) return { files: [] };
-    return this.api.resolve_files(this.sessionId, paths);
-  }
-
-  async openFile(info, download = false) {
-    const result = await this.api.read_file(this.sessionId, info.path);
-    const bytes = base64ToBytes(result.data);
-    const blob = new Blob([bytes], { type: result.mime || "application/octet-stream" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    if (download) a.download = result.name || "download";
-    a.target = "_blank";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-  }
-
-  async readFileText(path) {
-    const result = await this.api.read_file(this.sessionId, path);
-    const bytes = base64ToBytes(result.data);
-    return new TextDecoder().decode(bytes);
-  }
-
-  async synthesizeText(text) {
-    return this.api.synthesize_text(text);
-  }
-
-  async sendTextMessage(text, agentSettings) {
-    return this.api.send_text_message(this.sessionId, text, agentSettings || {});
-  }
-
-  async sendVoiceMessage(audioBlob, mime, agentSettings) {
-    const bytes = new Uint8Array(await audioBlob.arrayBuffer());
-    return this.api.send_voice_message(this.sessionId, bytesToBase64(bytes), mime, agentSettings || {});
-  }
-
-  async transcribeAudio(audioBlob, mime) {
-    const bytes = new Uint8Array(await audioBlob.arrayBuffer());
-    return this.api.transcribe_audio(bytesToBase64(bytes), mime);
-  }
-
-  async cancelAgent() {
-    if (!this.sessionId) return;
-    await this.api.cancel_agent(this.sessionId);
-  }
-
-  async detach() {
-    this.stopReading();
-    if (!this.sessionId) return;
-    this.sessionId = "";
-  }
-
-  async close() {
-    this.stopReading();
-    if (!this.sessionId) return;
-    const sid = this.sessionId;
-    this.sessionId = "";
-    await this.api.close_session(sid);
-  }
-
-  abandon() {
-    this.stopReading();
-    this.sessionId = "";
-  }
-
-  async toggleFullscreen() {
-    await this.api.toggle_fullscreen();
-  }
-
-  async closeApp() {
-    await this.api.close_app();
-  }
 }
 
 class BrowserTransport {
@@ -746,7 +534,6 @@ class BrowserTransport {
     this.clientId = "";
   }
 
-  async closeApp() {}
 }
 
 class BrowserStreamMultiplexer {
@@ -833,17 +620,6 @@ class BrowserStreamMultiplexer {
       new Promise(resolve => setTimeout(resolve, timeout)),
     ]);
   }
-}
-
-async function loadTransport() {
-  if (window.pywebview && window.pywebview.api) {
-    return new PywebviewTransport();
-  }
-  if (location.protocol === "file:") {
-    const api = await waitForPywebview();
-    return new PywebviewTransport(api);
-  }
-  return new BrowserTransport();
 }
 
 function isScrollbarTarget(target) {
@@ -968,7 +744,7 @@ class TerminalTab {
       this.manager._dragTab = this;
       this.button.classList.add("dragging");
       e.dataTransfer.effectAllowed = "move";
-      if (!window.pywebview && this.transport.sessionId) {
+      if (this.transport.sessionId) {
         const transfer = this.manager.beginTabTransfer(this);
         e.dataTransfer.setData("application/x-envoy-tab", JSON.stringify(transfer));
         e.dataTransfer.setData("text/plain", this.transport.sessionId);
@@ -1010,7 +786,7 @@ class TerminalTab {
       this.manager.acceptTabDrop(e, this, before);
     });
     this.button.addEventListener("contextmenu", e => {
-      if (window.pywebview || !this.transport.sessionId || this.manager.tabs.length <= 1) return;
+      if (!this.transport.sessionId || this.manager.tabs.length <= 1) return;
       e.preventDefault();
       this.manager.popOutTab(this);
     });
@@ -2234,10 +2010,6 @@ class TabManager {
     if (!remaining.length) {
       await tab.close();
       this.updateDisconnectOverlay();
-      if (window.pywebview) {
-        await this.baseTransport.closeApp();
-        return;
-      }
       localStorage.removeItem(this.stateKey);
       window.close();
       if (this.onLastTabClosed) this.onLastTabClosed();
@@ -2252,13 +2024,6 @@ class TabManager {
     }
     await tab.close();
     this.syncHash();
-  }
-
-  async closeAll() {
-    const tabs = [...this.tabs];
-    this.tabs = [];
-    this.activeTab = null;
-    await Promise.all(tabs.map(tab => tab.close()));
   }
 
   current() {
@@ -2298,7 +2063,7 @@ class TabManager {
 }
 
 document.fonts.load("13pt 'Source Code Pro'").then(async () => {
-  const transport = await loadTransport();
+  const transport = new BrowserTransport();
   const config = await transport.init();
   init(transport, config);
 });
@@ -2420,21 +2185,19 @@ function init(baseTransport, config) {
   });
   manager.showToast = showToast;
   manager.dismissToast = dismissToast;
-  if (!window.pywebview) {
-    const eventHasEnvoyTab = e => Array.from(e.dataTransfer?.types || []).includes("application/x-envoy-tab");
-    document.addEventListener("dragover", e => {
-      if (!eventHasEnvoyTab(e)) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "move";
-    });
-    document.addEventListener("drop", e => {
-      if (!eventHasEnvoyTab(e)) return;
-      e.preventDefault();
-      overlay.classList.remove("active");
-      dragCount = 0;
-      manager.acceptTabDrop(e);
-    });
-  }
+  const eventHasEnvoyTab = e => Array.from(e.dataTransfer?.types || []).includes("application/x-envoy-tab");
+  document.addEventListener("dragover", e => {
+    if (!eventHasEnvoyTab(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+  });
+  document.addEventListener("drop", e => {
+    if (!eventHasEnvoyTab(e)) return;
+    e.preventDefault();
+    overlay.classList.remove("active");
+    dragCount = 0;
+    manager.acceptTabDrop(e);
+  });
   window.__envoyTransformWriteData = data => transformMobileTerminalInput(data);
 
   function currentTab() {
@@ -2757,7 +2520,6 @@ function init(baseTransport, config) {
   const spFs = document.getElementById("sp-fs");
   const spUpload = document.getElementById("sp-upload");
 
-  if (window.pywebview) spUpload.style.display = "none";
 
   let pendingSidebarTouchButton = null;
   let sidebarTouchStart = null;
@@ -3528,20 +3290,13 @@ function init(baseTransport, config) {
     overlay.classList.remove("active");
     const tab = currentTab();
     if (!tab) return;
-    if (baseTransport.toggleFullscreen) {
-      const paths = Array.from(e.dataTransfer.files, f => f.path).filter(Boolean);
-      if (paths.length) {
-        tab.transport.write(paths.map(p => p.includes(" ") ? `'${p}'` : p).join(" ")).catch(err => tab.handleWriteError(err));
-      }
-    } else {
-      for (const file of e.dataTransfer.files) {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const b64 = reader.result.split(",")[1];
-          tab.transport.uploadFile(file.name, b64).catch(err => showToast(String(err)));
-        };
-        reader.readAsDataURL(file);
-      }
+    for (const file of e.dataTransfer.files) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const b64 = reader.result.split(",")[1];
+        tab.transport.uploadFile(file.name, b64).catch(err => showToast(String(err)));
+      };
+      reader.readAsDataURL(file);
     }
   });
 
@@ -3933,7 +3688,6 @@ function init(baseTransport, config) {
   }
 
   async function listManagedSessions() {
-    if (window.pywebview && baseTransport.api) return baseTransport.api.list_sessions();
     const response = await fetch((baseTransport.basePath || "/envoy") + "/api/sessions");
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Unable to load sessions");
@@ -3941,12 +3695,6 @@ function init(baseTransport, config) {
   }
 
   async function updateManagedLimits(body) {
-    if (window.pywebview && baseTransport.api) {
-      return baseTransport.api.update_resource_limits(
-        body.target, body.session_id, body.memory_high,
-        body.memory_max ?? null, body.memory_swap_max
-      );
-    }
     const response = await fetch((baseTransport.basePath || "/envoy") + "/api/resource_limits", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -3983,20 +3731,14 @@ function init(baseTransport, config) {
     if (!confirm(`Really ${action} session ${sessionId}?`)) return;
     try {
       let result;
-      if (window.pywebview && baseTransport.api) {
-        result = force
-          ? await baseTransport.api.force_stop_session(sessionId)
-          : await baseTransport.api.close_session(sessionId);
-      } else {
-        const endpoint = force ? "/api/force_stop_session" : "/api/close_session";
-        const response = await fetch((baseTransport.basePath || "/envoy") + endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id: sessionId }),
-        });
-        result = await response.json();
-        if (!response.ok) throw new Error(result.error || "Unable to stop session");
-      }
+      const endpoint = force ? "/api/force_stop_session" : "/api/close_session";
+      const response = await fetch((baseTransport.basePath || "/envoy") + endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Unable to stop session");
       showToast(force ? "Session force-stopped" : "Session is shutting down");
       setTimeout(() => openSessionPicker(), force ? 100 : 500);
     } catch (err) {
@@ -4751,11 +4493,6 @@ function init(baseTransport, config) {
   }
 
   spFs.addEventListener("click", () => {
-    if (baseTransport.toggleFullscreen) {
-      baseTransport.toggleFullscreen();
-      scheduleFullscreenLayoutRefresh();
-      return;
-    }
     const el = document.documentElement;
     const fsElement = document.fullscreenElement || document.webkitFullscreenElement;
     if (fsElement) {
@@ -5218,22 +4955,18 @@ function init(baseTransport, config) {
   }, false);
 
   window.addEventListener("beforeunload", () => {
-    if (!(window.pywebview && window.pywebview.api)) {
-      for (const tab of manager.tabs) {
-        if (tab.transport?.sessionId) {
-          const endpoint = (tab.isNew && !tab.hasInput) ? "/envoy/api/close_session" : "/envoy/api/detach";
-          navigator.sendBeacon(
-            endpoint,
-            new Blob([JSON.stringify({
-              session_id: tab.transport.sessionId,
-              client_id: tab.transport.clientId,
-            })], { type: "application/json" }),
-          );
-        }
+    for (const tab of manager.tabs) {
+      if (tab.transport?.sessionId) {
+        const endpoint = (tab.isNew && !tab.hasInput) ? "/envoy/api/close_session" : "/envoy/api/detach";
+        navigator.sendBeacon(
+          endpoint,
+          new Blob([JSON.stringify({
+            session_id: tab.transport.sessionId,
+            client_id: tab.transport.clientId,
+          })], { type: "application/json" }),
+        );
       }
-      return;
     }
-    manager.closeAll().catch(() => {});
   });
 
   window.addEventListener("hashchange", () => {

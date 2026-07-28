@@ -1,4 +1,4 @@
-"""Shared runtime core for desktop and envoy server modes."""
+"""Runtime core for the envoy server."""
 
 from __future__ import annotations
 
@@ -57,24 +57,17 @@ def _web_head_extra(static: str) -> str:
     )
 
 
-def render_html(mode: str, web_prefix: str = "") -> str:
+def render_html(web_prefix: str = "") -> str:
     template = APP_TEMPLATE.read_text()
-    if mode == "web":
-        static = f"{web_prefix}/static/"
-        head_extra = _web_head_extra(static)
-        body_extra = (
-            "<script>\n"
-            "if ('serviceWorker' in navigator && window.isSecureContext) {\n"
-            f"  navigator.serviceWorker.register('{static}sw.js', {{ scope: '{web_prefix}/' }});\n"
-            "}\n"
-            "</script>"
-        )
-    elif mode == "desktop":
-        static = ""
-        head_extra = ""
-        body_extra = ""
-    else:
-        raise ValueError(f"unknown render mode: {mode!r}")
+    static = f"{web_prefix}/static/"
+    head_extra = _web_head_extra(static)
+    body_extra = (
+        "<script>\n"
+        "if ('serviceWorker' in navigator && window.isSecureContext) {\n"
+        f"  navigator.serviceWorker.register('{static}sw.js', {{ scope: '{web_prefix}/' }});\n"
+        "}\n"
+        "</script>"
+    )
     return (template
             .replace("{{STATIC}}", static)
             .replace("{{WEB_HEAD_EXTRA}}", head_extra)
@@ -111,31 +104,6 @@ def _login_env() -> dict[str, str]:
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "LANG": os.environ.get("LANG", "en_US.UTF-8"),
     }
-
-
-# Env vars a desktop-launched shell expects to inherit so GUI apps,
-# dbus, keyrings, and agents work. The user's rc files still run on
-# top, so anything here is just a default.
-_DESKTOP_PASSTHROUGH_VARS = (
-    "DISPLAY",
-    "XAUTHORITY",
-    "WAYLAND_DISPLAY",
-    "DBUS_SESSION_BUS_ADDRESS",
-    "XDG_RUNTIME_DIR",
-    "XDG_SESSION_TYPE",
-    "XDG_SESSION_ID",
-    "XDG_SESSION_DESKTOP",
-    "XDG_CURRENT_DESKTOP",
-    "XDG_DATA_DIRS",
-    "XDG_CONFIG_DIRS",
-    "DESKTOP_SESSION",
-    "SSH_AUTH_SOCK",
-    "SSH_AGENT_PID",
-)
-
-
-def desktop_inherited_env() -> dict[str, str]:
-    return {k: os.environ[k] for k in _DESKTOP_PASSTHROUGH_VARS if k in os.environ}
 
 
 def _login_shell() -> str:

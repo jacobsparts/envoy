@@ -8,10 +8,10 @@
 
 <p align="center">
   A terminal emulator with a built-in voice &amp; text AI agent.<br>
-  Runs as a <strong>web app</strong> or a native <strong>desktop app</strong> &mdash; same codebase, same features.
+  Runs as a <strong>web app</strong> / PWA.
 </p>
 
-![envoy desktop app](static/screenshot.png)
+![envoy app](static/screenshot.png)
 
 ---
 
@@ -30,12 +30,11 @@
 ## Architecture
 
 ```
-Browser / pywebview
-  ├── xterm.js          terminal emulation
-  ├── app.js            tabs, voice, drag-drop, settings
-  └── transport layer
-        ├── PywebviewTransport   (desktop: JS ↔ Python bridge)
-        └── BrowserTransport     (web: HTTP JSON to server.py)
+Browser  ──────────────►  Python HTTP server (server.py)
+   │                             │
+   ▼                             ▼
+BrowserTransport             EnvoyService / PtyWorker
+                               (runs shell processes and coordinates AI agent)
 
 Python backend
   ├── app_core.py       PTY session management, file uploads
@@ -45,11 +44,9 @@ Python backend
   └── env_config.py     API key management
 ```
 
-Both modes share the same runtime (`app_core.py`) and frontend (`app.js`). The only difference is the transport layer.
+The browser frontend (`app.js`) talks to the Python runtime (`app_core.py`) over HTTP via `BrowserTransport`.
 
 ## Quickstart
-
-### Web mode
 
 ```bash
 uv venv .venv
@@ -58,21 +55,6 @@ python server.py
 ```
 
 Open `http://localhost:8080/envoy/`
-
-### Desktop mode
-
-```bash
-uv venv .venv
-uv pip install --python .venv/bin/python -r requirements-desktop.txt
-./envoy-desktop
-```
-
-An optional launch target can open a specific alias or path:
-
-```bash
-./envoy-desktop /python        # resolved via aliases.conf
-./envoy-desktop /projects/foo  # resolved relative to $HOME
-```
 
 ## API Keys
 
