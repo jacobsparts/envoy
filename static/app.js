@@ -2987,7 +2987,18 @@ function init(baseTransport, config) {
         spans[0].textContent = "\n";
       }
     }
+    // Merge soft-wrapped buffer rows so copy/paste keeps logical lines.
+    // Continuations use isWrapped; browsers otherwise insert newlines between row divs.
     if (wrapper) {
+      for (let i = Math.min(wrapper.children.length, buf.length) - 1; i >= 1; i--) {
+        const line = buf.getLine(i);
+        if (!line || !line.isWrapped) continue;
+        const row = wrapper.children[i];
+        const prev = wrapper.children[i - 1];
+        if (!row || !prev) continue;
+        while (row.firstChild) prev.appendChild(row.firstChild);
+        row.remove();
+      }
       while (wrapper.lastElementChild && wrapper.lastElementChild.textContent === "\n") {
         wrapper.lastElementChild.remove();
       }
