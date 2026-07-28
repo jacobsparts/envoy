@@ -1,0 +1,9 @@
+[Unit]
+Description=Envoy terminal sessions
+Before=shutdown.target
+
+[Slice]
+MemoryAccounting=yes
+MemoryHigh=12G
+MemoryMax=18G
+MemorySwapMax=4G

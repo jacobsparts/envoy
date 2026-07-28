@@ -131,8 +131,21 @@ class DesktopApi:
     def cancel_agent(self, session_id: str) -> dict[str, bool]:
         return self._service.cancel_agent(session_id)
 
+    def list_sessions(self) -> dict[str, object]:
+        return self._service.list_sessions()
+
     def close_session(self, session_id: str) -> dict[str, bool]:
         return self._service.close_session(session_id)
+
+    def force_stop_session(self, session_id: str) -> dict[str, bool]:
+        return self._service.force_stop_session(session_id)
+
+    def update_resource_limits(self, target: str, session_id: str = "",
+                               memory_high: object = None, memory_max: object = None,
+                               memory_swap_max: object = None) -> dict[str, object]:
+        return self._service.update_resource_limits(
+            target, session_id, memory_high, memory_max, memory_swap_max
+        )
 
     def toggle_fullscreen(self) -> dict[str, bool]:
         if self.window:

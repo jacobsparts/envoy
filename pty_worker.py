@@ -10,7 +10,7 @@ import threading
 import time
 import traceback
 
-from app_core import Session, apply_session_resource_limits
+from app_core import Session
 
 
 def _start_parent_watchdog(parent_pid: int) -> None:
@@ -37,16 +37,18 @@ def _send(control_file, msg: dict[str, object]) -> None:
 
 def main() -> None:
     if len(sys.argv) != 6:
-        raise SystemExit("usage: pty_worker.py CONTROL_FD INPUT_FD OUTPUT_FD CONFIG_B64 PARENT_PID")
+        raise SystemExit("usage: pty_worker.py CONTROL_SOCKET INPUT_SOCKET OUTPUT_SOCKET CONFIG_B64 PARENT_PID")
     _start_parent_watchdog(int(sys.argv[5]))
-    apply_session_resource_limits()
-
-    control_fd = int(sys.argv[1])
-    input_fd = int(sys.argv[2])
-    output_fd = int(sys.argv[3])
+    sockets = {}
+    for name, socket_path in zip(("control", "input", "output"), sys.argv[1:4]):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(socket_path)
+        sockets[name] = sock
+    control_sock = sockets["control"]
+    input_fd = sockets["input"].fileno()
+    output_fd = sockets["output"].fileno()
     config = json.loads(base64.b64decode(sys.argv[4]).decode("utf-8"))
 
-    control_sock = socket.socket(fileno=control_fd)
     control_file_r = control_sock.makefile("rb", buffering=0)
     control_file_w = control_sock.makefile("wb", buffering=0)
 
@@ -61,6 +63,7 @@ def main() -> None:
         str(config["cwd"]),
         login=bool(config.get("login")),
         extra_env=dict(config.get("extra_env") or {}),
+        prompt_sentinel=str(config.get("prompt_sentinel") or ""),
         output_callback=output_callback,
     )
 
@@ -165,9 +168,9 @@ def main() -> None:
         try:
             session.cleanup()
         finally:
-            for fd in (input_fd, output_fd):
+            for sock in sockets.values():
                 try:
-                    os.close(fd)
+                    sock.close()
                 except OSError:
                     pass
 

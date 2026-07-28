@@ -141,8 +141,6 @@ def make_handler():
                             self.wfile.write(b"event: evicted\ndata: {}\n\n")
                             self.wfile.flush()
                             break
-                        if session.alive:
-                            session.cancel_timeout()
                         session.last_seen = time.monotonic()
                         output, events, promoted, resize = session.wait_for_client(client_id, 10)
                         if client_id not in session.clients:
@@ -212,8 +210,6 @@ def make_handler():
                 try:
                     for session_id, client_id in pairs:
                         session = sessions[session_id]
-                        if session.alive:
-                            session.cancel_timeout()
                         session.last_seen = time.monotonic()
 
                         def callback(payload: dict[str, object], sid=session_id, cid=client_id) -> None:
@@ -237,7 +233,6 @@ def make_handler():
                         for session_id, client_id, payload in pending:
                             session = sessions.get(session_id)
                             if session and session.alive:
-                                session.cancel_timeout()
                                 session.last_seen = time.monotonic()
                             msg = {
                                 "session_id": session_id,
@@ -452,6 +447,24 @@ def make_handler():
                 if parsed.path == f"{WEB_PREFIX}/api/close_session":
                     body = read_json_body(self)
                     result = service.close_session(str(body.get("session_id") or ""))
+                    json_response(self, 202, result)
+                    return
+
+                if parsed.path == f"{WEB_PREFIX}/api/force_stop_session":
+                    body = read_json_body(self)
+                    result = service.force_stop_session(str(body.get("session_id") or ""))
+                    json_response(self, 200, result)
+                    return
+
+                if parsed.path == f"{WEB_PREFIX}/api/resource_limits":
+                    body = read_json_body(self)
+                    result = service.update_resource_limits(
+                        str(body.get("target") or ""),
+                        str(body.get("session_id") or ""),
+                        body.get("memory_high"),
+                        body.get("memory_max"),
+                        body.get("memory_swap_max"),
+                    )
                     json_response(self, 200, result)
                     return
 

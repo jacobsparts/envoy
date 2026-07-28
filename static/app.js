@@ -1166,6 +1166,13 @@ class TerminalTab {
     } else {
       this.fitTerminal();
     }
+    if (this.manager.activeTab === this) {
+      requestAnimationFrame(() => {
+        if (this.manager.activeTab !== this || this.closed) return;
+        this.fitTerminal({ preserveScroll: true });
+        this.term.refresh(0, this.term.rows - 1);
+      });
+    }
   }
 
   resetFileLinks() {
@@ -1318,6 +1325,11 @@ class TerminalTab {
   scheduleActivationResize() {
     this.markActivated();
     this.fitTerminal({ preserveScroll: true });
+    requestAnimationFrame(() => {
+      if (this.manager.activeTab !== this || this.closed) return;
+      this.fitTerminal({ preserveScroll: true });
+      this.term.refresh(0, this.term.rows - 1);
+    });
     if (this._activationResizeTimer) {
       clearTimeout(this._activationResizeTimer);
     }
@@ -1325,6 +1337,7 @@ class TerminalTab {
       this._activationResizeTimer = null;
       if (this.manager.activeTab === this && !this.closed) {
         this.fitTerminal({ preserveScroll: true });
+        this.term.refresh(0, this.term.rows - 1);
       }
     }, 1000);
   }
@@ -1852,23 +1865,37 @@ class TabManager {
 
   async createTab({ activate = true, sessionId = "", mode = "takeover" } = {}) {
     const tab = new TerminalTab(this, this.baseTransport.clone(), this.nextIndex++);
+    const previousActiveTab = this.activeTab;
+    const shouldActivate = activate || !previousActiveTab;
     this.tabs.push(tab);
     this.elements.stack.appendChild(tab.pane);
     this.elements.tabs.appendChild(tab.button);
     this.updateTabBar();
+    if (shouldActivate) {
+      // xterm must have visible geometry while reset and reconnect replay run.
+      // Replaying into a display:none pane can leave mobile/PWA renderers black.
+      this.activateTab(tab.id);
+    }
     try {
       await tab.connect(sessionId, mode);
     } catch (err) {
       this.tabs = this.tabs.filter(item => item !== tab);
+      if (this.activeTab === tab) this.activeTab = null;
       tab.closed = true;
       tab.resizeObserver?.disconnect();
       tab.pane.remove();
       tab.button.remove();
       this.updateTabBar();
+      if (previousActiveTab && this.tabs.includes(previousActiveTab)) {
+        this.activateTab(previousActiveTab.id);
+      } else {
+        this.updateDisconnectOverlay();
+        this.syncHash();
+      }
       this.saveTabState();
       throw err;
     }
-    if (activate || !this.activeTab) this.activateTab(tab.id);
+    if (shouldActivate && this.activeTab !== tab) this.activateTab(tab.id);
     this.syncHash();
     this.saveTabState();
     return tab;
@@ -3833,7 +3860,149 @@ function init(baseTransport, config) {
   if (spFindNext) spFindNext.addEventListener("click", () => triggerFindNext());
 
   const sessionsList = document.getElementById("sessions-list");
+  const sessionsAggregate = document.getElementById("sessions-aggregate");
   const sessionsClose = document.getElementById("sessions-close");
+
+  const resourceEventCounts = new Map();
+
+  function resourceStatus(memory, resourceKey) {
+    if (!memory?.available || Date.now() / 1000 - (memory.updated_at || 0) > 15) return "unavailable";
+    const current = memory.current || 0;
+    const high = memory.high;
+    const maximum = memory.max;
+    const events = memory.events || {};
+    const counts = {
+      max: Number(events.max || 0),
+      oom: Number(events.oom || 0),
+      oom_kill: Number(events.oom_kill || 0),
+    };
+    const now = Date.now();
+    const previous = resourceEventCounts.get(resourceKey);
+    const increased = previous && (
+      counts.max > previous.counts.max
+      || counts.oom > previous.counts.oom
+      || counts.oom_kill > previous.counts.oom_kill
+    );
+    const criticalUntil = increased ? now + 15000 : (previous?.criticalUntil || 0);
+    resourceEventCounts.set(resourceKey, { counts, criticalUntil });
+    if ((maximum && current >= maximum * 0.9) || (memory.swap_max && memory.swap_current >= memory.swap_max) || criticalUntil > now) return "critical";
+    if ((high && current >= high) || (memory.pressure?.full_avg10 || 0) > 0) return "pressure";
+    if (high && current >= high * 0.8) return "elevated";
+    return "normal";
+  }
+
+  function resourceProcessText(memory) {
+    if (!memory?.available) return "(? ps)";
+    return `(${memory.processes ?? "?"} ps)`;
+  }
+
+  function resourceMemoryText(memory) {
+    if (!memory?.available) return "? MB";
+    return `${Math.round((memory.current || 0) / (1024 * 1024))} MB`;
+  }
+
+  function makeResourceLink(memory, target, sessionId = "") {
+    const link = document.createElement("button");
+    link.type = "button";
+    const resourceKey = target === "session" ? `session:${sessionId}` : "aggregate";
+    link.className = `resource-usage-link resource-link-${resourceStatus(memory, resourceKey)}`;
+    link.textContent = resourceMemoryText(memory);
+    link.title = "Edit memory thresholds";
+    link.addEventListener("click", e => {
+      e.stopPropagation();
+      editResourceLimits(target, sessionId, memory);
+    });
+    return link;
+  }
+
+  function renderAggregateResources(memory) {
+    if (!sessionsAggregate) return;
+    sessionsAggregate.className = `resource-${resourceStatus(memory, "aggregate")}`;
+    sessionsAggregate.replaceChildren(
+      document.createTextNode("All sessions — "),
+      makeResourceLink(memory, "aggregate"),
+      document.createTextNode(` ${resourceProcessText(memory)}`)
+    );
+  }
+
+  function parseLimitInput(value) {
+    const match = String(value || "").trim().match(/^(\d+(?:\.\d+)?)\s*(b|kib|mib|gib|kb|mb|gb)?$/i);
+    if (!match) throw new Error("Use a byte value or a size such as 8 GiB");
+    const units = { b: 1, kb: 1000, mb: 1000 ** 2, gb: 1000 ** 3, kib: 1024, mib: 1024 ** 2, gib: 1024 ** 3 };
+    return Math.round(Number(match[1]) * units[(match[2] || "b").toLowerCase()]);
+  }
+
+  async function listManagedSessions() {
+    if (window.pywebview && baseTransport.api) return baseTransport.api.list_sessions();
+    const response = await fetch((baseTransport.basePath || "/envoy") + "/api/sessions");
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Unable to load sessions");
+    return result;
+  }
+
+  async function updateManagedLimits(body) {
+    if (window.pywebview && baseTransport.api) {
+      return baseTransport.api.update_resource_limits(
+        body.target, body.session_id, body.memory_high,
+        body.memory_max ?? null, body.memory_swap_max
+      );
+    }
+    const response = await fetch((baseTransport.basePath || "/envoy") + "/api/resource_limits", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Unable to update limits");
+    return result;
+  }
+
+  async function editResourceLimits(target, sessionId, memory) {
+    const currentHigh = memory?.high ? `${(memory.high / (1024 * 1024 * 1024)).toFixed(1)} GiB` : "";
+    const highText = prompt("Memory limit (for example 8 GiB)", currentHigh);
+    if (highText === null) return;
+    try {
+      const highBytes = parseLimitInput(highText);
+      const body = {
+        target,
+        session_id: sessionId || "",
+        memory_high: highBytes,
+        memory_max: Math.round(highBytes * 1.5),
+        memory_swap_max: Math.round(highBytes * 0.25),
+      };
+      await updateManagedLimits(body);
+      showToast("Runtime resource limits updated");
+      await openSessionPicker();
+    } catch (err) {
+      showToast(err.message || String(err), true);
+    }
+  }
+
+  async function stopSession(sessionId, force) {
+    const action = force ? "force-stop" : "shut down";
+    if (!confirm(`Really ${action} session ${sessionId}?`)) return;
+    try {
+      let result;
+      if (window.pywebview && baseTransport.api) {
+        result = force
+          ? await baseTransport.api.force_stop_session(sessionId)
+          : await baseTransport.api.close_session(sessionId);
+      } else {
+        const endpoint = force ? "/api/force_stop_session" : "/api/close_session";
+        const response = await fetch((baseTransport.basePath || "/envoy") + endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: sessionId }),
+        });
+        result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Unable to stop session");
+      }
+      showToast(force ? "Session force-stopped" : "Session is shutting down");
+      setTimeout(() => openSessionPicker(), force ? 100 : 500);
+    } catch (err) {
+      showToast(err.message || String(err), true);
+    }
+  }
   const sessionsTakeoverAll = document.getElementById("sessions-takeover-all");
   let currentSessionPickerSessions = [];
   async function openSessionPicker() {
@@ -3842,10 +4011,10 @@ function init(baseTransport, config) {
     sessionsList.innerHTML = '<p class="sessions-empty">Loading...</p>';
     if (sessionsTakeoverAll) sessionsTakeoverAll.disabled = true;
     try {
-      const basePath = baseTransport.basePath || "/envoy";
-      const resp = await fetch(basePath + "/api/sessions");
-      const sessions = await resp.json();
+      const payload = await listManagedSessions();
+      const sessions = payload.sessions || [];
       currentSessionPickerSessions = sessions;
+      renderAggregateResources(payload.resources?.memory);
       const openSids = new Set(manager.tabs.map(t => t.transport.sessionId).filter(Boolean));
       const takeoverAllSessions = sessions.filter(s => !openSids.has(s.sid));
       if (sessionsTakeoverAll) sessionsTakeoverAll.disabled = !takeoverAllSessions.length;
@@ -3863,13 +4032,32 @@ function init(baseTransport, config) {
           item.classList.add("session-item-active");
           item.style.opacity = "0.5";
         }
-        const status = s.attached
-          ? `attached (${s.clients || 1} client${(s.clients || 1) !== 1 ? "s" : ""})`
-          : "detached";
+        const clientCount = s.clients ?? 0;
+        const status = `${clientCount} client${clientCount === 1 ? "" : "s"}`;
+        const memory = s.resources?.memory || {};
+        const resourceState = resourceStatus(memory, `session:${s.sid}`);
+        item.classList.add(`resource-${resourceState}`);
         item.innerHTML =
-          `<div class="session-item-id">${s.title || s.sid}</div>` +
-          `<div class="session-item-cmd">${s.cmd.join(" ")}</div>` +
-          `<div class="session-item-status ${s.attached ? "attached" : "detached"}">pid ${s.pid} &mdash; ${status} &mdash; ${s.path}</div>`;
+          `<div class="session-item-id">${escapeHtml(s.title || s.sid)}</div>`;
+        const statusLine = document.createElement("div");
+        statusLine.className = `session-item-status ${s.attached ? "attached" : "detached"}`;
+        const pidSpan = document.createElement("span");
+        pidSpan.className = "session-pid-clickable";
+        pidSpan.textContent = `pid ${s.pid}`;
+        pidSpan.title = "Click to copy PID";
+        pidSpan.style.cursor = "pointer";
+        pidSpan.addEventListener("click", async e => {
+          e.stopPropagation();
+          await copyToClipboard(String(s.pid));
+          showToast(`Copied PID ${s.pid}`);
+        });
+        statusLine.append(
+          pidSpan,
+          document.createTextNode(` — ${status} — `),
+          makeResourceLink(memory, "session", s.sid),
+          document.createTextNode(` ${resourceProcessText(memory)}${s.closing ? " — shutting down" : ""}`)
+        );
+        item.appendChild(statusLine);
         if (!isActive && !isOpen) {
           const actions = document.createElement("div");
           actions.className = "session-item-actions";
@@ -3900,6 +4088,14 @@ function init(baseTransport, config) {
           }
           item.appendChild(actions);
         }
+        const stop = document.createElement("button");
+        stop.type = "button";
+        stop.className = "session-stop";
+        stop.textContent = "×";
+        stop.title = s.closing ? "Force stop now" : "Shut down session";
+        stop.setAttribute("aria-label", stop.title);
+        stop.addEventListener("click", () => stopSession(s.sid, !!s.closing));
+        item.appendChild(stop);
         sessionsList.appendChild(item);
       }
       function attachSession(sid, mode) {
@@ -3926,9 +4122,6 @@ function init(baseTransport, config) {
   const sessionsNewTab = document.getElementById("sessions-new-tab");
 
   if (spSessions) {
-    if (window.pywebview) {
-      spSessions.style.display = "none";
-    }
     let sessionsLongPress = null;
     let sessionsLongPressFired = false;
     function copySessionId() {
@@ -5144,9 +5337,8 @@ function init(baseTransport, config) {
       } else if (hashSid) {
         // Check if session is already attached before auto-connecting
         try {
-          const basePath = baseTransport.basePath || "/envoy";
-          const resp = await fetch(basePath + "/api/sessions");
-          const sessions = await resp.json();
+          const payload = await listManagedSessions();
+          const sessions = payload.sessions || [];
           const target = sessions.find(s => s.sid === hashSid);
           if (target && target.attached) {
             await createTabFromHashSid(hashSid, "lead");

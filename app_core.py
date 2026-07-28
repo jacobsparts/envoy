@@ -13,21 +13,23 @@ import fcntl
 import os
 import pty
 import re
-import resource
 import signal
 import secrets
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
 import termios
 import threading
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 
 import pyte
 
+from cgroup_manager import SystemdScopeManager
 from env_config import get_env_settings, save_env_settings
 from speech import synthesize_speech
 from terminal_session import SessionTerminal
@@ -82,7 +84,6 @@ UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
 MAX_CLIENT_OUTPUT_BUFFER = 4 * 1024 * 1024
-SESSION_TIMEOUT = 60 * 60 * 24
 TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
 DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
@@ -91,33 +92,6 @@ LIVE_PYTE_HISTORY_LINES = 1000
 ARCHIVE_HISTORY_LINES = 200000
 ARCHIVE_PYTE_HISTORY_LINES = 1000
 
-
-def _parse_size(value: str, default: int) -> int:
-    text = (value or "").strip().lower()
-    if not text:
-        return default
-    multipliers = {
-        "k": 1024,
-        "kb": 1024,
-        "m": 1024 ** 2,
-        "mb": 1024 ** 2,
-        "g": 1024 ** 3,
-        "gb": 1024 ** 3,
-    }
-    match = re.fullmatch(r"(\d+)([a-z]*)", text)
-    if not match:
-        return default
-    number, suffix = match.groups()
-    return int(number) * multipliers.get(suffix, 1)
-
-
-SESSION_MEM_LIMIT = _parse_size(os.environ.get("ENVOY_SESSION_MEMORY_MAX", "4G"), 4 * 1024 ** 3)
-
-
-def apply_session_resource_limits() -> None:
-    if SESSION_MEM_LIMIT <= 0:
-        return
-    resource.setrlimit(resource.RLIMIT_AS, (SESSION_MEM_LIMIT, SESSION_MEM_LIMIT))
 
 
 def _login_env() -> dict[str, str]:
@@ -336,6 +310,7 @@ class FlatteningHistoryScreen(pyte.HistoryScreen):
 class Session:
     def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
                  login: bool = False, extra_env: dict[str, str] | None = None,
+                 prompt_sentinel: str = "",
                  output_callback: Callable[[bytes], None] | None = None):
         self.sid = sid
         self.path = path
@@ -343,7 +318,7 @@ class Session:
         self.cwd = cwd
         self.title = ""
         self.master, slave = pty.openpty()
-        self._prompt_sentinel = f"__ENVOY_PROMPT_{secrets.token_hex(6)}__"
+        self._prompt_sentinel = prompt_sentinel or f"__ENVOY_PROMPT_{secrets.token_hex(6)}__"
         env = {
             **(extra_env or {}),
             **_login_env(),
@@ -366,7 +341,7 @@ class Session:
             shell_name = os.path.basename(cmd[0])
             popen_kwargs["executable"] = cmd[0]
             cmd = [f"-{shell_name}"] + cmd[1:]
-        self.proc = subprocess.Popen(cmd, **popen_kwargs, preexec_fn=apply_session_resource_limits)
+        self.proc = subprocess.Popen(cmd, **popen_kwargs)
         os.close(slave)
         self.scrollback = collections.deque()
         self.scrollback_bytes = 0
@@ -404,7 +379,6 @@ class Session:
         self._last_agent_request: tuple[str, float] | None = None
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
-        self._timeout: threading.Timer | None = None
         self._output_callback = output_callback
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name=f"pty-{sid}")
         self._reader.start()
@@ -666,7 +640,6 @@ class Session:
                     self._output_callback(self.exit_message)
                 except Exception:
                     pass
-            self.cancel_timeout()
             try:
                 os.close(self.master)
             except OSError:
@@ -814,7 +787,7 @@ class Session:
             return payload["output"], payload["events"], bool(payload["promoted"]), resize_tuple
 
     def write(self, data: bytes) -> None:
-        if self.alive:
+        if self.alive and not getattr(self, "closing", False):
             with self._lock:
                 self._last_input_at = time.monotonic()
             os.write(self.master, data)
@@ -1203,19 +1176,6 @@ class Session:
                 results.append(info)
         return results
 
-    def start_timeout(self) -> None:
-        self.cancel_timeout()
-        timer = threading.Timer(SESSION_TIMEOUT, self._timeout_expired)
-        timer.daemon = True
-        self._timeout = timer
-        timer.start()
-
-    def cancel_timeout(self) -> None:
-        timer = self._timeout
-        if timer:
-            timer.cancel()
-            self._timeout = None
-
     def _terminate_process_tree(self, timeout: float = 2.0) -> None:
         try:
             pgid = os.getpgid(self.proc.pid)
@@ -1245,14 +1205,6 @@ class Session:
         else:
             self.proc.kill()
 
-    def _timeout_expired(self) -> None:
-        self._timeout = None
-        if self.alive:
-            try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
-            except OSError:
-                self.proc.terminate()
-
     def _notify_push_callbacks_closed(self) -> None:
         with self._lock:
             callbacks = list(self._push_callbacks.values())
@@ -1264,7 +1216,6 @@ class Session:
         self._dispatch_push_payloads(deliveries)
 
     def cleanup(self) -> None:
-        self.cancel_timeout()
         cancel = self.voice_cancel
         if cancel:
             cancel.set()
@@ -1278,18 +1229,21 @@ class Session:
                 pass
 
 
-CLIENT_STALE_SECONDS = 30
-
-
-
+REAPER_INTERVAL_SECONDS = 30
 class WorkerSession:
     def __init__(self, sid: str, path: str, cmd: list[str], cwd: str, *,
-                 login: bool = False, extra_env: dict[str, str] | None = None):
+                 scope_manager: SystemdScopeManager,
+                 login: bool = False, extra_env: dict[str, str] | None = None,
+                 prompt_sentinel: str = ""):
         self.sid = sid
         self.path = path
         self.cmd = list(cmd)
         self.cwd = cwd
         self.title = ""
+        self.scope_manager = scope_manager
+        self.scope_name = scope_manager.unit_name(sid)
+        self.closing = False
+        self.prompt_sentinel = prompt_sentinel or f"__ENVOY_PROMPT_{secrets.token_hex(6)}__"
         self.clients: dict[str, ClientState] = {}
         self._push_callbacks: dict[str, Callable[[dict[str, object]], None]] = {}
         self.last_seen: float = time.monotonic()
@@ -1299,7 +1253,6 @@ class WorkerSession:
         self._pyte_known_lines: list[str] = []
         self._lock = threading.Lock()
         self._pending_ready = threading.Condition(self._lock)
-        self._timeout: threading.Timer | None = None
         self.voice_cancel: threading.Event | None = None
         self.agent_lock = threading.Lock()
         self.alive = True
@@ -1309,10 +1262,24 @@ class WorkerSession:
         self._exit_status_ready = threading.Event()
         self._pending_control: dict[int, dict[str, object] | None] = {}
         self._next_control_id = 1
+        self._cleanup_lock = threading.Lock()
+        self._cleanup_state_lock = threading.Lock()
+        self._cleanup_force = threading.Event()
+        self._cleanup_started = False
+        self._cleaned = False
 
-        control_parent, control_child = socket.socketpair()
-        input_r, input_w = os.pipe()
-        output_r, output_w = os.pipe()
+        ipc_dir = tempfile.mkdtemp(prefix=f"envoy-{sid}-")
+        socket_paths = {
+            name: os.path.join(ipc_dir, f"{name}.sock")
+            for name in ("control", "input", "output")
+        }
+        listeners: dict[str, socket.socket] = {}
+        for name, socket_path in socket_paths.items():
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(socket_path)
+            listener.listen(1)
+            listener.settimeout(10)
+            listeners[name] = listener
         config = {
             "sid": sid,
             "path": path,
@@ -1320,20 +1287,51 @@ class WorkerSession:
             "cwd": cwd,
             "login": login,
             "extra_env": extra_env or {},
+            "prompt_sentinel": self.prompt_sentinel,
         }
         config_b64 = base64.b64encode(json.dumps(config).encode("utf-8")).decode("ascii")
         worker = str(APP_DIR / "pty_worker.py")
-        self.proc = subprocess.Popen(
-            [sys.executable, worker, str(control_child.fileno()), str(input_r), str(output_w), config_b64, str(os.getpid())],
-            pass_fds=[control_child.fileno(), input_r, output_w],
-            cwd=str(APP_DIR),
-        )
-        control_child.close()
-        os.close(input_r)
-        os.close(output_w)
-        self._control_sock = control_parent
-        self._input_fd = input_w
-        self._output_fd = output_r
+        worker_python = str(APP_DIR / ".venv" / "bin" / "python")
+        if not os.path.exists(worker_python):
+            worker_python = sys.executable
+        worker_command = [
+            worker_python, worker, socket_paths["control"], socket_paths["input"],
+            socket_paths["output"], config_b64, str(os.getpid()),
+        ]
+        connections: dict[str, socket.socket] = {}
+        try:
+            self.proc = subprocess.Popen(
+                scope_manager.launch_command(sid, worker_command),
+                cwd=str(APP_DIR),
+                env={**os.environ, "ENVOY_PROMPT_SENTINEL": self.prompt_sentinel},
+            )
+            for name, listener in listeners.items():
+                connections[name] = listener.accept()[0]
+            self.cgroup_path = scope_manager.verify_scope(sid)
+        except Exception:
+            for connection in connections.values():
+                connection.close()
+            try:
+                scope_manager.stop_scope(sid)
+            except Exception:
+                pass
+            if getattr(self, "proc", None) and self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+            raise
+        finally:
+            for listener in listeners.values():
+                listener.close()
+            shutil.rmtree(ipc_dir, ignore_errors=True)
+        self._control_sock = connections["control"]
+        self._input_sock = connections["input"]
+        self._output_sock = connections["output"]
+        self._input_fd = self._input_sock.fileno()
+        self._output_fd = self._output_sock.fileno()
         self._control_reader = threading.Thread(target=self._control_loop, daemon=True, name=f"worker-control-{sid}")
         self._output_reader = threading.Thread(target=self._output_loop, daemon=True, name=f"worker-output-{sid}")
         self._control_reader.start()
@@ -1369,16 +1367,6 @@ class WorkerSession:
     def push_agent_event(self, kind: str, text: str) -> None:
         return Session.push_agent_event(self, kind, text)
 
-    def start_timeout(self) -> None:
-        return Session.start_timeout(self)
-
-    def cancel_timeout(self) -> None:
-        return Session.cancel_timeout(self)
-
-    def _timeout_expired(self) -> None:
-        self._timeout = None
-        if self.alive:
-            self.proc.terminate()
     def _notify_push_callbacks_closed(self) -> None:
         return Session._notify_push_callbacks_closed(self)
 
@@ -1422,22 +1410,25 @@ class WorkerSession:
     def _control_loop(self) -> None:
         try:
             reader = self._control_sock.makefile("rb", buffering=0)
-            for raw in reader:
-                try:
-                    msg = json.loads(raw.decode("utf-8"))
-                except Exception:
-                    continue
-                req_id = msg.get("id")
-                if req_id is not None:
-                    with self._control_ready:
-                        self._pending_control[int(req_id)] = msg
-                        self._control_ready.notify_all()
-                if msg.get("type") == "exit":
-                    with self._lock:
-                        self.alive = False
-                        self.exit_code = msg.get("exit_code")
-                        self._pending_ready.notify_all()
-                    self._exit_status_ready.set()
+            try:
+                for raw in reader:
+                    try:
+                        msg = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        continue
+                    req_id = msg.get("id")
+                    if req_id is not None:
+                        with self._control_ready:
+                            self._pending_control[int(req_id)] = msg
+                            self._control_ready.notify_all()
+                    if msg.get("type") == "exit":
+                        with self._lock:
+                            self.alive = False
+                            self.exit_code = msg.get("exit_code")
+                            self._pending_ready.notify_all()
+                        self._exit_status_ready.set()
+            except (ConnectionError, OSError):
+                pass
         finally:
             self._exit_status_ready.set()
             with self._control_ready:
@@ -1471,7 +1462,7 @@ class WorkerSession:
         return resp
 
     def write(self, data: bytes) -> None:
-        if self.alive:
+        if self.alive and not getattr(self, "closing", False):
             with self._lock:
                 self._last_input_at = time.monotonic()
             os.write(self._input_fd, data)
@@ -1529,31 +1520,58 @@ class WorkerSession:
         info = resp.get("info")
         return info if isinstance(info, dict) else None
 
-    def cleanup(self) -> None:
-        self.cancel_timeout()
-        cancel = self.voice_cancel
-        if cancel:
-            cancel.set()
-        self._notify_push_callbacks_closed()
-        try:
-            self._call_control({"type": "close"}, timeout=1)
-        except Exception:
-            pass
-        if self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        for fd in (self._input_fd, self._output_fd):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        try:
-            self._control_sock.close()
-        except OSError:
-            pass
+    def cleanup(self, force: bool = False) -> None:
+        if force:
+            self._cleanup_force.set()
+        with self._cleanup_lock:
+            if self._cleaned:
+                return
+            self.closing = True
+            cancel = self.voice_cancel
+            if cancel:
+                cancel.set()
+            self._notify_push_callbacks_closed()
+            if not self._cleanup_force.is_set():
+                try:
+                    self._call_control({"type": "close"}, timeout=1)
+                except Exception:
+                    pass
+                deadline = time.monotonic() + 5
+                while (
+                    not self._cleanup_force.is_set()
+                    and self.scope_manager.scope_active(self.sid)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+            if self.scope_manager.scope_active(self.sid):
+                self.scope_manager.signal_scope(self.sid, signal.SIGTERM)
+                deadline = time.monotonic() + 5
+                while (
+                    not self._cleanup_force.is_set()
+                    and self.scope_manager.scope_active(self.sid)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+            if self.scope_manager.scope_active(self.sid):
+                self.scope_manager.stop_scope(self.sid)
+            if self.proc.poll() is None:
+                try:
+                    self.proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
+            self.scope_manager.unregister(self.sid)
+            for fd in (self._input_fd, self._output_fd):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            for sock in (self._control_sock, self._input_sock, self._output_sock):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            self._cleaned = True
 
 
 class EnvoyService:
@@ -1561,29 +1579,27 @@ class EnvoyService:
         self._sessions: dict[str, WorkerSession] = {}
         self._extra_env = dict(extra_env) if extra_env else None
         self._lock = threading.Lock()
+        self._scope_manager = SystemdScopeManager()
         self._reaper = threading.Thread(target=self._reap_loop, daemon=True, name="session-reaper")
         self._reaper.start()
 
     def _reap_loop(self) -> None:
         while True:
-            time.sleep(CLIENT_STALE_SECONDS)
+            time.sleep(REAPER_INTERVAL_SECONDS)
             self._reap_sessions()
 
     def _reap_sessions(self) -> None:
-        now = time.monotonic()
         dead = []
-        detached = []
         with self._lock:
             for sid, session in list(self._sessions.items()):
                 if not session.alive:
                     self._sessions.pop(sid, None)
                     dead.append(session)
-                elif not session.clients and session._timeout is None and now - session.last_seen >= CLIENT_STALE_SECONDS:
-                    detached.append(session)
         for session in dead:
-            session.cleanup()
-        for session in detached:
-            session.start_timeout()
+            try:
+                session.cleanup()
+            except Exception as exc:
+                print(f"envoy: failed to reap session {session.sid}: {exc}", file=sys.stderr)
 
     def _encode(self, payload: bytes) -> str:
         return base64.b64encode(payload).decode("ascii")
@@ -1612,7 +1628,23 @@ class EnvoyService:
             sid = self._new_session_id()
             while sid in self._sessions:
                 sid = self._new_session_id()
-        session = WorkerSession(sid, path, cmd, cwd, login=login, extra_env=self._extra_env)
+        # Reserve the session ID before launching its scope. Otherwise the
+        # cgroup reconciliation thread can mistake the new scope for an orphan
+        # and stop it before WorkerSession finishes connecting to its sockets.
+        self._scope_manager.register(sid)
+        try:
+            session = WorkerSession(
+                sid,
+                path,
+                cmd,
+                cwd,
+                scope_manager=self._scope_manager,
+                login=login,
+                extra_env=self._extra_env,
+            )
+        except Exception:
+            self._scope_manager.unregister(sid)
+            raise
         with self._lock:
             self._sessions[session.sid] = session
         return session
@@ -1634,7 +1666,6 @@ class EnvoyService:
                 session = self._sessions.get(session_id)
             if not session or not session.alive:
                 raise ValueError("No active session")
-            session.cancel_timeout()
             client_id = secrets.token_hex(8)
             with session._lock:
                 if mode == "takeover":
@@ -1674,8 +1705,6 @@ class EnvoyService:
             return {"output": "", "alive": False, "exit_code": -1}
         if client_id and client_id not in session.clients:
             return {"output": "", "alive": False, "evicted": True, "exit_code": -1}
-        if session.alive:
-            session.cancel_timeout()
         session.last_seen = time.monotonic()
         if client_id and wait_timeout > 0:
             output, events, promoted, resize = session.wait_for_client(client_id, wait_timeout)
@@ -1856,7 +1885,7 @@ class EnvoyService:
             cancel.set()
         return {"ok": True}
 
-    def list_sessions(self) -> list[dict[str, object]]:
+    def list_sessions(self) -> dict[str, object]:
         with self._lock:
             sessions = list(self._sessions.values())
         result = []
@@ -1870,10 +1899,53 @@ class EnvoyService:
                 "cmd": s.cmd,
                 "cwd": s.cwd,
                 "pid": s.proc.pid,
-                "attached": s._timeout is None,
+                "scope": s.scope_name,
+                "attached": bool(s.clients),
                 "clients": len(s.clients),
+                "closing": s.closing,
+                "resources": {"memory": self._scope_manager.session_stats(s.sid)},
             })
-        return result
+        return {
+            "sessions": result,
+            "resources": {"memory": self._scope_manager.aggregate_stats()},
+        }
+
+    def update_resource_limits(self, target: str, session_id: str = "",
+                               memory_high: object = None, memory_max: object = None,
+                               memory_swap_max: object = None) -> dict[str, object]:
+        if target == "session":
+            self._get_session(session_id)
+        return self._scope_manager.update_limits(
+            target, session_id, memory_high, memory_max, memory_swap_max
+        )
+
+    def _start_session_cleanup(self, session_id: str, session: WorkerSession, force: bool) -> None:
+        if force:
+            session._cleanup_force.set()
+        with session._cleanup_state_lock:
+            if session._cleanup_started:
+                return
+            session._cleanup_started = True
+            session.closing = True
+
+        def close() -> None:
+            try:
+                session.cleanup(force=force)
+            except Exception as exc:
+                print(f"envoy: failed to clean up session {session_id}: {exc}", file=sys.stderr)
+            finally:
+                with self._lock:
+                    if self._sessions.get(session_id) is session:
+                        self._sessions.pop(session_id, None)
+
+        threading.Thread(target=close, daemon=True, name=f"close-{session_id}").start()
+
+    def force_stop_session(self, session_id: str) -> dict[str, bool]:
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if session:
+            self._start_session_cleanup(session_id, session, force=True)
+        return {"ok": True}
 
     def rename_session(self, session_id: str, title: str) -> dict[str, object]:
         with self._lock:
@@ -1890,18 +1962,13 @@ class EnvoyService:
         with self._lock:
             session = self._sessions.get(session_id)
         if session:
-            session.cleanup()
-            with self._lock:
-                if self._sessions.get(session_id) is session:
-                    self._sessions.pop(session_id, None)
-        return {"ok": True}
+            self._start_session_cleanup(session_id, session, force=False)
+        return {"ok": True, "closing": bool(session)}
 
     def mark_detached(self, session_id: str, client_id: str = "") -> None:
         session = self._get_session(session_id)
         if client_id:
             session.remove_client(client_id)
-        if session.alive and not session.clients:
-            session.start_timeout()
 
     def shutdown(self) -> None:
         with self._lock:
@@ -1909,3 +1976,4 @@ class EnvoyService:
             self._sessions.clear()
         for session in sessions:
             session.cleanup()
+        self._scope_manager.close()

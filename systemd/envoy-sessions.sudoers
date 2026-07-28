@@ -1,0 +1,5 @@
+jacob ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --uid jacob --gid 1000 --scope --unit envoy-session-* --slice envoy-sessions --property MemoryAccounting=yes --property MemoryHigh=* --property MemoryMax=* --property MemorySwapMax=* --property KillMode=control-group --property CollectMode=inactive-or-failed --property PartOf=envoy.service -- *
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl stop envoy-session-*.scope
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl kill --kill-whom=all --signal=* envoy-session-*.scope
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl set-property --runtime envoy-session-*.scope MemoryHigh=* MemoryMax=* MemorySwapMax=*
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl set-property --runtime envoy-sessions.slice MemoryHigh=* MemoryMax=* MemorySwapMax=*
