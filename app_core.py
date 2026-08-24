@@ -77,6 +77,10 @@ UPLOAD_DIR = os.path.join(APP_DIR, ".envoy_uploads")
 ALIASES_FILE = os.path.join(APP_DIR, "aliases.conf")
 SCROLLBACK_BUFFER_SIZE = 100_000
 MAX_CLIENT_OUTPUT_BUFFER = 4 * 1024 * 1024
+# Clients that have not attached a push callback yet (still replaying the
+# snapshot) get a much larger allowance so slow mobile reconnects are not
+# evicted while nobody is draining their buffer.
+PRE_ATTACH_CLIENT_OUTPUT_BUFFER = 100 * 1024 * 1024
 TERMINAL_SETTLE_SECONDS = 0.75
 TERMINAL_POLL_SECONDS = 0.1
 DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
@@ -422,7 +426,8 @@ class Session:
         evicted_clients = []
         for client_id, cs in list(self.clients.items()):
             cs.output.extend(data)
-            if len(cs.output) > MAX_CLIENT_OUTPUT_BUFFER:
+            limit = PRE_ATTACH_CLIENT_OUTPUT_BUFFER if client_id not in self._push_callbacks else MAX_CLIENT_OUTPUT_BUFFER
+            if len(cs.output) > limit:
                 evicted_clients.append(client_id)
         for client_id in evicted_clients:
             self.clients.pop(client_id, None)
@@ -670,12 +675,6 @@ class Session:
         """Return rendered lines from pyte: history + current screen."""
         with self._lock:
             return self._render_pyte_screen(self._pyte_screen)
-
-    def reset_context_lookback(self, rows: int) -> None:
-        """Reset the context watermark to include the last *rows* lines."""
-        lines = self.get_terminal_lines()
-        start = max(0, len(lines) - rows)
-        self._pyte_known_lines = lines[:start]
 
     def push_agent_event(self, kind: str, text: str) -> None:
         deliveries = []
@@ -1344,7 +1343,8 @@ class WorkerSession:
         evicted_clients = []
         for client_id, cs in list(self.clients.items()):
             cs.output.extend(data)
-            if len(cs.output) > MAX_CLIENT_OUTPUT_BUFFER:
+            limit = PRE_ATTACH_CLIENT_OUTPUT_BUFFER if client_id not in self._push_callbacks else MAX_CLIENT_OUTPUT_BUFFER
+            if len(cs.output) > limit:
                 evicted_clients.append(client_id)
         for client_id in evicted_clients:
             self.clients.pop(client_id, None)
@@ -1767,8 +1767,6 @@ class EnvoyService:
                 return {"error": "Duplicate agent request ignored.", "response": "", "speech": "", "commands": []}
         if not session.agent_lock.acquire(blocking=False):
             return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
-        with session._lock:
-            session._last_agent_request = (request_key, now)
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
@@ -1780,12 +1778,15 @@ class EnvoyService:
                 session.push_agent_event("status", "Generating audio...")
             if speech and not iface.messages:
                 session.push_agent_event("message", speech)
-            return {
+            result = {
                 "response": reply,
                 "speech": speech,
                 "commands": iface.commands,
                 "audio": synthesize_speech(speech) if speech else None,
             }
+            with session._lock:
+                session._last_agent_request = (request_key, time.monotonic())
+            return result
         except AgentMaxTurnsError as exc:
             message = f"Agent stopped after reaching the turn limit ({exc.max_turns}). Send another message to continue."
             session.push_agent_event("status", message)
@@ -1814,8 +1815,6 @@ class EnvoyService:
                 return {"error": "Duplicate agent request ignored.", "response": "", "speech": "", "commands": []}
         if not session.agent_lock.acquire(blocking=False):
             return {"error": "Agent is already running for this session.", "response": "", "speech": "", "commands": []}
-        with session._lock:
-            session._last_agent_request = (request_key, now)
         cancel = threading.Event()
         session.voice_cancel = cancel
         try:
@@ -1827,12 +1826,15 @@ class EnvoyService:
                 session.push_agent_event("status", "Generating audio...")
             if speech and not iface.messages:
                 session.push_agent_event("message", speech)
-            return {
+            result = {
                 "response": reply,
                 "speech": speech,
                 "commands": iface.commands,
                 "audio": synthesize_speech(speech) if speech else None,
             }
+            with session._lock:
+                session._last_agent_request = (request_key, time.monotonic())
+            return result
         except AgentMaxTurnsError as exc:
             message = f"Agent stopped after reaching the turn limit ({exc.max_turns}). Send another message to continue."
             session.push_agent_event("status", message)
@@ -1853,12 +1855,14 @@ class EnvoyService:
             cancel.set()
         return {"ok": True}
 
-    def list_sessions(self) -> dict[str, object]:
+    def list_sessions(self, path: str | None = None) -> dict[str, object]:
         with self._lock:
             sessions = list(self._sessions.values())
         result = []
         for s in sessions:
             if not s.alive:
+                continue
+            if path is not None and path not in ("all", "*", "") and s.path != path:
                 continue
             result.append({
                 "sid": s.sid,
