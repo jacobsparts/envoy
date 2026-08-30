@@ -86,7 +86,7 @@ TERMINAL_POLL_SECONDS = 0.1
 DEFAULT_WAIT_FOR_SETTLE = TERMINAL_SETTLE_SECONDS
 AGENT_DUPLICATE_REQUEST_WINDOW_SECONDS = 15.0
 LIVE_PYTE_HISTORY_LINES = 1000
-ARCHIVE_HISTORY_LINES = 200000
+ARCHIVE_HISTORY_LINES = 10_000
 ARCHIVE_PYTE_HISTORY_LINES = 1000
 
 
@@ -330,7 +330,6 @@ class Session:
             on_clear=self._archive_lines.clear,
         )
         self._archive_pyte_stream = pyte.Stream(self._archive_pyte_screen)
-        self._last_archive_cut = {"kind": "init", "bytes": 0}
         self._archive_total_bytes = 0
         self.session_files: list[str] = []
         self.resolved_files: dict[str, dict[str, object]] = {}
@@ -452,11 +451,10 @@ class Session:
             _, cols, rows = self._archive_resize_events.popleft()
             self._archive_pyte_screen.resize(rows, cols)
 
-    def _feed_archive(self, data: bytes, cut_kind: str = "unknown") -> None:
+    def _feed_archive(self, data: bytes) -> None:
         if not data:
             self._apply_archive_resizes_locked()
             return
-        self._last_archive_cut = {"kind": cut_kind, "bytes": len(data)}
         offset = 0
         while offset < len(data):
             self._apply_archive_resizes_locked()
@@ -476,20 +474,16 @@ class Session:
             offset = end
         self._apply_archive_resizes_locked()
 
-    def _ansi_safe_cut(self, data: bytes, overflow: int) -> tuple[int, str]:
+    def _ansi_safe_cut(self, data: bytes, overflow: int) -> int:
         if not data:
-            return 0, "empty"
+            return 0
         target = min(len(data), overflow + 8192)
-        preferred = (
-            (b"\n", "newline"),
-            (b"\r", "carriage_return"),
-        )
-        for needle, kind in preferred:
+        for needle in (b"\n", b"\r"):
             idx = data.rfind(needle, 0, target)
             if idx != -1:
                 cut = idx + 1
                 if self._is_escape_boundary_safe(data, cut):
-                    return cut, kind
+                    return cut
         hard = overflow
         while hard < len(data) and (data[hard] & 0b1100_0000) == 0b1000_0000:
             hard += 1
@@ -498,8 +492,8 @@ class Session:
         while hard > overflow and not self._is_escape_boundary_safe(data, hard):
             hard -= 1
         if hard > 0:
-            return hard, "hard_safe"
-        return min(len(data), overflow), "hard"
+            return hard
+        return min(len(data), overflow)
 
     def _is_escape_boundary_safe(self, data: bytes, cut: int) -> bool:
         state = "ground"
@@ -558,13 +552,13 @@ class Session:
                 return
             if overflow >= len(removed):
                 self.scrollback_bytes -= len(removed)
-                self._feed_archive(removed, "chunk")
+                self._feed_archive(removed)
                 continue
-            cut, cut_kind = self._ansi_safe_cut(removed, overflow)
+            cut = self._ansi_safe_cut(removed, overflow)
             archived = removed[:cut]
             kept = removed[cut:]
             self.scrollback_bytes -= len(archived)
-            self._feed_archive(archived, cut_kind)
+            self._feed_archive(archived)
             if kept:
                 self.scrollback.appendleft(kept)
             if cut == 0:
@@ -651,25 +645,6 @@ class Session:
     def get_archived_text(self) -> str:
         with self._lock:
             return "\n".join(self._archived_lines_locked())
-
-    def get_reconnect_debug(self) -> dict[str, object]:
-        with self._lock:
-            archive_lines = self._archived_lines_locked()
-            return {
-                "archive_lines": len(archive_lines),
-                "archive_flattened_lines": len(self._archive_lines),
-                "archive_pyte_lines": len(self._render_pyte_screen(self._archive_pyte_screen)),
-                "archive_bytes": self._archive_total_bytes,
-                "recent_bytes": self.scrollback_bytes,
-                "recent_chunks": len(self.scrollback),
-                "pending_archive_resizes": len(self._archive_resize_events),
-                "archive_cols": self._archive_pyte_screen.columns,
-                "archive_rows": self._archive_pyte_screen.lines,
-                "last_archive_cut": dict(self._last_archive_cut),
-                "live_lines": len(self._render_pyte_screen(self._pyte_screen)),
-                "cols": self._pyte_screen.columns,
-                "rows": self._pyte_screen.lines,
-            }
 
     def get_terminal_lines(self) -> list[str]:
         """Return rendered lines from pyte: history + current screen."""
@@ -1450,10 +1425,6 @@ class WorkerSession:
 
     def get_archived_text(self) -> str:
         return str(self.snapshot_response("lead").get("archive_text") or "")
-
-    def get_reconnect_debug(self) -> dict[str, object]:
-        value = self.snapshot_response("lead").get("reconnect_debug") or {}
-        return value if isinstance(value, dict) else {}
 
     def get_terminal_state(self) -> dict[str, object]:
         resp = self._call_control({"type": "terminal_state"}, timeout=30)

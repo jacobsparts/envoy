@@ -116,7 +116,6 @@ def main() -> None:
                         "rows": session._pyte_screen.lines,
                         "title": msg.get("title") or "",
                         "archive_text": session.get_archived_text(),
-                        "reconnect_debug": session.get_reconnect_debug(),
                         "output": base64.b64encode(session.get_scrollback()).decode("ascii"),
                         "alive": session.alive,
                         "exit_code": session.exit_code,

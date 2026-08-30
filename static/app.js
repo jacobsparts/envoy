@@ -877,28 +877,13 @@ class TerminalTab {
     }
 
     const chunk = base64ToBytes(result.output);
-    if (result.reconnect_debug) {
-      const debug = {
-        sid: result.sid,
-        archiveTextChars: result.archive_text ? result.archive_text.length : 0,
-        rawReplayBytes: chunk.length,
-        ...result.reconnect_debug,
-      };
-      console.info("envoy reconnect debug", debug);
-      this._lastReconnectDebug = debug;
-    } else {
-      this._lastReconnectDebug = null;
-    }
-
     this.resetFileLinks();
-    this.scanTerminalText(result.archive_text || "");
 
     this._suppressInput = true;
     await new Promise(resolve => {
       const writeRaw = () => {
         if (chunk.length) {
           this.term.write(chunk, resolve);
-          this.scanTerminalBytes(chunk);
         } else {
           resolve();
         }
@@ -937,18 +922,23 @@ class TerminalTab {
       events => this.handleAgentEvents(events),
       () => this.handlePromotion(),
     );
-    if (this.role === "follow") {
-      this.fitFollower();
-    } else {
-      this.fitTerminal();
-    }
-    if (this.manager.activeTab === this) {
-      requestAnimationFrame(() => {
-        if (this.manager.activeTab !== this || this.closed) return;
-        this.fitTerminal({ preserveScroll: true });
-        this.term.refresh(0, this.term.rows - 1);
-      });
-    }
+    setTimeout(() => {
+      if (this.closed) return;
+      this.scanTerminalText(result.archive_text || "");
+      this.scanTerminalBytes(chunk);
+      if (this.role === "follow") {
+        this.fitFollower();
+      } else {
+        this.fitTerminal();
+      }
+      if (this.manager.activeTab === this) {
+        requestAnimationFrame(() => {
+          if (this.manager.activeTab !== this || this.closed) return;
+          this.fitTerminal({ preserveScroll: true });
+          this.term.refresh(0, this.term.rows - 1);
+        });
+      }
+    }, 0);
   }
 
   resetFileLinks() {
