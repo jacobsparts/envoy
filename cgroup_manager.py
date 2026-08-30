@@ -13,6 +13,7 @@ from pathlib import Path
 
 SESSION_SLICE = "envoy-sessions.slice"
 UNIT_PREFIX = "envoy-session-"
+STALE_SCOPE_GRACE_SECONDS = 60
 SESSION_MEMORY_HIGH = 8 * 1024 ** 3
 SESSION_MEMORY_MAX = 12 * 1024 ** 3
 SESSION_SWAP_MAX = 1 * 1024 ** 3
@@ -30,10 +31,11 @@ class SystemdScopeManager:
         self.refresh_seconds = refresh_seconds
         self._lock = threading.Lock()
         self._cache: dict[str, dict[str, object]] = {}
+        self._ever_registered: set[str] = set()
+        self._registered_at: dict[str, float] = {}
         self._aggregate: dict[str, object] = self._unavailable()
         self._stop = threading.Event()
         self._validate_slice()
-        self.reconcile_stale(set())
         self._thread = threading.Thread(target=self._refresh_loop, daemon=True, name="cgroup-statistics")
         self._thread.start()
 
@@ -79,7 +81,6 @@ class SystemdScopeManager:
             "--property", f"MemorySwapMax={SESSION_SWAP_MAX}",
             "--property", "KillMode=control-group",
             "--property", "CollectMode=inactive-or-failed",
-            "--property", "PartOf=envoy.service",
             "--",
             *command,
         ]
@@ -107,9 +108,16 @@ class SystemdScopeManager:
         return units
 
     def reconcile_stale(self, live_sids: set[str]) -> None:
-        live_units = {self.unit_name(sid) for sid in live_sids}
-        for unit in self.active_units() - live_units:
-            self._run(["sudo", "-n", "systemctl", "stop", unit], check=False)
+        now = time.monotonic()
+        with self._lock:
+            stale_sids = {
+                sid for sid in self._ever_registered - live_sids
+                if now - self._registered_at.get(sid, now) >= STALE_SCOPE_GRACE_SECONDS
+            }
+        for sid in stale_sids:
+            unit = self.unit_name(sid)
+            if unit in self.active_units():
+                self._run(["sudo", "-n", "systemctl", "stop", unit], check=False)
 
     def signal_scope(self, sid: str, sig: signal.Signals) -> None:
         self._run([
@@ -212,12 +220,60 @@ class SystemdScopeManager:
         except (OSError, ValueError, RuntimeError):
             return self._unavailable()
 
+    @staticmethod
+    def _sum_optional(values: list[object]) -> int | None:
+        total = 0
+        saw_value = False
+        for value in values:
+            if isinstance(value, int):
+                total += value
+                saw_value = True
+        return total if saw_value else None
+
+    def _aggregate_from_sessions(self, slice_stats: dict[str, object], session_stats: dict[str, dict[str, object]]) -> dict[str, object]:
+        """Build aggregate usage from live sessions.
+
+        Slice memory.current can retain orphaned charges (for example tmpfs/shmem
+        pages left behind after a scope exits). The UI's "All sessions" figure
+        should reflect live session scopes, while keeping slice-level limits and
+        pressure/events for threshold editing and health.
+        """
+        live = [stats for stats in session_stats.values() if stats.get("available")]
+        aggregate = dict(slice_stats)
+        if not slice_stats.get("available") and not live:
+            return aggregate
+
+        aggregate["available"] = True
+        aggregate["updated_at"] = time.time()
+        aggregate["current"] = self._sum_optional([stats.get("current") for stats in live]) or 0
+        aggregate["swap_current"] = self._sum_optional([stats.get("swap_current") for stats in live]) or 0
+        aggregate["processes"] = self._sum_optional([stats.get("processes") for stats in live]) or 0
+        aggregate["tasks"] = self._sum_optional([stats.get("tasks") for stats in live])
+
+        peaks = [stats.get("peak") for stats in live if isinstance(stats.get("peak"), int)]
+        if peaks:
+            aggregate["peak"] = max(peaks)
+        elif not isinstance(aggregate.get("peak"), int):
+            aggregate["peak"] = None
+
+        # Preserve slice high/max/swap_max/pressure/events from slice_stats.
+        if not slice_stats.get("available"):
+            # If the slice itself is unreadable, still report summed usage with
+            # unknown limits rather than marking everything unavailable.
+            aggregate.setdefault("high", None)
+            aggregate.setdefault("max", None)
+            aggregate.setdefault("swap_max", None)
+            aggregate.setdefault("pressure", {})
+            aggregate.setdefault("events", {})
+        return aggregate
+
     def refresh(self, live_sids: set[str]) -> None:
         cache = {
             sid: self._statistics(self.unit_name(sid), framework_processes=1)
             for sid in live_sids
         }
-        aggregate = self._statistics(SESSION_SLICE, framework_processes=len(live_sids))
+        slice_stats = self._statistics(SESSION_SLICE, framework_processes=len(live_sids))
+        aggregate = self._aggregate_from_sessions(slice_stats, cache)
         with self._lock:
             self._cache = cache
             self._aggregate = aggregate
@@ -232,6 +288,8 @@ class SystemdScopeManager:
     def register(self, sid: str) -> None:
         with self._lock:
             self._cache[sid] = self._unavailable()
+            self._ever_registered.add(sid)
+            self._registered_at[sid] = time.monotonic()
         self.refresh(set(self.session_ids()))
 
     def unregister(self, sid: str) -> None:
@@ -277,11 +335,20 @@ class SystemdScopeManager:
         args = ["sudo", "-n", "systemctl", "set-property", "--runtime", unit]
         args.extend(f"{key}={value}" for key, value in values.items())
         self._run(args)
-        stats = self._statistics(unit, framework_processes=framework_processes)
         if target == "aggregate":
             with self._lock:
+                live_sids = set(self._cache)
+            cache = {
+                live_sid: self._statistics(self.unit_name(live_sid), framework_processes=1)
+                for live_sid in live_sids
+            }
+            slice_stats = self._statistics(SESSION_SLICE, framework_processes=len(live_sids))
+            stats = self._aggregate_from_sessions(slice_stats, cache)
+            with self._lock:
+                self._cache = cache
                 self._aggregate = stats
         else:
+            stats = self._statistics(unit, framework_processes=framework_processes)
             with self._lock:
                 self._cache[sid] = stats
         return {"ok": True, "target": target, "session_id": sid or None, "memory": stats}

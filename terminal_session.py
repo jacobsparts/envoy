@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+def reset_context_lookback(session, rows: int) -> None:
+    lines = session.get_terminal_lines()
+    session._pyte_known_lines = lines[:max(0, len(lines) - rows)]
+
+
 def get_terminal_context(session) -> str:
     """Return new terminal content since last call, rendered via pyte.
 

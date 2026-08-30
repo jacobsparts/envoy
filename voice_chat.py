@@ -18,6 +18,7 @@ import threading
 import requests
 from agent import Agent
 from env_config import load_app_env
+from terminal_session import reset_context_lookback
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 log = logging.getLogger("voice_chat")
@@ -131,7 +132,7 @@ def format_terminal_attachment(terminal_context: str) -> str:
 
 
 class VoiceChatAgent(Agent):
-    model = "gemini-3-flash-preview"
+    model = "gemini-3.6-flash"
     system = VOICE_SYSTEM_PROMPT
 
     def _check_cancelled(self):
@@ -199,12 +200,11 @@ def _prepare_agent(session, agent_settings):
     """Return (agent, is_new) based on persistence setting."""
     persistence = agent_settings.get("agent_persistence", "persistent")
     lookback = int(agent_settings.get("agent_lookback", 100))
-    is_new = False
-    if persistence == "per_invocation" or not hasattr(session, "voice_agent"):
-        session.voice_agent = VoiceChatAgent()
-        is_new = True
+    is_new = persistence == "per_invocation" or not hasattr(session, "voice_agent")
     if is_new:
-        session.reset_context_lookback(lookback)
+        agent = VoiceChatAgent()
+        reset_context_lookback(session, lookback)
+        session.voice_agent = agent
     return session.voice_agent, is_new
 
 

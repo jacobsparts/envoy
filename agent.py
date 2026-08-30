@@ -23,7 +23,7 @@ class AgentMaxTurnsError(RuntimeError):
 
 
 class Agent:
-    model = "gemini-2.5-flash"
+    model = "gemini-3.6-flash"
     system = ""
 
     def __init__(self) -> None:
@@ -78,14 +78,13 @@ class Agent:
                 response_parts: list[dict[str, Any]] = []
                 for call in function_calls:
                     result = self._dispatch_tool(call)
-                    response_parts.append(
-                        {
-                            "functionResponse": {
-                                "name": call["name"],
-                                "response": {"result": result},
-                            }
-                        }
-                    )
+                    function_response = {
+                        "name": call["name"],
+                        "response": {"result": result},
+                    }
+                    if "id" in call:
+                        function_response["id"] = call["id"]
+                    response_parts.append({"functionResponse": function_response})
                 self._contents.append({"role": "user", "parts": response_parts})
                 continue
 

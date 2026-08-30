@@ -3688,8 +3688,12 @@ function init(baseTransport, config) {
     return Math.round(Number(match[1]) * units[(match[2] || "b").toLowerCase()]);
   }
 
-  async function listManagedSessions() {
-    const response = await fetch((baseTransport.basePath || "/envoy") + "/api/sessions");
+  async function listManagedSessions(targetPath = baseTransport.targetPath) {
+    let url = (baseTransport.basePath || "/envoy") + "/api/sessions";
+    if (targetPath) {
+      url += "?path=" + encodeURIComponent(targetPath);
+    }
+    const response = await fetch(url);
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Unable to load sessions");
     return result;
@@ -4972,7 +4976,7 @@ function init(baseTransport, config) {
 
   window.addEventListener("hashchange", () => {
     const sid = window.location.hash.slice(1);
-    if (!sid) return;
+    if (!sid || sid === "first") return;
     const tab = manager.activeTab;
     if (tab && tab.transport.sessionId === sid) return;
     openSessionPicker();
@@ -5004,7 +5008,8 @@ function init(baseTransport, config) {
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-      manager.pauseActiveReads();
+      // 8/21/26 we can't just pause and resume or we discard transcript
+      // manager.pauseActiveReads();
     } else {
       recoverConnections();
     }
@@ -5066,12 +5071,27 @@ function init(baseTransport, config) {
       manager.saveTabState();
     }
     if (!manager.tabs.length) {
-      if (hashSid && claimed.has(hashSid)) {
+      if (hashSid === "first") {
+        try {
+          const payload = await listManagedSessions();
+          const sessions = payload.sessions || [];
+          if (sessions.length > 0) {
+            const first = sessions[0];
+            const isAttached = first.attached || claimed.has(first.sid);
+            const mode = isAttached ? "follow" : "takeover";
+            await createTabFromHashSid(first.sid, mode);
+          } else {
+            await manager.createTab({ activate: true });
+          }
+        } catch {
+          await manager.createTab({ activate: true });
+        }
+      } else if (hashSid && claimed.has(hashSid)) {
         await createTabFromHashSid(hashSid, "follow");
       } else if (hashSid) {
         // Check if session is already attached before auto-connecting
         try {
-          const payload = await listManagedSessions();
+          const payload = await listManagedSessions("all");
           const sessions = payload.sessions || [];
           const target = sessions.find(s => s.sid === hashSid);
           if (target && target.attached) {

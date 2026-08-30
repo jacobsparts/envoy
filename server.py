@@ -116,7 +116,13 @@ def make_handler():
                 return
 
             if parsed.path == f"{WEB_PREFIX}/api/sessions":
-                json_response(self, 200, service.list_sessions())
+                qs = parse_qs(parsed.query)
+                raw_path = qs.get("path", [None])[0]
+                if raw_path is not None and raw_path not in ("all", "*", ""):
+                    session_path = normalize_app_path(raw_path)
+                else:
+                    session_path = None
+                json_response(self, 200, service.list_sessions(path=session_path))
                 return
 
             if parsed.path == f"{WEB_PREFIX}/api/stream":
