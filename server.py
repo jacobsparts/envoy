@@ -8,11 +8,14 @@ import json
 import logging
 import os
 import signal
+import base64
 import threading
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, quote, urlparse
+from websockets.server import ServerProtocol
+from websockets.sync.server import ServerConnection
 
 from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, render_html
 
@@ -108,6 +111,55 @@ def make_handler():
                     self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if parsed.path in (f"{WEB_PREFIX}/ws/transcribe", f"{WEB_PREFIX}/api/transcribe_ws"):
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    req_line = f"{self.command} {self.path} {self.request_version}\r\n"
+                    headers_str = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
+                    raw_req = (req_line + headers_str + "\r\n").encode("latin1")
+                    proto = ServerProtocol()
+                    proto.receive_data(raw_req)
+                    conn = ServerConnection(self.request, proto)
+                    for event in proto.events_received():
+                        conn.process_event(event)
+                    conn.handshake()
+                    from voice_chat import stream_transcribe_inworld
+                    inworld_key = os.environ.get("INWORLD_API_KEY", "")
+                    if not inworld_key:
+                        conn.send(json.dumps({"error": "INWORLD_API_KEY is not set"}))
+                        conn.close()
+                        return
+                    stream_transcribe_inworld(conn, inworld_key)
+                    return
+                self.send_error(400, "WebSocket upgrade required")
+                return
+
+            if parsed.path in (f"{WEB_PREFIX}/ws/tts", f"{WEB_PREFIX}/api/tts_ws"):
+                if self.headers.get("Upgrade", "").lower() == "websocket":
+                    req_line = f"{self.command} {self.path} {self.request_version}\r\n"
+                    headers_str = "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())
+                    raw_req = (req_line + headers_str + "\r\n").encode("latin1")
+                    proto = ServerProtocol()
+                    proto.receive_data(raw_req)
+                    conn = ServerConnection(self.request, proto)
+                    for event in proto.events_received():
+                        conn.process_event(event)
+                    conn.handshake()
+                    try:
+                        msg = conn.recv(timeout=10)
+                        data = json.loads(msg) if isinstance(msg, str) else json.loads(msg.decode("utf-8"))
+                        text = data.get("text", "")
+                        voice = data.get("voice", "Ashley")
+                    except Exception as e:
+                        conn.send(json.dumps({"error": f"Invalid TTS request: {e}"}))
+                        conn.close()
+                        return
+
+                    from speech import stream_inworld_speech_ws
+                    stream_inworld_speech_ws(conn, text, voice=voice)
+                    return
+                self.send_error(400, "WebSocket upgrade required")
                 return
 
             if parsed.path == f"{WEB_PREFIX}/api/config":

@@ -172,6 +172,81 @@ def _synthesize_inworld_speech(text: str, voice: str = DEFAULT_INWORLD_VOICE) ->
     return _pcm_to_wav_base64(bytes(pcm_data), INWORLD_TTS_SAMPLE_RATE)
 
 
+def stream_inworld_speech_ws(client_conn, text: str, voice: str = DEFAULT_INWORLD_VOICE):
+    """Stream Inworld TTS PCM audio chunks to a WebSocket client connection."""
+    inworld_api_key = os.environ.get("INWORLD_API_KEY", "").strip()
+    if not inworld_api_key:
+        client_conn.send(json.dumps({"error": "INWORLD_API_KEY is not set"}))
+        client_conn.close()
+        return
+
+    clean_text = strip_markdown(text)
+    if not clean_text:
+        client_conn.send(json.dumps({"done": True}))
+        client_conn.close()
+        return
+
+    # Inworld accepts up to 4000 characters per stream request.
+    # Chunk by up to 3000 chars on sentence boundaries for large selections.
+    chunks = chunk_text(clean_text, limit=3000)
+
+    try:
+        for chunk in chunks:
+            resp = requests.post(
+                INWORLD_TTS_URL,
+                headers={
+                    "Authorization": f"Basic {inworld_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "text": chunk,
+                    "voice_id": voice,
+                    "model_id": "inworld-tts-1.5-mini",
+                    "audio_config": {
+                        "audio_encoding": "LINEAR16",
+                        "sample_rate_hertz": INWORLD_TTS_SAMPLE_RATE,
+                        "speaking_rate": 1.2,
+                    },
+                },
+                stream=True,
+            )
+            if not resp.ok:
+                try:
+                    err_msg = resp.json().get("error", {}).get("message", resp.text)
+                except Exception:
+                    err_msg = resp.text
+                client_conn.send(json.dumps({"error": f"Inworld TTS error: {err_msg}"}))
+                break
+
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.strip():
+                    continue
+                try:
+                    res = json.loads(line).get("result", {})
+                    audio_b64 = res.get("audioContent")
+                    if audio_b64:
+                        raw = base64.b64decode(audio_b64)
+                        if len(raw) > 44 and raw[:4] == b"RIFF":
+                            pcm = raw[44:]
+                        else:
+                            pcm = raw
+                        if pcm:
+                            client_conn.send(pcm)
+                except Exception:
+                    continue
+
+        client_conn.send(json.dumps({"done": True}))
+    except Exception as exc:
+        try:
+            client_conn.send(json.dumps({"error": str(exc)}))
+        except Exception:
+            pass
+    finally:
+        try:
+            client_conn.close()
+        except Exception:
+            pass
+
 def synthesize_speech(text: str, voice: str = DEFAULT_TTS_VOICE) -> str | None:
     text = strip_markdown(text)
     if not text:

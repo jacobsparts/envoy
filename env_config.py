@@ -63,11 +63,11 @@ CONFIG_KEYS = {
     },
     "GROQ_API_KEY": {
         "label": "Groq API Key",
-        "required_for": ["dictation"],
+        "required_for": [],
     },
     "INWORLD_API_KEY": {
         "label": "Inworld API Key",
-        "required_for": ["speech"],
+        "required_for": ["speech", "dictation"],
     },
     "UPLOAD_LINK_URL": {
         "label": "Upload Link URL",

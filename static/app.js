@@ -492,6 +492,16 @@ class BrowserTransport {
     return data;
   }
 
+  getTranscribeWsUrl() {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${this.basePath}/ws/transcribe`;
+  }
+
+  getTtsWsUrl() {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${this.basePath}/ws/tts`;
+  }
+
   async cancelAgent() {
     if (!this.sessionId) return;
     await this.requestJson("/api/voice/cancel", {
@@ -1159,9 +1169,11 @@ class TerminalTab {
     }
     if (this.lastSentSize && this.lastSentSize.cols === cols && this.lastSentSize.rows === rows) return;
     this.lastSentSize = { cols, rows };
-    this.transport.resize(cols, rows).catch(err => {
+    this.transport.resize(cols, rows).catch((err) => {
+      // A failed resize is non-fatal: the PTY keeps its old size and the
+      // next fit/resize retries. Don't mark the tab disconnected here.
       this.lastSentSize = null;
-      this.handleWriteError(err);
+      console.warn("envoy resize failed; will retry", err);
     });
   }
 
@@ -1569,10 +1581,134 @@ class TabManager {
     if (!clean) throw new Error("Select text to read");
     const tab = this.activeTab;
     if (!tab) throw new Error("No active terminal");
+
+    if (tab.transport.getTtsWsUrl && window.WebSocket && (window.AudioContext || window.webkitAudioContext)) {
+      this.streamSpeakText(clean, tab);
+      return;
+    }
+
     const result = await tab.transport.synthesizeText(clean.slice(0, 12000));
     if (!result.audio) throw new Error("Speech synthesis returned no audio");
     this.ttsQueue.push({ tab: null, audio: result.audio });
     this.playNextSpeech();
+  }
+
+  streamSpeakText(text, tab) {
+    if (this.ttsAudio) {
+      try { this.ttsAudio.pause(); } catch (e) {}
+      this.ttsAudioFinish?.();
+    }
+    if (this.ttsStreamCleanup) {
+      try { this.ttsStreamCleanup(); } catch (e) {}
+      this.ttsStreamCleanup = null;
+    }
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioCtx({ sampleRate: 48000 });
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+    const sampleRate = 48000;
+    let nextPlayTime = 0;
+    let stopped = false;
+    let ws = null;
+
+    const cleanup = () => {
+      if (stopped) return;
+      stopped = true;
+      if (this.ttsStreamCleanup === cleanup) {
+        this.ttsStreamCleanup = null;
+        this.ttsPlaying = false;
+        this.onTtsStateChange?.(false);
+      }
+      if (ws) {
+        try { ws.close(); } catch (e) {}
+        ws = null;
+      }
+      if (audioCtx && audioCtx.state !== "closed") {
+        try { audioCtx.close(); } catch (e) {}
+      }
+    };
+
+    this.ttsStreamCleanup = cleanup;
+    this.ttsPlaying = true;
+    this.onTtsStateChange?.(true);
+
+    try {
+      const wsUrl = tab.transport.getTtsWsUrl();
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ text: text.slice(0, 12000), voice: "Ashley" }));
+      };
+
+      ws.onmessage = evt => {
+        if (stopped) return;
+        if (typeof evt.data === "string") {
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.error) {
+              showToast("TTS: " + msg.error, true);
+              cleanup();
+            } else if (msg.done) {
+              const remaining = Math.max(0, (nextPlayTime - audioCtx.currentTime) * 1000);
+              setTimeout(() => {
+                if (!stopped) cleanup();
+              }, remaining + 200);
+            }
+          } catch (e) {}
+          return;
+        }
+
+        // Binary PCM chunk received (16-bit LINEAR16 @ 48kHz)
+        const arrayBuf = evt.data;
+        if (!arrayBuf || arrayBuf.byteLength < 2) return;
+        const pcm16 = new Int16Array(arrayBuf);
+        const float32 = new Float32Array(pcm16.length);
+        for (let i = 0; i < pcm16.length; i++) {
+          const val = pcm16[i];
+          float32[i] = val < 0 ? val / 32768.0 : val / 32767.0;
+        }
+
+        const audioBuf = audioCtx.createBuffer(1, float32.length, sampleRate);
+        audioBuf.copyToChannel(float32, 0);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = audioBuf;
+        source.connect(audioCtx.destination);
+
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume().catch(() => {});
+        }
+        const now = audioCtx.currentTime;
+        if (nextPlayTime < now) {
+          // Give audio hardware 150ms buffer lead time on start to avoid clipping first word
+          nextPlayTime = now + 0.15;
+        }
+        source.start(nextPlayTime);
+        nextPlayTime += audioBuf.duration;
+      };
+
+      ws.onerror = () => {
+        if (!stopped) {
+          showToast("TTS WebSocket error", true);
+          cleanup();
+        }
+      };
+
+      ws.onclose = () => {
+        if (!stopped) {
+          const remaining = Math.max(0, (nextPlayTime - audioCtx.currentTime) * 1000);
+          setTimeout(() => {
+            if (!stopped) cleanup();
+          }, remaining + 100);
+        }
+      };
+    } catch (err) {
+      showToast("TTS: " + (err.message || err), true);
+      cleanup();
+    }
   }
 
   async playNextSpeech() {
@@ -1584,6 +1720,7 @@ class TabManager {
     }
     this.ttsPlaying = true;
     this.ttsCurrentItem = item;
+    this.onTtsStateChange?.(true);
     try {
       const audioData = item.audio || (await item.tab.transport.synthesizeText(item.text)).audio;
       if (item.tab && !item.tab.ttsContinuous) return;
@@ -1613,8 +1750,26 @@ class TabManager {
       this.ttsAudioFinish = null;
       this.ttsCurrentItem = null;
       this.ttsPlaying = false;
+      this.onTtsStateChange?.(false);
       this.playNextSpeech();
     }
+  }
+
+  stopSpeech() {
+    this.ttsQueue = [];
+    if (this.ttsAudio) {
+      try { this.ttsAudio.pause(); } catch (e) {}
+      this.ttsAudioFinish?.();
+      this.ttsAudio = null;
+      this.ttsAudioFinish = null;
+    }
+    if (this.ttsStreamCleanup) {
+      try { this.ttsStreamCleanup(); } catch (e) {}
+      this.ttsStreamCleanup = null;
+    }
+    this.ttsPlaying = false;
+    this.ttsCurrentItem = null;
+    this.onTtsStateChange?.(false);
   }
 
   stopSpeechForTab(tab) {
@@ -1626,6 +1781,13 @@ class TabManager {
     if (this.ttsAudio && this.ttsCurrentItem?.tab === tab) {
       this.ttsAudio.pause();
       this.ttsAudioFinish?.();
+    }
+    if (this.ttsStreamCleanup) {
+      try { this.ttsStreamCleanup(); } catch (e) {}
+      this.ttsStreamCleanup = null;
+    }
+    if (!this.ttsQueue.length && !this.ttsAudio && !this.ttsStreamCleanup) {
+      this.onTtsStateChange?.(false);
     }
   }
 
@@ -3390,6 +3552,7 @@ function init(baseTransport, config) {
   let voiceShouldRestoreTerminalFocus = false;
   let voiceAudio = null;
   let voiceAudioObjectUrl = "";
+  let voiceDictSession = null;
 
   function cancelVoiceAgent() {
     currentTab()?.transport.cancelAgent().catch(() => {});
@@ -3400,7 +3563,12 @@ function init(baseTransport, config) {
     spMic.classList.toggle("cancelling", voiceCancelPending && voiceMode === "agent");
     spCancel.classList.toggle("audio-playing", audioPlaying);
     spCancel.disabled = voiceCancelPending || (!voiceRecorder && !voiceAbort && !audioPlaying);
+    spTts.classList.toggle("playing", !!manager.ttsPlaying);
   }
+
+  manager.onTtsStateChange = () => {
+    updateVoiceControls();
+  };
 
   function stopVoiceAudio() {
     if (voiceAudio) {
@@ -3416,6 +3584,11 @@ function init(baseTransport, config) {
   }
 
   function voiceReset() {
+    if (voiceDictSession) {
+      const s = voiceDictSession;
+      voiceDictSession = null;
+      s.stop();
+    }
     if (voiceStream) {
       voiceStream.getTracks().forEach(track => track.stop());
       voiceStream = null;
@@ -3453,7 +3626,196 @@ function init(baseTransport, config) {
     return true;
   }
 
+  function startStreamingDictation({ transport, onText, onError, onStop }) {
+    let audioContext = null;
+    let sourceNode = null;
+    let processorNode = null;
+    let mediaStream = null;
+    let ws = null;
+    let stopped = false;
+
+    let stopping = false;
+
+    function stopAudioCapture() {
+      if (processorNode) {
+        try { processorNode.disconnect(); } catch (e) {}
+        processorNode = null;
+      }
+      if (sourceNode) {
+        try { sourceNode.disconnect(); } catch (e) {}
+        sourceNode = null;
+      }
+      if (audioContext && audioContext.state !== "closed") {
+        try { audioContext.close(); } catch (e) {}
+        audioContext = null;
+      }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(t => t.stop());
+        mediaStream = null;
+      }
+    }
+
+    function cleanup() {
+      if (stopped) return;
+      stopped = true;
+      stopAudioCapture();
+      if (ws) {
+        try {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ action: "close" }));
+          }
+          ws.close();
+        } catch (e) {}
+        ws = null;
+      }
+      if (onStop) onStop();
+    }
+
+    function finish() {
+      if (stopped || stopping) return;
+      stopping = true;
+      stopAudioCapture();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        // Send "stop" action to ask server to flush remaining transcription before closing
+        try {
+          ws.send(JSON.stringify({ action: "stop" }));
+        } catch (e) {
+          cleanup();
+        }
+      } else {
+        cleanup();
+      }
+    }
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+      if (stopped) {
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+      mediaStream = stream;
+      const wsUrl = transport.getTranscribeWsUrl ? transport.getTranscribeWsUrl() : (
+        (window.location.protocol === "https:" ? "wss:" : "ws:") + "//" + window.location.host + "/envoy/ws/transcribe"
+      );
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = "arraybuffer";
+
+      ws.onmessage = evt => {
+        try {
+          const data = JSON.parse(evt.data);
+          if (data.error) {
+            if (onError) onError(new Error(data.error));
+            cleanup();
+            return;
+          }
+          if (data.text && onText) {
+            onText(data.text);
+          }
+          if (data.done) {
+            cleanup();
+          }
+        } catch (err) {
+          console.error("Transcribe ws parse error:", err);
+        }
+      };
+
+      ws.onerror = () => {
+        if (!stopped && onError) onError(new Error("Transcription WebSocket connection failed"));
+      };
+
+      ws.onclose = () => {
+        if (!stopped) cleanup();
+      };
+
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      audioContext = new AudioCtx();
+      sourceNode = audioContext.createMediaStreamSource(stream);
+      const inputSampleRate = audioContext.sampleRate;
+      const targetSampleRate = 16000;
+      const silenceThreshold = 0.01;
+
+      processorNode = audioContext.createScriptProcessor(4096, 1, 1);
+      processorNode.onaudioprocess = e => {
+        if (stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const inputData = e.inputBuffer.getChannelData(0);
+        let sumSquares = 0;
+        for (const sample of inputData) sumSquares += sample * sample;
+        if (Math.sqrt(sumSquares / inputData.length) < silenceThreshold) return;
+        const resampledLength = Math.round(inputData.length * targetSampleRate / inputSampleRate);
+        const pcm16 = new Int16Array(resampledLength);
+        for (let i = 0; i < resampledLength; i++) {
+          const srcIdx = Math.min(Math.floor(i * inputSampleRate / targetSampleRate), inputData.length - 1);
+          const s = Math.max(-1, Math.min(1, inputData[srcIdx]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        ws.send(pcm16.buffer);
+      };
+
+      sourceNode.connect(processorNode);
+      processorNode.connect(audioContext.destination);
+    }).catch(err => {
+      if (onError) onError(err);
+      cleanup();
+    });
+
+    return {
+      stop: () => finish(),
+      abort: () => cleanup()
+    };
+  }
+
+  function startDictation() {
+    const tab = currentTab();
+    if (!tab || voiceDictSession || voiceRecorder || voiceAudio) return;
+    voiceShouldRestoreTerminalFocus = keyboardVisible && terminalInputActive;
+    if (!navigator.mediaDevices || !window.WebSocket) {
+      showToast("Realtime dictation not supported");
+      return;
+    }
+    if (!sidePanel.classList.contains("active")) toggleSidePanel();
+    voiceCancelled = false;
+    voiceMode = "dict";
+    spDict.classList.add("recording");
+    updateVoiceControls();
+
+    let lastFragmentEndedWithSpace = true;
+
+    voiceDictSession = startStreamingDictation({
+      transport: tab.transport,
+      onText: fragment => {
+        if (!fragment) return;
+        let textToWrite = fragment;
+        if (!lastFragmentEndedWithSpace && !textToWrite.startsWith(" ")) {
+          textToWrite = " " + textToWrite;
+        }
+        lastFragmentEndedWithSpace = textToWrite.endsWith(" ");
+        tab.transport.write(textToWrite).then(() => {
+          if (manager.activeTab === tab && tab.shouldKeepPinnedToBottom()) {
+            tab.term.scrollToBottom();
+            requestAnimationFrame(() => {
+              if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
+            });
+            setTimeout(() => {
+              if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
+            }, 50);
+          }
+        }).catch(() => tab.markDisconnected());
+      },
+      onError: err => {
+        showToast("Dictation: " + (err.message || err));
+        voiceReset();
+      },
+      onStop: () => {
+        voiceDictSession = null;
+        voiceReset();
+      }
+    });
+  }
+
   function startVoiceRecording(mode) {
+    if (mode === "dict") {
+      startDictation();
+      return;
+    }
     const tab = currentTab();
     if (!tab || voiceRecorder || voiceAudio) return;
     voiceShouldRestoreTerminalFocus = keyboardVisible && terminalInputActive;
@@ -3464,7 +3826,7 @@ function init(baseTransport, config) {
     if (!sidePanel.classList.contains("active")) toggleSidePanel();
     voiceCancelled = false;
     voiceMode = mode;
-    const button = mode === "dict" ? spDict : spMic;
+    const button = spMic;
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
       voiceStream = stream;
       const chunks = [];
@@ -3482,37 +3844,16 @@ function init(baseTransport, config) {
         }
         button.classList.remove("recording");
         button.classList.add("processing");
-        if (mode === "agent") showToast("Thinking...", true);
+        showToast("Thinking...", true);
         const mime = recorder.mimeType.split(";")[0];
         const controller = new AbortController();
         voiceAbort = controller;
         const blob = new Blob(chunks, { type: mime });
-        const request = mode === "dict"
-          ? tab.transport.transcribeAudio(blob, mime)
-          : tab.transport.sendVoiceMessage(blob, mime, getAgentSettings());
+        const request = tab.transport.sendVoiceMessage(blob, mime, getAgentSettings());
         request.then(data => {
           if (data.error) {
             voiceReset();
             showToast(data.error, false, !!data.turn_limit_reached);
-            return;
-          }
-          if (mode === "dict") {
-            const finishDictation = () => voiceReset();
-            if (data.text) {
-              tab.transport.write(data.text).then(() => {
-                if (manager.activeTab === tab && tab.shouldKeepPinnedToBottom()) {
-                  tab.term.scrollToBottom();
-                  requestAnimationFrame(() => {
-                    if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
-                  });
-                  setTimeout(() => {
-                    if (tab.shouldKeepPinnedToBottom()) tab.term.scrollToBottom();
-                  }, 50);
-                }
-              }).catch(() => tab.markDisconnected()).finally(finishDictation);
-            } else {
-              finishDictation();
-            }
             return;
           }
           tab.addAgentLog(data.response, data.commands);
@@ -3560,14 +3901,22 @@ function init(baseTransport, config) {
   });
 
   function toggleDictation() {
+    if (voiceDictSession) {
+      const s = voiceDictSession;
+      voiceDictSession = null;
+      spDict.classList.remove("recording");
+      spDict.classList.add("processing");
+      s.stop();
+      return;
+    }
     if (voiceAbort && voiceMode === "dict") {
       voiceAbort.abort();
       voiceReset();
       showToast("Cancelled");
     } else if (voiceRecorder && voiceRecorder.state === "recording" && voiceMode === "dict") {
       voiceRecorder.stop();
-    } else if (!voiceRecorder && !voiceAbort) {
-      startVoiceRecording("dict");
+    } else if (!voiceRecorder && !voiceAbort && !voiceDictSession) {
+      startDictation();
     }
   }
 
@@ -3576,6 +3925,14 @@ function init(baseTransport, config) {
   });
 
   function requestVoiceCancel() {
+    if (voiceDictSession) {
+      const s = voiceDictSession;
+      voiceDictSession = null;
+      s.abort();
+      voiceReset();
+      showToast("Cancelled");
+      return true;
+    }
     if (voiceAudio) {
       voiceReset();
       dismissToast();
@@ -3942,8 +4299,7 @@ function init(baseTransport, config) {
   const textInputClose = document.getElementById("text-input-close");
   const textInputDict = document.getElementById("text-input-dict");
   let textAbort = null;
-  let textDictRecorder = null;
-  let textDictStream = null;
+  let textDictSession = null;
 
   function openTextInput() {
     textInputModal.classList.add("active");
@@ -4024,11 +4380,11 @@ function init(baseTransport, config) {
   textInputModal.addEventListener("click", e => { if (e.target === textInputModal) closeTextInput(); });
 
   function stopTextDict() {
-    if (textDictStream) {
-      textDictStream.getTracks().forEach(t => t.stop());
-      textDictStream = null;
+    if (textDictSession) {
+      const s = textDictSession;
+      textDictSession = null;
+      s.stop();
     }
-    textDictRecorder = null;
     textInputDict.classList.remove("recording", "processing");
     textInputDict.textContent = "Dictate";
     updateViewportState();
@@ -4038,51 +4394,39 @@ function init(baseTransport, config) {
   textInputDict.addEventListener("click", () => {
     const tab = currentTab();
     if (!tab) return;
-    if (textDictRecorder && textDictRecorder.state === "recording") {
-      textDictRecorder.stop();
+    if (textDictSession) {
+      stopTextDict();
+      textInputArea.focus();
       return;
     }
-    if (textDictRecorder) return;
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-      textDictStream = stream;
-      const chunks = [];
-      const mimeOpts = ["audio/ogg;codecs=opus", "audio/ogg", "audio/webm;codecs=opus", "audio/webm", "audio/wav"];
-      const mimeOpt = mimeOpts.find(m => MediaRecorder.isTypeSupported(m));
-      const recorder = mimeOpt ? new MediaRecorder(stream, { mimeType: mimeOpt }) : new MediaRecorder(stream);
-      textDictRecorder = recorder;
-      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-      recorder.onstop = () => {
-        stream.getTracks().forEach(t => t.stop());
-        textInputDict.classList.remove("recording");
-        textInputDict.classList.add("processing");
-        textInputDict.textContent = "Transcribing...";
-        const mime = recorder.mimeType.split(";")[0];
-        const blob = new Blob(chunks, { type: mime });
-        tab.transport.transcribeAudio(blob, mime).then(data => {
-          stopTextDict();
-          if (data.text) {
-            const start = textInputArea.selectionStart;
-            const end = textInputArea.selectionEnd;
-            const before = textInputArea.value.substring(0, start);
-            const after = textInputArea.value.substring(end);
-            const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
-            textInputArea.value = before + prefix + data.text + after;
-            const cursor = start + prefix.length + data.text.length;
-            textInputArea.selectionStart = textInputArea.selectionEnd = cursor;
-          }
-          textInputArea.focus();
-        }).catch(err => {
-          stopTextDict();
-          showToast("Dictation: " + (err.message || err));
-          textInputArea.focus();
-        });
-      };
-      recorder.start();
-      textInputDict.classList.add("recording");
-      textInputDict.textContent = "Stop";
-    }).catch(err => {
-      stopTextDict();
-      showToast("Mic: " + err.message);
+    textInputDict.classList.add("recording");
+    textInputDict.textContent = "Stop";
+
+    textDictSession = startStreamingDictation({
+      transport: tab.transport,
+      onText: fragment => {
+        if (!fragment) return;
+        const start = textInputArea.selectionStart;
+        const end = textInputArea.selectionEnd;
+        const before = textInputArea.value.substring(0, start);
+        const after = textInputArea.value.substring(end);
+        const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+        textInputArea.value = before + prefix + fragment + after;
+        const cursor = start + prefix.length + fragment.length;
+        textInputArea.selectionStart = textInputArea.selectionEnd = cursor;
+      },
+      onError: err => {
+        stopTextDict();
+        showToast("Dictation: " + (err.message || err));
+        textInputArea.focus();
+      },
+      onStop: () => {
+        textDictSession = null;
+        textInputDict.classList.remove("recording", "processing");
+        textInputDict.textContent = "Dictate";
+        updateViewportState();
+        updateMobileInputBar();
+      }
     });
   });
 
@@ -4200,15 +4544,14 @@ function init(baseTransport, config) {
   pasteEditorArea.addEventListener("keypress", e => e.stopPropagation(), { capture: true });
 
   const pasteEditorDict = document.getElementById("paste-editor-dict");
-  let pasteDictRecorder = null;
-  let pasteDictStream = null;
+  let pasteDictSession = null;
 
   function stopPasteDict() {
-    if (pasteDictStream) {
-      pasteDictStream.getTracks().forEach(t => t.stop());
-      pasteDictStream = null;
+    if (pasteDictSession) {
+      const s = pasteDictSession;
+      pasteDictSession = null;
+      s.stop();
     }
-    pasteDictRecorder = null;
     pasteEditorDict.classList.remove("recording", "processing");
     pasteEditorDict.textContent = "Dictate";
     updateViewportState();
@@ -4218,51 +4561,39 @@ function init(baseTransport, config) {
   pasteEditorDict.addEventListener("click", () => {
     const tab = currentTab();
     if (!tab) return;
-    if (pasteDictRecorder && pasteDictRecorder.state === "recording") {
-      pasteDictRecorder.stop();
+    if (pasteDictSession) {
+      stopPasteDict();
+      pasteEditorArea.focus();
       return;
     }
-    if (pasteDictRecorder) return;
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-      pasteDictStream = stream;
-      const chunks = [];
-      const mimeOpts = ["audio/ogg;codecs=opus", "audio/ogg", "audio/webm;codecs=opus", "audio/webm", "audio/wav"];
-      const mimeOpt = mimeOpts.find(m => MediaRecorder.isTypeSupported(m));
-      const recorder = mimeOpt ? new MediaRecorder(stream, { mimeType: mimeOpt }) : new MediaRecorder(stream);
-      pasteDictRecorder = recorder;
-      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
-      recorder.onstop = () => {
-        stream.getTracks().forEach(t => t.stop());
-        pasteEditorDict.classList.remove("recording");
-        pasteEditorDict.classList.add("processing");
-        pasteEditorDict.textContent = "Transcribing...";
-        const mime = recorder.mimeType.split(";")[0];
-        const blob = new Blob(chunks, { type: mime });
-        tab.transport.transcribeAudio(blob, mime).then(data => {
-          stopPasteDict();
-          if (data.text) {
-            const start = pasteEditorArea.selectionStart;
-            const end = pasteEditorArea.selectionEnd;
-            const before = pasteEditorArea.value.substring(0, start);
-            const after = pasteEditorArea.value.substring(end);
-            const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
-            pasteEditorArea.value = before + prefix + data.text + after;
-            const cursor = start + prefix.length + data.text.length;
-            pasteEditorArea.selectionStart = pasteEditorArea.selectionEnd = cursor;
-          }
-          pasteEditorArea.focus();
-        }).catch(err => {
-          stopPasteDict();
-          showToast("Dictation: " + (err.message || err));
-          pasteEditorArea.focus();
-        });
-      };
-      recorder.start();
-      pasteEditorDict.classList.add("recording");
-      pasteEditorDict.textContent = "Stop";
-    }).catch(err => {
-      stopPasteDict();
-      showToast("Mic: " + err.message);
+    pasteEditorDict.classList.add("recording");
+    pasteEditorDict.textContent = "Stop";
+
+    pasteDictSession = startStreamingDictation({
+      transport: tab.transport,
+      onText: fragment => {
+        if (!fragment) return;
+        const start = pasteEditorArea.selectionStart;
+        const end = pasteEditorArea.selectionEnd;
+        const before = pasteEditorArea.value.substring(0, start);
+        const after = pasteEditorArea.value.substring(end);
+        const prefix = before.length && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
+        pasteEditorArea.value = before + prefix + fragment + after;
+        const cursor = start + prefix.length + fragment.length;
+        pasteEditorArea.selectionStart = pasteEditorArea.selectionEnd = cursor;
+      },
+      onError: err => {
+        stopPasteDict();
+        showToast("Dictation: " + (err.message || err));
+        pasteEditorArea.focus();
+      },
+      onStop: () => {
+        pasteDictSession = null;
+        pasteEditorDict.classList.remove("recording", "processing");
+        pasteEditorDict.textContent = "Dictate";
+        updateViewportState();
+        updateMobileInputBar();
+      }
     });
   });
 
@@ -4278,7 +4609,7 @@ function init(baseTransport, config) {
   function renderSettingsStatus(settings) {
     const missing = [];
     if (!settings.GOOGLE_API_KEY?.present) missing.push("Google");
-    if (!settings.GROQ_API_KEY?.present) missing.push("Groq");
+    if (!settings.INWORLD_API_KEY?.present && !settings.GROQ_API_KEY?.present) missing.push("Inworld");
     if (!missing.length) {
       settingsStatus.textContent = "All configured.";
       settingsStatus.className = "success";
@@ -4560,6 +4891,12 @@ function init(baseTransport, config) {
   spTts.addEventListener("click", () => {
     if (ttsLongPressFired) {
       ttsLongPressFired = false;
+      return;
+    }
+    if (manager.ttsPlaying) {
+      manager.stopSpeech();
+      updateVoiceControls();
+      showToast("TTS stopped");
       return;
     }
     const text = savedTtsSelection || (selectOverlay.classList.contains("active")

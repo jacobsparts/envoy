@@ -23,7 +23,7 @@ class AgentMaxTurnsError(RuntimeError):
 
 
 class Agent:
-    model = "gemini-3.6-flash"
+    model = "gemini-3.7-flash"
     system = ""
 
     def __init__(self) -> None:

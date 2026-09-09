@@ -123,8 +123,8 @@ def require_voice_agent_env():
 
 
 def require_stt_env():
-    if not os.environ.get("GROQ_API_KEY"):
-        raise RuntimeError("GROQ_API_KEY is required for dictation")
+    if not os.environ.get("INWORLD_API_KEY") and not os.environ.get("GROQ_API_KEY"):
+        raise RuntimeError("INWORLD_API_KEY (or GROQ_API_KEY) is required for dictation")
 
 
 def format_terminal_attachment(terminal_context: str) -> str:
@@ -132,7 +132,7 @@ def format_terminal_attachment(terminal_context: str) -> str:
 
 
 class VoiceChatAgent(Agent):
-    model = "gemini-3.6-flash"
+    model = "gemini-3.7-flash"
     system = VOICE_SYSTEM_PROMPT
 
     def _check_cancelled(self):
@@ -181,8 +181,11 @@ class VoiceChatAgent(Agent):
 
 
 def transcribe_audio(audio_data, mime_type):
-    """Transcribe audio bytes to text via Groq Whisper."""
+    """Transcribe audio bytes to text via Inworld STT (falling back to Groq if key is present)."""
     require_stt_env()
+    inworld_key = os.environ.get("INWORLD_API_KEY")
+    if inworld_key:
+        return transcribe_audio_inworld(audio_data, mime_type)
     groq_api_key = os.environ["GROQ_API_KEY"]
     ext = {"audio/webm": "webm", "audio/mp4": "mp4",
            "audio/ogg": "ogg", "audio/wav": "wav"}.get(mime_type, "webm")
@@ -194,6 +197,168 @@ def transcribe_audio(audio_data, mime_type):
     )
     resp.raise_for_status()
     return resp.json()["text"]
+
+INWORLD_STT_URL = "wss://api.inworld.ai/stt/v1/transcribe:streamBidirectional"
+
+def transcribe_audio_inworld(audio_data, mime_type):
+    """Transcribe recorded audio file to text using Inworld STT streaming endpoint."""
+    import asyncio
+    import base64
+    import json
+    import websockets
+
+    # Convert audio_data to 16kHz 16-bit mono PCM via ffmpeg
+    with tempfile.NamedTemporaryFile(suffix=".audio", delete=False) as inp:
+        inp.write(audio_data)
+        inp_path = inp.name
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-i", inp_path, "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+            capture_output=True, check=True
+        )
+        pcm_data = proc.stdout
+    finally:
+        if os.path.exists(inp_path):
+            os.unlink(inp_path)
+
+    key = os.environ["INWORLD_API_KEY"]
+    auth = key if key.startswith("Basic ") else f"Basic {key}"
+
+    async def _stream():
+        final_transcripts = []
+        async with websockets.connect(INWORLD_STT_URL, additional_headers={"Authorization": auth}) as ws:
+            config = {
+                "transcribeConfig": {
+                    "modelId": "inworld/inworld-stt-1",
+                    "audioEncoding": "LINEAR16",
+                    "sampleRateHertz": 16000,
+                    "language": "en",
+                }
+            }
+            await ws.send(json.dumps(config))
+            chunk_size = 3200  # 100ms chunks
+            for i in range(0, len(pcm_data), chunk_size):
+                chunk = pcm_data[i:i + chunk_size]
+                b64 = base64.b64encode(chunk).decode("ascii")
+                await ws.send(json.dumps({"audioChunk": {"content": b64}}))
+                await asyncio.sleep(0.001)
+            await ws.send(json.dumps({"closeStream": {}}))
+
+            try:
+                while True:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        continue
+                    result = data.get("result", {})
+                    transcription = result.get("transcription", {})
+                    if transcription.get("isFinal"):
+                        text = transcription.get("transcript", "")
+                        if text:
+                            final_transcripts.append(text)
+            except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
+                pass
+        return " ".join(final_transcripts).strip()
+
+    return asyncio.run(_stream())
+
+def stream_transcribe_inworld(client_conn, key):
+    """Stream bidirectional audio/text transcription between client WebSocket and Inworld STT."""
+    import asyncio
+    import base64
+    import json
+    import websockets
+
+    auth = key if key.startswith("Basic ") else f"Basic {key}"
+
+    async def bridge():
+        async with websockets.connect(INWORLD_STT_URL, additional_headers={"Authorization": auth}) as inworld_ws:
+            config = {
+                "transcribeConfig": {
+                    "modelId": "inworld/inworld-stt-1",
+                    "audioEncoding": "LINEAR16",
+                    "sampleRateHertz": 16000,
+                    "language": "en",
+                }
+            }
+            await inworld_ws.send(json.dumps(config))
+
+            loop = asyncio.get_running_loop()
+            inworld_done = asyncio.Event()
+
+            async def read_inworld():
+                try:
+                    async for message in inworld_ws:
+                        try:
+                            data = json.loads(message)
+                        except Exception:
+                            continue
+                        result = data.get("result", {})
+                        transcription = result.get("transcription", {})
+                        if transcription.get("isFinal"):
+                            text = transcription.get("transcript", "")
+                            if text:
+                                out_msg = json.dumps({"text": text, "is_final": True})
+                                await loop.run_in_executor(None, client_conn.send, out_msg)
+                except Exception:
+                    pass
+                finally:
+                    inworld_done.set()
+
+            inworld_task = asyncio.create_task(read_inworld())
+
+            def read_client_blocking():
+                try:
+                    for msg in client_conn:
+                        if isinstance(msg, bytes):
+                            b64 = base64.b64encode(msg).decode("ascii")
+                            asyncio.run_coroutine_threadsafe(
+                                inworld_ws.send(json.dumps({"audioChunk": {"content": b64}})),
+                                loop
+                            ).result()
+                        elif isinstance(msg, str):
+                            try:
+                                d = json.loads(msg)
+                                action = d.get("action")
+                                if action == "stop":
+                                    # Graceful stop: tell Inworld stream is closed, wait for remaining results
+                                    asyncio.run_coroutine_threadsafe(
+                                        inworld_ws.send(json.dumps({"closeStream": {}})),
+                                        loop
+                                    ).result(timeout=2.0)
+                                    break
+                                elif action == "close":
+                                    # Immediate abort
+                                    break
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            inworld_ws.send(json.dumps({"closeStream": {}})),
+                            loop
+                        ).result(timeout=2.0)
+                    except Exception:
+                        pass
+
+            await loop.run_in_executor(None, read_client_blocking)
+            try:
+                await asyncio.wait_for(inworld_done.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            try:
+                client_conn.send(json.dumps({"done": True}))
+            except Exception:
+                pass
+            inworld_task.cancel()
+
+    try:
+        asyncio.run(bridge())
+    except Exception as exc:
+        log.warning("stream_transcribe_inworld bridge error: %s", exc)
 
 
 def _prepare_agent(session, agent_settings):
