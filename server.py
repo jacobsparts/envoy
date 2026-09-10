@@ -378,7 +378,11 @@ def make_handler():
 
                 if parsed.path == f"{WEB_PREFIX}/api/write":
                     body = read_json_body(self)
-                    result = service.write(str(body.get("session_id") or ""), str(body.get("data") or ""))
+                    result = service.write(
+                        str(body.get("session_id") or ""),
+                        str(body.get("data") or ""),
+                        client_id=str(body.get("client_id") or ""),
+                    )
                     json_response(self, 200, result)
                     return
 

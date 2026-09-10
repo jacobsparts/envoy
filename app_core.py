@@ -1606,25 +1606,38 @@ class EnvoyService:
             if not session or not session.alive:
                 raise ValueError("No active session")
             client_id = secrets.token_hex(8)
+            eviction_deliveries = []
             with session._lock:
-                if mode == "takeover":
+                if mode == "takeover" or mode not in {"lead", "follow"}:
+                    # Revoke the old clients immediately, but retain their callback
+                    # references long enough to deliver one final eviction payload.
+                    # Removing them from both maps first prevents any terminal output
+                    # produced after the takeover from being streamed to them.
+                    old_callbacks = list(session._push_callbacks.values())
                     session._push_callbacks.clear()
                     session.clients.clear()
                     session.add_client(client_id, "lead")
+                    eviction_payload = {
+                        "output": b"",
+                        "events": [],
+                        "evicted": True,
+                        "alive": False,
+                        "exit_code": -1,
+                    }
+                    eviction_deliveries = [
+                        (callback, eviction_payload) for callback in old_callbacks
+                    ]
                 elif mode == "lead":
                     # Demote existing lead to follow
                     for cs in session.clients.values():
                         if cs.role == "lead":
                             cs.role = "follow"
                     session.add_client(client_id, "lead")
-                elif mode == "follow":
-                    session.add_client(client_id, "follow")
                 else:
-                    session._push_callbacks.clear()
-                    session.clients.clear()
-                    session.add_client(client_id, "lead")
+                    session.add_client(client_id, "follow")
                 session._pending_ready.notify_all()
-            role = session.clients[client_id].role
+                role = session.clients[client_id].role
+            session._dispatch_push_payloads(eviction_deliveries)
             resp = session.snapshot_response(role)
             resp["client_id"] = client_id
             return resp
@@ -1674,8 +1687,13 @@ class EnvoyService:
             result["resize"] = resize
         return result
 
-    def write(self, session_id: str, data_b64: str) -> dict[str, bool]:
+    def write(self, session_id: str, data_b64: str,
+              client_id: str = "") -> dict[str, bool]:
         session = self._get_session(session_id)
+        if client_id:
+            with session._lock:
+                if client_id not in session.clients:
+                    raise ValueError("Client was evicted")
         session.write(self._decode(data_b64))
         return {"ok": True}
 

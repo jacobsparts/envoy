@@ -373,7 +373,11 @@ class BrowserTransport {
           await this.requestJson("/api/write", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ session_id: this.sessionId, data: payload }),
+            body: JSON.stringify({
+              session_id: this.sessionId,
+              client_id: this.clientId,
+              data: payload,
+            }),
           });
           for (const entry of batch) entry.resolve();
           this._writeRetries = 0;
