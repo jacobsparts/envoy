@@ -1703,7 +1703,9 @@ class EnvoyService:
         if client_id:
             with session._lock:
                 cs = session.clients.get(client_id)
-                if cs and cs.role != "lead":
+                if cs is None:
+                    raise ValueError("Client was evicted")
+                if cs.role != "lead":
                     return {"ok": False}
         session.resize(cols, rows)
         with session._lock:

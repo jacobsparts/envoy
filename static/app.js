@@ -183,6 +183,7 @@ class BrowserTransport {
     if (!response.ok) {
       const error = new Error(data.error || `${response.status} ${response.statusText}`);
       error.status = response.status;
+      error.evicted = data.evicted === true;
       throw error;
     }
     return data;
@@ -1214,8 +1215,14 @@ class TerminalTab {
   }
 
   handleWriteError(err) {
-    if (err?.status) this.markDisconnected();
-    else console.warn("envoy: transient write error", err);
+    if (err?.evicted) {
+      this.transport.stopReading();
+      this.markDisconnected({ kind: "evicted" });
+    } else if (err?.status) {
+      this.markDisconnected();
+    } else {
+      console.warn("envoy: transient write error", err);
+    }
   }
 
   handleDisconnect(info) {

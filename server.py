@@ -278,15 +278,47 @@ def make_handler():
                         if initial is not None:
                             enqueue(session_id, client_id, initial)
 
+                    evicted_pairs: set[tuple[str, str]] = set()
+                    last_ping = time.monotonic()
                     while True:
                         with ready:
                             if not queue:
-                                ready.wait(10)
+                                # Callback delivery is normally immediate. Wake
+                                # periodically as a fallback for takeovers that
+                                # raced registration or a suspended mobile stream.
+                                ready.wait(1)
                             pending = list(queue)
                             queue.clear()
+
+                        pending_evictions = {
+                            (sid, cid) for sid, cid, payload in pending
+                            if payload.get("evicted")
+                        }
+                        evicted_pairs.update(pending_evictions)
+                        for session_id, client_id in pairs:
+                            pair = (session_id, client_id)
+                            if pair in evicted_pairs:
+                                continue
+                            session = sessions[session_id]
+                            with session._lock:
+                                attached = client_id in session.clients
+                            if not attached:
+                                evicted_pairs.add(pair)
+                                pending.append((session_id, client_id, {
+                                    "output": b"",
+                                    "events": [],
+                                    "evicted": True,
+                                    "alive": False,
+                                    "exit_code": -1,
+                                }))
+
                         if not pending:
+                            now = time.monotonic()
+                            if now - last_ping < 10:
+                                continue
                             self.wfile.write(b": ping\n\n")
                             self.wfile.flush()
+                            last_ping = now
                             continue
                         for session_id, client_id, payload in pending:
                             session = sessions.get(session_id)
@@ -542,7 +574,11 @@ def make_handler():
             except BrokenPipeError:
                 return
             except ValueError as exc:
-                json_response(self, 400, {"error": str(exc)})
+                message = str(exc)
+                if message == "Client was evicted":
+                    json_response(self, 409, {"error": message, "evicted": True})
+                else:
+                    json_response(self, 400, {"error": message})
                 return
             except Exception as exc:
                 logging.exception("Error handling %s", parsed.path)
