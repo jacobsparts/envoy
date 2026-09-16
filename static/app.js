@@ -616,10 +616,9 @@ class BrowserStreamMultiplexer {
     };
     es.onerror = () => {
       if (!isActive()) return;
-      if (es.readyState === EventSource.CLOSED) {
-        this.eventSource = null;
-        setTimeout(() => this.open(), 1000);
-      }
+      try { es.close(); } catch {}
+      this.eventSource = null;
+      setTimeout(() => this.open(), 1000);
     };
   }
 

@@ -252,10 +252,6 @@ def make_handler():
 
                 with service._lock:
                     sessions = {sid: service._sessions.get(sid) for sid, _cid in pairs}
-                missing = [sid for sid, _cid in pairs if sessions.get(sid) is None]
-                if missing:
-                    json_response(self, 404, {"error": "No active session", "session_id": missing[0]})
-                    return
 
                 self.close_connection = True
                 self.send_response(200)
@@ -267,7 +263,16 @@ def make_handler():
 
                 try:
                     for session_id, client_id in pairs:
-                        session = sessions[session_id]
+                        session = sessions.get(session_id)
+                        if session is None:
+                            enqueue(session_id, client_id, {
+                                "output": b"",
+                                "events": [],
+                                "alive": False,
+                                "exit_code": -1,
+                                "evicted": True,
+                            })
+                            continue
                         session.last_seen = time.monotonic()
 
                         def callback(payload: dict[str, object], sid=session_id, cid=client_id) -> None:
