@@ -1,0 +1,55 @@
+[Unit]
+Description=envoy /tmp watcher (attributes /tmp file creation to envoy sessions)
+Documentation=file:/home/jacob/envoy/systemd/README.md
+After=local-fs.target
+
+[Service]
+Type=simple
+User=jacob
+Group=jacob
+WorkingDirectory=/home/jacob/envoy
+
+# fanotify_init needs CAP_SYS_ADMIN. envoy itself runs as an unprivileged user, so the
+# watcher is a separate unit that is handed exactly that one capability. A setuid or
+# file-capability helper would not work: Linux ignores setuid on scripts, and setcap is
+# not installed here. CAP_SYS_NICE is for Nice=-20, which measurably improves
+# attribution of very short-lived writers.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE
+Nice=-20
+
+# Owns /run/envoy-tmpwatch: the IPC socket lives there, and systemd removes the
+# directory whenever this unit stops.
+RuntimeDirectory=envoy-tmpwatch
+RuntimeDirectoryMode=0700
+
+# The persisted index lives in a StateDirectory instead, because the sessions it
+# tracks outlive both envoy and this watcher. In the runtime directory the index
+# was erased whenever the watcher stopped (and, before PartOf was dropped, envoy
+# stopping took the watcher with it), which lost the file list for sessions that
+# were still running and left their /tmp files behind after they ended.
+StateDirectory=envoy-tmpwatch
+StateDirectoryMode=0700
+Environment=TMPWATCH_STATE=/var/lib/envoy-tmpwatch/state.json
+
+ExecStart=/usr/bin/python3 -u /home/jacob/envoy/tmp_watch.py
+Restart=always
+RestartSec=2
+
+# The watcher must see the real /tmp, not a private one, and it deletes files there.
+PrivateTmp=no
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+# /var/lib/envoy-tmpwatch (StateDirectory) is writable implicitly.
+ReadWritePaths=/run/envoy-tmpwatch /tmp
+PrivateDevices=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=envoy.service

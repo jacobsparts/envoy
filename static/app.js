@@ -168,7 +168,6 @@ class BrowserTransport {
     this.clientId = "";
     this.role = "lead";
     this.closed = false;
-    this.eventSource = null;
   }
 
   async requestJson(path, options = {}) {
@@ -233,55 +232,6 @@ class BrowserTransport {
     BrowserStreamMultiplexer.instance(this.basePath).register(this);
   }
 
-  _openStream() {
-    if (!this._streamCallbacks) return;
-    const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
-    const url = new URL(this.basePath + "/api/stream", location.origin);
-    url.searchParams.set("session_id", this.sessionId);
-    url.searchParams.set("client_id", this.clientId);
-    const es = new EventSource(url);
-    this.eventSource = es;
-    const isActive = () => !this.closed && !this._paused && this.eventSource === es;
-    es.onmessage = (e) => {
-      if (!isActive()) return;
-      const result = JSON.parse(e.data);
-      const chunk = base64ToBytes(result.output);
-      if (chunk.length) onData(chunk);
-      if (result.events && result.events.length) onEvents(result.events);
-      if (!result.alive) {
-        es.close();
-        onDisconnect({ kind: "exit", exitCode: result.exit_code });
-      }
-    };
-    es.addEventListener("evicted", () => {
-      es.close();
-      if (isActive()) onDisconnect({ kind: "evicted" });
-    });
-    es.addEventListener("promoted", () => {
-      if (!isActive()) return;
-      this.role = "lead";
-      if (onPromoted) onPromoted();
-    });
-    es.addEventListener("resize", (e) => {
-      if (!isActive()) return;
-      const { cols, rows } = JSON.parse(e.data);
-      if (this.onResize) this.onResize(cols, rows);
-    });
-    es.onerror = () => {
-      if (!isActive()) return;
-      if (es.readyState === EventSource.CLOSED) {
-        const suppress = document.hidden || (performance.now() - (this._visibleAt || 0) < 1500);
-        if (suppress) {
-          this._paused = true;
-          this.eventSource = null;
-          if (!document.hidden) queueMicrotask(() => { try { this.resumeReading(); } catch {} });
-          return;
-        }
-        onDisconnect({ kind: "error", error: new Error("stream closed") });
-      }
-    };
-  }
-
   _handleStreamResult(result) {
     if (this.closed || this._paused || !this._streamCallbacks) return;
     const { onData, onDisconnect, onEvents, onPromoted } = this._streamCallbacks;
@@ -311,11 +261,6 @@ class BrowserTransport {
     if (this._paused) return;
     this._paused = true;
     BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
-    if (this.eventSource) {
-      const es = this.eventSource;
-      this.eventSource = null;
-      try { es.close(); } catch {}
-    }
   }
 
   resumeReading() {
@@ -328,10 +273,6 @@ class BrowserTransport {
   stopReading() {
     this.closed = true;
     BrowserStreamMultiplexer.instance(this.basePath).unregister(this);
-    if (this.eventSource) {
-      this.eventSource.close();
-      this.eventSource = null;
-    }
   }
 
   write(data) {
@@ -566,6 +507,9 @@ class BrowserStreamMultiplexer {
     this.transports = new Map();
     this.eventSource = null;
     this.reopenTimer = null;
+    // Highest SSE event id applied per "<session>:<client>", used to resume
+    // without replaying (or losing) a chunk around a reconnect.
+    this.appliedIds = new Map();
   }
 
   keyFor(transport) {
@@ -579,7 +523,11 @@ class BrowserStreamMultiplexer {
   }
 
   unregister(transport) {
-    this.transports.delete(this.keyFor(transport));
+    const key = this.keyFor(transport);
+    this.transports.delete(key);
+    // Keep the applied id while the same session/client may reconnect; drop it
+    // once the transport is closed for good so the map cannot grow unbounded.
+    if (transport.closed) this.appliedIds.delete(key);
     this.scheduleOpen();
   }
 
@@ -600,7 +548,13 @@ class BrowserStreamMultiplexer {
     if (!entries.length) return;
 
     const url = new URL(this.basePath + "/api/stream_all", location.origin);
-    for (const [key] of entries) url.searchParams.append("pair", key);
+    for (const [key] of entries) {
+      url.searchParams.append("pair", key);
+      // Tell the server the last event id this client actually applied so it
+      // can resend anything that was written to a socket the browser never saw.
+      const applied = this.appliedIds.get(key);
+      if (applied) url.searchParams.append("last", `${key}=${applied}`);
+    }
     const es = new EventSource(url);
     this.eventSource = es;
     this._connectedResolve = null;
@@ -611,6 +565,13 @@ class BrowserStreamMultiplexer {
       if (!isActive()) return;
       const result = JSON.parse(e.data);
       const key = `${result.session_id}:${result.client_id}`;
+      const id = Number(e.lastEventId);
+      if (Number.isFinite(id) && id > 0) {
+        const applied = this.appliedIds.get(key) || 0;
+        // A replayed frame we already applied must not be rendered twice.
+        if (id <= applied) return;
+        this.appliedIds.set(key, id);
+      }
       const transport = this.transports.get(key);
       if (transport) transport._handleStreamResult(result);
     };

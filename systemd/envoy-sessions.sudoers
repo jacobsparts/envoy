@@ -1,5 +1,10 @@
-jacob ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --uid jacob --gid 1000 --scope --unit envoy-session-* --slice envoy-sessions --property MemoryAccounting=yes --property MemoryHigh=* --property MemoryMax=* --property MemorySwapMax=* --property KillMode=control-group --property CollectMode=inactive-or-failed --property PartOf=envoy.service -- *
-jacob ALL=(root) NOPASSWD: /usr/bin/systemctl stop envoy-session-*.scope
-jacob ALL=(root) NOPASSWD: /usr/bin/systemctl kill --kill-whom=all --signal=* envoy-session-*.scope
-jacob ALL=(root) NOPASSWD: /usr/bin/systemctl set-property --runtime envoy-session-*.scope MemoryHigh=* MemoryMax=* MemorySwapMax=*
+# Session workers run as transient services (systemd stops the cgroup when the
+# worker dies, which a scope does not do).
+jacob ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --uid jacob --gid 1000 --unit envoy-session-* --slice envoy-sessions --property MemoryAccounting=yes --property MemoryHigh=* --property MemoryMax=* --property MemorySwapMax=* --property KillMode=control-group --property TimeoutStopSec=* --property CollectMode=inactive-or-failed -- *
+# Transitional: an Envoy process that predates the service switch still
+# launches scopes. Drop this line once every host runs the new code.
+jacob ALL=(root) NOPASSWD: /usr/bin/systemd-run --quiet --uid jacob --gid 1000 --scope --unit envoy-session-* --slice envoy-sessions --property MemoryAccounting=yes --property MemoryHigh=* --property MemoryMax=* --property MemorySwapMax=* --property KillMode=control-group --property CollectMode=inactive-or-failed -- *
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl stop envoy-session-*
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl kill --kill-whom=all --signal=* envoy-session-*
+jacob ALL=(root) NOPASSWD: /usr/bin/systemctl set-property --runtime envoy-session-* MemoryHigh=* MemoryMax=* MemorySwapMax=*
 jacob ALL=(root) NOPASSWD: /usr/bin/systemctl set-property --runtime envoy-sessions.slice MemoryHigh=* MemoryMax=* MemorySwapMax=*

@@ -13,6 +13,14 @@ from pathlib import Path
 
 SESSION_SLICE = "envoy-sessions.slice"
 UNIT_PREFIX = "envoy-session-"
+UNIT_SUFFIX = ".service"
+# Session units used to be systemd scopes. The legacy suffix is still accepted
+# so a unit left behind by an older Envoy is found and stopped instead of
+# lingering forever.
+LEGACY_UNIT_SUFFIX = ".scope"
+# Bound on how long a child that ignores SIGTERM can delay the cgroup kill that
+# follows its worker's death.
+STOP_TIMEOUT_SECONDS = 10
 STALE_SCOPE_GRACE_SECONDS = 60
 SESSION_MEMORY_HIGH = 8 * 1024 ** 3
 SESSION_MEMORY_MAX = 12 * 1024 ** 3
@@ -24,6 +32,18 @@ MIN_LIMIT = 64 * 1024 ** 2
 MAX_LIMIT = 1024 * 1024 ** 3
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 _SAFE_SID = re.compile(r"^[0-9a-f]{8}$")
+
+
+def sid_from_unit(unit: str) -> str | None:
+    """Session id encoded in a session unit name, if it is one."""
+    if not unit.startswith(UNIT_PREFIX):
+        return None
+    for suffix in (UNIT_SUFFIX, LEGACY_UNIT_SUFFIX):
+        if unit.endswith(suffix):
+            sid = unit[len(UNIT_PREFIX):-len(suffix)]
+            if _SAFE_SID.fullmatch(sid):
+                return sid
+    return None
 
 
 class SystemdScopeManager:
@@ -39,9 +59,24 @@ class SystemdScopeManager:
         self._thread = threading.Thread(target=self._refresh_loop, daemon=True, name="cgroup-statistics")
         self._thread.start()
 
+    @staticmethod
+    def _env() -> dict[str, str]:
+        """Environment for systemctl/systemd-run.
+
+        A login shell exports DBUS_SESSION_BUS_ADDRESS, which makes a bare
+        `systemctl` talk to the *user* manager. Session scopes live in the
+        system manager, so the session bus is removed here to keep behaviour
+        identical whether Envoy was started from a shell or as a service.
+        """
+        env = dict(os.environ)
+        env.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        env.pop("DBUS_SYSTEM_BUS_ADDRESS", None)
+        return env
+
     def _run(self, args: list[str], timeout: float = 15.0, check: bool = True) -> subprocess.CompletedProcess[str]:
         try:
-            result = subprocess.run(args, text=True, capture_output=True, timeout=timeout, check=False)
+            result = subprocess.run(args, text=True, capture_output=True, timeout=timeout,
+                                    check=False, env=self._env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RuntimeError(f"systemd operation failed: {exc}") from exc
         if check and result.returncode:
@@ -62,9 +97,38 @@ class SystemdScopeManager:
     def unit_name(self, sid: str) -> str:
         if not _SAFE_SID.fullmatch(sid):
             raise ValueError("Invalid session ID")
-        return f"{UNIT_PREFIX}{sid}.scope"
+        return f"{UNIT_PREFIX}{sid}{UNIT_SUFFIX}"
 
-    def launch_command(self, sid: str, command: list[str]) -> list[str]:
+    def session_units(self, sid: str) -> list[str]:
+        """Every unit name one session could be running under.
+
+        The current unit is a supervised service; the legacy scope name is
+        included so a unit left behind by an older Envoy is still stopped.
+        """
+        if not _SAFE_SID.fullmatch(sid):
+            raise ValueError("Invalid session ID")
+        return [f"{UNIT_PREFIX}{sid}{UNIT_SUFFIX}", f"{UNIT_PREFIX}{sid}{LEGACY_UNIT_SUFFIX}"]
+
+    def launch_command(self, sid: str, command: list[str],
+                       high: int = SESSION_MEMORY_HIGH,
+                       maximum: int = SESSION_MEMORY_MAX,
+                       swap_max: int = SESSION_SWAP_MAX) -> list[str]:
+        """Build the systemd-run argv for one session unit.
+
+        The worker runs as a transient *service*, not a scope. A scope is only a
+        container: systemd never stops one when its main process dies, so a
+        SIGKILLed worker left its whole cgroup running - including descendants
+        that escaped the PTY session with setsid - with nobody watching. A
+        service is supervised, so when the worker dies systemd applies
+        KillMode=control-group to the cgroup and the children die with it, even
+        with no Envoy process anywhere on the machine. TimeoutStopSec bounds how
+        long a child that ignores SIGTERM can delay that.
+
+        The unit deliberately does NOT carry ``PartOf=envoy.service``: session
+        workers outlive the web process, so stopping or restarting Envoy must
+        not stop them. Explicitly closed sessions, and units whose registry row
+        is gone, are stopped by the web process instead.
+        """
         unit = self.unit_name(sid)
         account = pwd.getpwuid(os.getuid())
         return [
@@ -72,38 +136,85 @@ class SystemdScopeManager:
             "--quiet",
             "--uid", account.pw_name,
             "--gid", str(account.pw_gid),
-            "--scope",
-            "--unit", unit.removesuffix(".scope"),
+            "--unit", unit.removesuffix(UNIT_SUFFIX),
             "--slice", SESSION_SLICE.removesuffix(".slice"),
             "--property", "MemoryAccounting=yes",
-            "--property", f"MemoryHigh={SESSION_MEMORY_HIGH}",
-            "--property", f"MemoryMax={SESSION_MEMORY_MAX}",
-            "--property", f"MemorySwapMax={SESSION_SWAP_MAX}",
+            "--property", f"MemoryHigh={high}",
+            "--property", f"MemoryMax={maximum}",
+            "--property", f"MemorySwapMax={swap_max}",
             "--property", "KillMode=control-group",
+            "--property", f"TimeoutStopSec={STOP_TIMEOUT_SECONDS}",
             "--property", "CollectMode=inactive-or-failed",
             "--",
             *command,
         ]
 
-    def verify_scope(self, sid: str) -> str:
-        unit = self.unit_name(sid)
-        values = self._show(unit, ["ActiveState", "ControlGroup"])
-        if values.get("ActiveState") not in {"active", "activating"}:
-            raise RuntimeError(f"session scope failed to start: {unit}")
-        cgroup = values.get("ControlGroup", "")
+    def unit_main_pid(self, sid: str, timeout: float = 10.0) -> int | None:
+        """PID of the worker process inside the session unit, if it is known."""
+        if not _SAFE_SID.fullmatch(sid):
+            raise ValueError("Invalid session ID")
+        deadline = time.monotonic() + timeout
+        while True:
+            # A service reports MainPID: that is exactly the worker. A legacy
+            # scope does not, so fall back to its first cgroup member, which is
+            # the worker the launcher placed there.
+            reported = self._show(self.unit_name(sid), ["MainPID"]).get("MainPID", "")
+            if reported.strip().isdigit() and int(reported) > 0:
+                return int(reported)
+            pids = sorted(int(line) for line in self._cgroup_procs(sid) if line.strip().isdigit())
+            if pids:
+                return pids[0]
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+
+    def _cgroup_procs(self, sid: str) -> list[str]:
+        cgroup = self._show(self.unit_name(sid), ["ControlGroup"]).get("ControlGroup", "")
         if not cgroup:
-            raise RuntimeError(f"session scope has no cgroup: {unit}")
-        return cgroup
+            return []
+        path = (CGROUP_ROOT / cgroup.lstrip("/") / "cgroup.procs")
+        try:
+            return path.read_text().split()
+        except OSError:
+            return []
+
+    def verify_scope(self, sid: str, timeout: float = 10.0) -> str:
+        """Wait for the transient unit to exist and report its cgroup.
+
+        The unit is registered asynchronously, so a query issued immediately
+        after the launcher is spawned can still come back empty. Poll until the
+        unit is active instead of failing on the first look; only report failure
+        once the deadline passes.
+        """
+        unit = self.unit_name(sid)
+        deadline = time.monotonic() + timeout
+        last: dict[str, str] = {}
+        while True:
+            last = self._show(unit, ["ActiveState", "ControlGroup"])
+            state = last.get("ActiveState", "")
+            cgroup = last.get("ControlGroup", "")
+            if state in {"active", "activating"} and cgroup:
+                return cgroup
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        raise RuntimeError(f"session unit failed to start: {unit} ({last.get('ActiveState') or 'unknown'})")
 
     def active_units(self) -> set[str]:
+        """Active session units, service or legacy scope.
+
+        Services are what this version launches. Legacy scopes are included so a
+        unit left behind by an older Envoy is still discovered and reaped
+        instead of running forever with nobody watching it.
+        """
         result = self._run([
-            "systemctl", "list-units", "--type=scope", "--state=active",
-            "--no-legend", "--plain", f"{UNIT_PREFIX}*.scope",
+            "systemctl", "list-units", "--type=service", "--type=scope", "--state=active",
+            "--no-legend", "--plain", f"{UNIT_PREFIX}*",
         ], check=False)
         units = set()
         for line in result.stdout.splitlines():
             unit = line.split(None, 1)[0] if line.strip() else ""
-            if unit.startswith(UNIT_PREFIX) and unit.endswith(".scope"):
+            if sid_from_unit(unit):
                 units.add(unit)
         return units
 
@@ -125,16 +236,32 @@ class SystemdScopeManager:
             f"--signal={sig.name}", self.unit_name(sid)
         ], check=False)
 
+    def stop_unit(self, unit: str) -> None:
+        """Stop one session unit by name, service or legacy scope."""
+        self._run(["sudo", "-n", "systemctl", "stop", unit], timeout=20, check=False)
+
     def stop_scope(self, sid: str) -> None:
-        self._run(
-            ["sudo", "-n", "systemctl", "stop", self.unit_name(sid)],
-            timeout=20,
-            check=False,
-        )
+        self.stop_unit(self.unit_name(sid))
+
+    def stop_session(self, sid: str) -> None:
+        """Stop whichever unit carries this session, service or legacy scope."""
+        for unit in self.session_units(sid):
+            if self._unit_active(unit):
+                self.stop_unit(unit)
+
+    def _unit_active(self, unit: str) -> bool:
+        result = self._run(["systemctl", "is-active", "--quiet", unit], check=False)
+        return result.returncode == 0
 
     def scope_active(self, sid: str) -> bool:
-        result = self._run(["systemctl", "is-active", "--quiet", self.unit_name(sid)], check=False)
-        return result.returncode == 0
+        """True while the session runs under either unit name.
+
+        The current name is a service, but a session started by an Envoy that
+        predates the switch runs as a scope. Reporting it inactive would make
+        startup drop - and therefore kill - a session that is still perfectly
+        alive, so both names count.
+        """
+        return any(self._unit_active(unit) for unit in self.session_units(sid))
 
     def _show(self, unit: str, properties: list[str]) -> dict[str, str]:
         result = self._run([
@@ -235,7 +362,7 @@ class SystemdScopeManager:
 
         Slice memory.current can retain orphaned charges (for example tmpfs/shmem
         pages left behind after a scope exits). The UI's "All sessions" figure
-        should reflect live session scopes, while keeping slice-level limits and
+        should reflect live session units, while keeping slice-level limits and
         pressure/events for threshold editing and health.
         """
         live = [stats for stats in session_stats.values() if stats.get("available")]
@@ -365,8 +492,19 @@ class SystemdScopeManager:
             raise ValueError(f"{name} must be between {MIN_LIMIT} and {MAX_LIMIT} bytes")
         return number
 
-    def close(self) -> None:
+    def stop_thread(self) -> None:
+        """Stop the statistics thread without touching any session unit."""
         self._stop.set()
         self._thread.join(timeout=2)
+
+    def close(self, stop_scopes: bool = True) -> None:
+        """Stop the statistics thread, and by default stop every session unit.
+
+        Routine web restarts must not stop sessions: call ``stop_thread()`` (or
+        ``close(stop_scopes=False)``) instead, and let the worker keep running.
+        """
+        self.stop_thread()
+        if not stop_scopes:
+            return
         for unit in self.active_units():
             self._run(["sudo", "-n", "systemctl", "stop", unit], check=False)

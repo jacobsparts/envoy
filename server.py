@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import signal
-import base64
 import threading
 import time
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -22,7 +21,6 @@ from app_core import STATIC_DIR, UPLOAD_DIR, EnvoyService, render_html
 
 WEB_PREFIX = "/envoy"
 DEFAULT_HTTP_PORT = int(os.environ.get("ENVOY_HTTP_PORT", "8080"))
-DEFAULT_READ_TIMEOUT = float(os.environ.get("ENVOY_READ_TIMEOUT", "20"))
 MIME_TYPES = {
     ".css": "text/css",
     ".js": "application/javascript",
@@ -177,57 +175,6 @@ def make_handler():
                 json_response(self, 200, service.list_sessions(path=session_path))
                 return
 
-            if parsed.path == f"{WEB_PREFIX}/api/stream":
-                qs = parse_qs(parsed.query)
-                session_id = qs.get("session_id", [""])[0]
-                client_id = qs.get("client_id", [""])[0]
-                with service._lock:
-                    session = service._sessions.get(session_id)
-                if not session:
-                    self.send_error(404)
-                    return
-                self.close_connection = True
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("X-Accel-Buffering", "no")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                try:
-                    while True:
-                        if client_id not in session.clients:
-                            self.wfile.write(b"event: evicted\ndata: {}\n\n")
-                            self.wfile.flush()
-                            break
-                        session.last_seen = time.monotonic()
-                        output, events, promoted, resize = session.wait_for_client(client_id, 10)
-                        if client_id not in session.clients:
-                            self.wfile.write(b"event: evicted\ndata: {}\n\n")
-                            self.wfile.flush()
-                            break
-                        if promoted:
-                            self.wfile.write(b"event: promoted\ndata: {}\n\n")
-                            self.wfile.flush()
-                        if resize:
-                            rdata = json.dumps({"cols": resize[0], "rows": resize[1]}, separators=(",", ":"))
-                            self.wfile.write(f"event: resize\ndata: {rdata}\n\n".encode())
-                            self.wfile.flush()
-                        if not output and not events and not promoted and not resize and session.alive:
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                            continue
-                        msg = {"output": service._encode(output), "events": events, "alive": session.alive}
-                        if not session.alive:
-                            msg["exit_code"] = session.exit_code
-                        line = json.dumps(msg, separators=(",", ":"))
-                        self.wfile.write(f"data: {line}\n\n".encode())
-                        self.wfile.flush()
-                        if not session.alive:
-                            break
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    pass
-                return
-
             if parsed.path == f"{WEB_PREFIX}/api/stream_all":
                 qs = parse_qs(parsed.query)
                 pairs = []
@@ -241,13 +188,30 @@ def make_handler():
                     self.send_error(400)
                     return
 
-                queue: list[tuple[str, str, dict[str, object]]] = []
+                # `last` carries "<session>:<client>=<id>", the highest SSE event
+                # id the browser already applied. A reconnecting stream uses it
+                # to resend a frame that reached the socket but never reached the
+                # browser.
+                acked: dict[tuple[str, str], int] = {}
+                for raw_ack in qs.get("last", []):
+                    key, sep, raw_id = raw_ack.rpartition("=")
+                    if not sep or ":" not in key or not raw_id.isdigit():
+                        continue
+                    ack_session, ack_client = key.split(":", 1)
+                    acked[(ack_session, ack_client)] = int(raw_id)
+
+                # A wakeup carries the client identity and, for notices that do
+                # not come from the client's own output buffer (eviction,
+                # shutdown), the frame to send. Otherwise the pending bytes stay
+                # in the session buffer until the SSE write succeeds.
+                wakeups: list[tuple[str, str, dict[str, object] | None]] = []
                 ready = threading.Condition()
                 registrations: list[tuple[object, str, object]] = []
 
-                def enqueue(session_id: str, client_id: str, payload: dict[str, object]) -> None:
+                def notify_pair(session_id: str, client_id: str,
+                                payload: dict[str, object] | None = None) -> None:
                     with ready:
-                        queue.append((session_id, client_id, payload))
+                        wakeups.append((session_id, client_id, payload))
                         ready.notify()
 
                 with service._lock:
@@ -261,91 +225,135 @@ def make_handler():
                 self.send_header("Connection", "close")
                 self.end_headers()
 
+                def encode_frame(session_id: str, client_id: str, seq: int,
+                                 payload: dict[str, object]) -> bytes:
+                    msg = {
+                        "session_id": session_id,
+                        "client_id": client_id,
+                        "output": service._encode(payload.get("output", b"")),
+                        "events": payload.get("events", []),
+                        "alive": payload.get("alive", False),
+                        "exit_code": payload.get("exit_code"),
+                    }
+                    if payload.get("evicted"):
+                        msg["evicted"] = True
+                    if payload.get("promoted"):
+                        msg["promoted"] = True
+                    if payload.get("resize"):
+                        msg["resize"] = payload["resize"]
+                    line = json.dumps(msg, separators=(",", ":"))
+                    prefix = f"id: {seq}\n" if seq else ""
+                    return f"{prefix}data: {line}\n\n".encode()
+
+                def evicted_payload() -> dict[str, object]:
+                    return {"output": b"", "events": [], "evicted": True,
+                            "alive": False, "exit_code": -1}
+
                 try:
+                    # Resend anything a previous stream committed but the
+                    # browser never acknowledged.
                     for session_id, client_id in pairs:
                         session = sessions.get(session_id)
                         if session is None:
-                            enqueue(session_id, client_id, {
-                                "output": b"",
-                                "events": [],
-                                "alive": False,
-                                "exit_code": -1,
-                                "evicted": True,
-                            })
+                            continue
+                        last_id = acked.get((session_id, client_id), 0)
+                        for _seq, line in session.replay_after(client_id, last_id):
+                            self.wfile.write(line.encode())
+                    self.wfile.flush()
+
+                    for session_id, client_id in pairs:
+                        session = sessions.get(session_id)
+                        if session is None:
+                            notify_pair(session_id, client_id)
                             continue
                         session.last_seen = time.monotonic()
 
-                        def callback(payload: dict[str, object], sid=session_id, cid=client_id) -> None:
-                            enqueue(sid, cid, payload)
+                        def callback(cid: str, payload: dict[str, object] | None = None,
+                                     sid: str = session_id) -> None:
+                            notify_pair(sid, cid, payload)
 
-                        initial = session.register_push(client_id, callback)
                         registrations.append((session, client_id, callback))
-                        if initial is not None:
-                            enqueue(session_id, client_id, initial)
+                        if session.register_push(client_id, callback) is not None:
+                            notify_pair(session_id, client_id)
 
-                    evicted_pairs: set[tuple[str, str]] = set()
+                    done_pairs: set[tuple[str, str]] = set()
                     last_ping = time.monotonic()
                     while True:
                         with ready:
-                            if not queue:
-                                # Callback delivery is normally immediate. Wake
+                            if not wakeups:
+                                # Notifications are normally immediate. Wake
                                 # periodically as a fallback for takeovers that
                                 # raced registration or a suspended mobile stream.
                                 ready.wait(1)
-                            pending = list(queue)
-                            queue.clear()
+                            pending = list(wakeups)
+                            wakeups.clear()
 
-                        pending_evictions = {
-                            (sid, cid) for sid, cid, payload in pending
-                            if payload.get("evicted")
-                        }
-                        evicted_pairs.update(pending_evictions)
+                        # jobs: (session_id, client_id, payload_or_None)
+                        jobs: list[tuple[str, str, dict[str, object] | None]] = []
+                        notified: set[tuple[str, str]] = set()
+                        for session_id, client_id, payload in pending:
+                            pair = (session_id, client_id)
+                            if pair in done_pairs or pair in notified:
+                                continue
+                            notified.add(pair)
+                            jobs.append((session_id, client_id, payload))
                         for session_id, client_id in pairs:
                             pair = (session_id, client_id)
-                            if pair in evicted_pairs:
+                            if pair in done_pairs or pair in notified:
                                 continue
-                            session = sessions[session_id]
-                            with session._lock:
-                                attached = client_id in session.clients
-                            if not attached:
-                                evicted_pairs.add(pair)
-                                pending.append((session_id, client_id, {
-                                    "output": b"",
-                                    "events": [],
-                                    "evicted": True,
-                                    "alive": False,
-                                    "exit_code": -1,
-                                }))
-
-                        if not pending:
-                            now = time.monotonic()
-                            if now - last_ping < 10:
-                                continue
-                            self.wfile.write(b": ping\n\n")
-                            self.wfile.flush()
-                            last_ping = now
-                            continue
-                        for session_id, client_id, payload in pending:
                             session = sessions.get(session_id)
-                            if session and session.alive:
-                                session.last_seen = time.monotonic()
-                            msg = {
-                                "session_id": session_id,
-                                "client_id": client_id,
-                                "output": service._encode(payload.get("output", b"")),
-                                "events": payload.get("events", []),
-                                "alive": payload.get("alive", False),
-                                "exit_code": payload.get("exit_code"),
-                            }
-                            if payload.get("evicted"):
-                                msg["evicted"] = True
-                            if payload.get("promoted"):
-                                msg["promoted"] = True
-                            if payload.get("resize"):
-                                msg["resize"] = payload["resize"]
-                            line = json.dumps(msg, separators=(",", ":"))
-                            self.wfile.write(f"data: {line}\n\n".encode())
+                            if session is not None:
+                                with session._lock:
+                                    attached = client_id in session.clients
+                                if attached:
+                                    continue
+                            notified.add(pair)
+                            jobs.append((session_id, client_id, evicted_payload()))
+
+                        wrote = False
+                        for session_id, client_id, payload in jobs:
+                            pair = (session_id, client_id)
+                            session = sessions.get(session_id)
+                            # `delivered` marks a payload snapshotted from the
+                            # client's buffer, which must be committed after a
+                            # successful write. Explicit notices (eviction,
+                            # shutdown) carry no buffer state.
+                            delivered = False
+                            if payload is None:
+                                if session is None:
+                                    payload = evicted_payload()
+                                else:
+                                    if session.alive:
+                                        session.last_seen = time.monotonic()
+                                    payload = session.take_delivery(client_id)
+                                    if payload is None:
+                                        continue
+                                    delivered = True
+                            seq = session.next_delivery_seq(client_id) if session is not None else 0
+                            frame = encode_frame(session_id, client_id, seq, payload)
+                            try:
+                                self.wfile.write(frame)
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, OSError):
+                                if delivered:
+                                    session.cancel_delivery(client_id)
+                                raise
+                            if delivered:
+                                session.commit_delivery(client_id, payload, seq, frame.decode())
+                            elif payload.get("evicted") or not payload.get("alive", True):
+                                # Terminal notice: the client is gone or the
+                                # session ended, so nothing more will be sent.
+                                done_pairs.add(pair)
+                            wrote = True
+
+                        if wrote:
+                            continue
+                        now = time.monotonic()
+                        if now - last_ping < 10:
+                            continue
+                        self.wfile.write(b": ping\n\n")
                         self.wfile.flush()
+                        last_ping = now
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass
                 finally:
@@ -398,17 +406,6 @@ def make_handler():
                         app_path,
                         str(body.get("session_id") or ""),
                         mode=str(body.get("mode") or "takeover"),
-                    )
-                    json_response(self, 200, result)
-                    return
-
-                if parsed.path == f"{WEB_PREFIX}/api/read":
-                    body = read_json_body(self)
-                    wait_timeout = body.get("wait_timeout", DEFAULT_READ_TIMEOUT)
-                    result = service.read(
-                        str(body.get("session_id") or ""),
-                        str(body.get("client_id") or ""),
-                        float(wait_timeout or 0),
                     )
                     json_response(self, 200, result)
                     return

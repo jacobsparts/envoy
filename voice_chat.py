@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import threading
 import requests
-from agent import Agent
+from agent import Agent, CancelledError
 from env_config import load_app_env
 from terminal_session import reset_context_lookback
 
@@ -113,10 +113,6 @@ Your final text response will be spoken aloud to the user.
 """
 
 
-class CancelledError(Exception):
-    pass
-
-
 def require_voice_agent_env():
     if not os.environ.get("GOOGLE_API_KEY"):
         raise RuntimeError("GOOGLE_API_KEY is required for voice/text agent features")
@@ -162,14 +158,14 @@ class VoiceChatAgent(Agent):
 
     @Agent.tool
     def execute_action(self,
-                       type: str,
+                       type: str = "input",
                        input: str = "",
                        wait_for_settle: float = None,
                        expect_prompt: str = "",
                        timeout: float = None):
         """Execute one terminal action and return a structured result.
 
-        type: "input" or "wait".
+        type: "input" or "wait" (defaults to "input").
         input: Text to send for input actions. Use \r for Enter, \x03 for Ctrl-C, \x04 for Ctrl-D, \x15 for Ctrl-U, \x7f for Backspace, \t for Tab, and \x1b[A/B/C/D for arrow keys.
         wait_for_settle: Optional seconds terminal output must be quiet before returning. Omit for default 0.75 seconds.
         expect_prompt: Optional prompt text to wait for only when you specifically need a known prompt after pressing Enter. Omit for ordinary typing or uncertain interactive states.

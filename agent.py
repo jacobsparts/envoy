@@ -16,6 +16,10 @@ log = logging.getLogger("agent")
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 
+class CancelledError(Exception):
+    pass
+
+
 class AgentMaxTurnsError(RuntimeError):
     def __init__(self, max_turns: int) -> None:
         self.max_turns = max_turns
@@ -115,9 +119,18 @@ class Agent:
         return response.json()
 
     def _dispatch_tool(self, call: dict[str, Any]) -> Any:
-        tool = getattr(self, call["name"])
+        tool_name = call.get("name", "")
+        tool = getattr(self, tool_name, None)
+        if tool is None or not getattr(tool, "_agent_tool", False):
+            return {"error": f"Unknown tool: {tool_name}"}
         args = call.get("args") or {}
-        return tool(**args)
+        try:
+            return tool(**args)
+        except Exception as exc:
+            if isinstance(exc, CancelledError):
+                raise
+            log.warning("Tool %s execution error: %s", tool_name, exc)
+            return {"error": f"Error executing {tool_name}: {type(exc).__name__}: {exc}"}
 
     def _tool_declarations(self) -> list[dict[str, Any]]:
         declarations = []
