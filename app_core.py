@@ -222,7 +222,7 @@ DELIVERY_REPLAY_BYTES = 4 * 1024 * 1024
 class ClientState:
     __slots__ = ("client_id", "role", "output", "events", "promoted", "joined",
                  "pending_resize", "delivering", "seq", "replay", "replay_bytes",
-                 "cursor", "applied", "awaiting_snapshot")
+                 "cursor", "applied", "awaiting_snapshot", "exited")
 
     def __init__(self, client_id: str, role: str):
         self.client_id = client_id
@@ -242,6 +242,7 @@ class ClientState:
         # anything yet: until the repaint watermark is known, any byte handed to
         # it might be a byte the repaint also contains.
         self.awaiting_snapshot = False
+        self.exited = False
         # Delivery transaction: while a snapshot is in flight, output and
         # events stay in this buffer until the socket write succeeds.
         self.delivering = False
@@ -259,7 +260,7 @@ class ClientState:
         """
         if self.delivering or self.awaiting_snapshot:
             return None
-        if not (self.output or self.events or self.promoted or self.pending_resize):
+        if not (self.output or self.events or self.promoted or self.pending_resize or self.exited):
             return None
         self.delivering = True
         payload: dict[str, object] = {
@@ -267,6 +268,7 @@ class ClientState:
             "events": copy.deepcopy(self.events),
             "promoted": self.promoted,
             "resize": self.pending_resize,
+            "exited": self.exited,
         }
         return payload
 
@@ -280,6 +282,8 @@ class ClientState:
         del self.events[:len(events)]
         if payload["promoted"]:
             self.promoted = False
+        if payload["exited"]:
+            self.exited = False
         resize = payload["resize"]
         if resize is not None and self.pending_resize == resize:
             self.pending_resize = None
@@ -1713,7 +1717,11 @@ class WorkerSession:
                         with self._lock:
                             self.alive = False
                             self.exit_code = msg.get("exit_code")
+                            for cs in self.clients.values():
+                                cs.exited = True
                             self._pending_ready.notify_all()
+                            deliveries = self._collect_push_payloads_locked()
+                        self._dispatch_push_notifications(deliveries)
                         self._exit_status_ready.set()
             except (ConnectionError, OSError):
                 pass

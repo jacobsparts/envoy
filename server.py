@@ -340,7 +340,7 @@ def make_handler():
                                 raise
                             if delivered:
                                 session.commit_delivery(client_id, payload, seq, frame.decode())
-                            elif payload.get("evicted") or not payload.get("alive", True):
+                            if payload.get("evicted") or not payload.get("alive", True):
                                 # Terminal notice: the client is gone or the
                                 # session ended, so nothing more will be sent.
                                 done_pairs.add(pair)
